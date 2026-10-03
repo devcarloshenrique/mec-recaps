@@ -1,0 +1,6 @@
+{
+  "name": "FrameBatch - Enquadrador e Processador de Capítulos",
+  "description": "Aplicativo para corte, enquadramento manual de imagens e processamento em lote organizado por pastas de capítulos.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
