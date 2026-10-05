@@ -56,10 +56,13 @@ import {
   generate9routerSpeech,
   getAudioBlobDuration,
   calculateWeightedSceneDurations,
+  getFrameNarrationText,
+  realignAllFramesWithAudio,
   consolidatePageNarrationText,
   loadAiNarrationConfig,
   saveAiNarrationConfig,
   testAiConnection,
+  TestAiConnectionResult,
 } from '../utils/aiNarration';
 
 interface NarracaoViewProps {
@@ -103,42 +106,6 @@ export const MOTION_CHIPS: {
   { id: 'fade', label: 'Fade', icon: '🌫', fullLabel: 'Fade In/Out', description: 'Transição suave de opacidade' },
   { id: 'cut', label: 'Cut', icon: '✕', fullLabel: 'Corte Seco', description: 'Troca instantânea sem efeito' },
 ];
-
-/**
- * Extracts or estimates the portion of narration text belonging to a specific cropped frame.
- */
-export function getFrameNarrationText(
-  frame: FrameItem,
-  allPageFrames: FrameItem[],
-  fullPageText: string
-): string {
-  if (frame.narrationSnippet && frame.narrationSnippet.trim()) {
-    return frame.narrationSnippet.trim();
-  }
-  if (!fullPageText || !fullPageText.trim()) return '';
-
-  const sentences = fullPageText
-    .split(/(?<=[.!?…])\s+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  if (sentences.length === 0) return fullPageText.trim();
-
-  const frameIdx = allPageFrames.findIndex((f) => f.id === frame.id);
-  if (frameIdx < 0) return fullPageText.trim();
-
-  if (sentences.length === allPageFrames.length) {
-    return sentences[frameIdx];
-  }
-
-  const sentencesPerFrame = Math.max(
-    1,
-    Math.round(sentences.length / Math.max(1, allPageFrames.length))
-  );
-  const start = frameIdx * sentencesPerFrame;
-  const slice = sentences.slice(start, start + sentencesPerFrame);
-  return slice.join(' ') || sentences[sentences.length - 1] || fullPageText.trim();
-}
 
 /**
  * FrameDurationSlider: Individual linear range slider graduated from 1.0s to 10.0s
@@ -493,10 +460,12 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
   const [aiConfig, setAiConfig] = useState<AiNarrationConfig>(() => loadAiNarrationConfig());
   const [isConfigModalOpen, setIsConfigModalOpen] = useState<boolean>(false);
   const [isTestingConnection, setIsTestingConnection] = useState<boolean>(false);
-  const [connectionTestResult, setConnectionTestResult] = useState<{
-    success: boolean;
-    message: string;
-  } | null>(null);
+  const [connectionTestResult, setConnectionTestResult] = useState<TestAiConnectionResult | null>(null);
+  const [detectedModels, setDetectedModels] = useState<string[]>([]);
+  const [isCustomModel, setIsCustomModel] = useState<boolean>(() => {
+    const isStandard = AVAILABLE_MODELS.some((m) => m.id === loadAiNarrationConfig().model);
+    return !isStandard;
+  });
 
   // Selected Narration Profile ('sarcastico', 'epico', 'tatico', 'dinamico')
   const [selectedProfileId, setSelectedProfileId] = useState<string>(
@@ -638,6 +607,9 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
     try {
       const result = await testAiConnection(aiConfig);
       setConnectionTestResult(result);
+      if (result.models && result.models.length > 0) {
+        setDetectedModels(result.models);
+      }
     } catch (err: any) {
       setConnectionTestResult({
         success: false,
@@ -1435,14 +1407,18 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
         },
       }));
 
-      // Synchronize frame durations proportionally
+      // Synchronize frame durations proportionally with phonetic weighting per snippet
       if (row.frames.length > 0) {
-        const weighted = calculateWeightedSceneDurations(row.frames, speechRes.duration, text);
+        const framesWithText = row.frames.map((f) => ({
+          ...f,
+          narrationSnippet: getFrameNarrationText(f, row.frames, text),
+        }));
+        const weighted = calculateWeightedSceneDurations(framesWithText, speechRes.duration, text);
         if (weighted.length > 0) {
           if (onUpdateMultipleFrames) {
             onUpdateMultipleFrames(weighted);
           } else if (onUpdateFrame) {
-            weighted.forEach((w) => onUpdateFrame(w.id, { duration: w.duration }));
+            weighted.forEach((w) => onUpdateFrame(w.id, { duration: w.duration, narrationSnippet: w.narrationSnippet }));
           }
         }
       }
@@ -1512,12 +1488,16 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
           }));
 
           if (row.frames.length > 0) {
-            const weighted = calculateWeightedSceneDurations(row.frames, res.duration, text);
+            const framesWithText = row.frames.map((f) => ({
+              ...f,
+              narrationSnippet: getFrameNarrationText(f, row.frames, text),
+            }));
+            const weighted = calculateWeightedSceneDurations(framesWithText, res.duration, text);
             if (weighted.length > 0) {
               if (onUpdateMultipleFrames) {
                 onUpdateMultipleFrames(weighted);
               } else if (onUpdateFrame) {
-                weighted.forEach((w) => onUpdateFrame(w.id, { duration: w.duration }));
+                weighted.forEach((w) => onUpdateFrame(w.id, { duration: w.duration, narrationSnippet: w.narrationSnippet }));
               }
             }
           }
@@ -1580,14 +1560,14 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
       });
 
       // Update frame durations and transitions atomically from AI (SoM anchored)
-      if (pageResult.cenas && pageResult.cenas.length > 0 && row.frames.length > 0) {
-        const frameUpdates: {
-          id: string;
-          duration?: number;
-          transition?: TransitionType;
-          narrationSnippet?: string;
-        }[] = [];
+      let generatedFrameUpdates: {
+        id: string;
+        duration?: number;
+        transition?: TransitionType;
+        narrationSnippet?: string;
+      }[] = [];
 
+      if (pageResult.cenas && pageResult.cenas.length > 0 && row.frames.length > 0) {
         row.frames.forEach((frame, idx) => {
           const cleanFrameLabel = frame.label.toLowerCase().replace(/[\[\]]/g, '').trim();
           const aiScene =
@@ -1601,7 +1581,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
             }) || pageResult.cenas[idx];
 
           if (aiScene) {
-            frameUpdates.push({
+            generatedFrameUpdates.push({
               id: frame.id,
               duration: Number(Math.max(1, Math.min(10, aiScene.duracao_segundos)).toFixed(1)),
               transition: aiScene.transicao,
@@ -1610,11 +1590,11 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
           }
         });
 
-        if (frameUpdates.length > 0) {
+        if (generatedFrameUpdates.length > 0) {
           if (onUpdateMultipleFrames) {
-            onUpdateMultipleFrames(frameUpdates);
+            onUpdateMultipleFrames(generatedFrameUpdates);
           } else if (onUpdateFrame) {
-            frameUpdates.forEach((u) => onUpdateFrame(u.id, u));
+            generatedFrameUpdates.forEach((u) => onUpdateFrame(u.id, u));
           }
         }
       }
@@ -1656,12 +1636,19 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
         }));
 
         if (row.frames.length > 0) {
-          const weighted = calculateWeightedSceneDurations(row.frames, speechRes.duration, scriptText);
+          const framesWithSnippets = row.frames.map((frame) => {
+            const upd = generatedFrameUpdates.find((u) => u.id === frame.id);
+            return {
+              ...frame,
+              narrationSnippet: upd?.narrationSnippet || frame.narrationSnippet || getFrameNarrationText(frame, row.frames, scriptText),
+            };
+          });
+          const weighted = calculateWeightedSceneDurations(framesWithSnippets, speechRes.duration, scriptText);
           if (weighted.length > 0) {
             if (onUpdateMultipleFrames) {
               onUpdateMultipleFrames(weighted);
             } else if (onUpdateFrame) {
-              weighted.forEach((w) => onUpdateFrame(w.id, { duration: w.duration }));
+              weighted.forEach((w) => onUpdateFrame(w.id, { duration: w.duration, narrationSnippet: w.narrationSnippet }));
             }
           }
         }
@@ -1746,6 +1733,8 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
           });
         }
 
+        const chapterSnippetsMap = new Map<string, string>();
+
         for (const pageResult of result.paginas) {
           const targetRow = chRows.find((r) => r.pageNumber === pageResult.pagina_numero);
           if (targetRow && (pageResult.roteiro || (pageResult.cenas && pageResult.cenas.length > 0))) {
@@ -1771,11 +1760,15 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
                   }) || pageResult.cenas[idx];
 
                 if (aiScene) {
+                  const snippetText = aiScene.roteiro_cena?.trim() || '';
+                  if (snippetText) {
+                    chapterSnippetsMap.set(frame.id, snippetText);
+                  }
                   frameUpdates.push({
                     id: frame.id,
                     duration: Number(Math.max(1, Math.min(10, aiScene.duracao_segundos)).toFixed(1)),
                     transition: aiScene.transicao,
-                    narrationSnippet: aiScene.roteiro_cena?.trim(),
+                    narrationSnippet: snippetText,
                   });
                 }
               });
@@ -1838,12 +1831,19 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
               }));
 
               if (targetRow.frames.length > 0) {
-                const weighted = calculateWeightedSceneDurations(targetRow.frames, speechRes.duration, text);
+                const framesWithSnippets = targetRow.frames.map((f) => ({
+                  ...f,
+                  narrationSnippet:
+                    chapterSnippetsMap.get(f.id) ||
+                    f.narrationSnippet ||
+                    getFrameNarrationText(f, targetRow.frames, text),
+                }));
+                const weighted = calculateWeightedSceneDurations(framesWithSnippets, speechRes.duration, text);
                 if (weighted.length > 0) {
                   if (onUpdateMultipleFrames) {
                     onUpdateMultipleFrames(weighted);
                   } else if (onUpdateFrame) {
-                    weighted.forEach((w) => onUpdateFrame(w.id, { duration: w.duration }));
+                    weighted.forEach((w) => onUpdateFrame(w.id, { duration: w.duration, narrationSnippet: w.narrationSnippet }));
                   }
                 }
               }
@@ -2074,6 +2074,30 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
                     <span>🎙️ Gerar Áudios TTS</span>
                   </>
                 )}
+              </button>
+            )}
+
+            {/* Re-align Quadros with Audio Button */}
+            {allFrames.length > 0 && scenes.some((s) => s.audioUrl || s.audioBlob || s.audioDuration) && (
+              <button
+                onClick={() => {
+                  const updates = realignAllFramesWithAudio(allFrames, scenes);
+                  if (updates.length > 0) {
+                    if (onUpdateMultipleFrames) {
+                      onUpdateMultipleFrames(updates);
+                    } else if (onUpdateFrame) {
+                      updates.forEach((u) => onUpdateFrame(u.id, u));
+                    }
+                    showToast(`${updates.length} quadros sincronizados perfeitamente com os áudios!`, 'success');
+                  } else {
+                    showToast('Nenhum quadro necessitou de ajuste temporal.', 'info');
+                  }
+                }}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 text-xs font-semibold transition-colors shadow-2xs cursor-pointer"
+                title="Ajusta o tempo de cada quadro proporcionalmente ao trecho de narração daquele quadro, casando com o áudio total"
+              >
+                <Sparkles className="h-3.5 w-3.5 text-emerald-400" />
+                <span className="hidden sm:inline">Sincronizar Quadros</span>
               </button>
             )}
 
@@ -3061,7 +3085,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
             <div className="space-y-4 text-xs">
               <div className="space-y-1">
                 <label className="font-semibold text-foreground flex items-center justify-between">
-                  <span>Base URL do 9router</span>
+                  <span>Base URL do Provedor / 9router</span>
                   <span className="text-[10px] text-muted-foreground font-mono">
                     OpenAI-compatible (/v1)
                   </span>
@@ -3072,15 +3096,18 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
                   onChange={(e) =>
                     setAiConfig({ ...aiConfig, baseURL: e.target.value.trim() })
                   }
-                  placeholder="https://..."
+                  placeholder="http://localhost:20128/v1"
                   className="w-full px-3 py-2 rounded-md border border-border bg-background font-mono text-xs text-foreground focus:border-primary outline-none"
                 />
+                <p className="text-[10px] text-muted-foreground">
+                  Padrão do ambiente: <code className="font-mono text-foreground">{DEFAULT_AI_CONFIG.baseURL}</code>
+                </p>
               </div>
 
               <div className="space-y-1">
                 <label className="font-semibold text-foreground flex items-center justify-between">
                   <span>API Key</span>
-                  <span className="text-[10px] text-muted-foreground">9router secret</span>
+                  <span className="text-[10px] text-muted-foreground">Opcional para servidores locais</span>
                 </label>
                 <input
                   type="password"
@@ -3088,24 +3115,64 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
                   onChange={(e) =>
                     setAiConfig({ ...aiConfig, apiKey: e.target.value.trim() })
                   }
-                  placeholder="sk-..."
+                  placeholder="Deixe em branco se seu 9router local não exigir chave"
                   className="w-full px-3 py-2 rounded-md border border-border bg-background font-mono text-xs text-foreground focus:border-primary outline-none"
                 />
               </div>
 
               <div className="space-y-1">
-                <label className="font-semibold text-foreground">Modelo de Visão</label>
-                <select
-                  value={aiConfig.model}
-                  onChange={(e) => setAiConfig({ ...aiConfig, model: e.target.value })}
-                  className="w-full px-3 py-2 rounded-md border border-border bg-background text-xs text-foreground focus:border-primary outline-none cursor-pointer"
-                >
-                  {AVAILABLE_MODELS.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.name} — {m.badge}
-                    </option>
-                  ))}
-                </select>
+                <div className="flex items-center justify-between">
+                  <label className="font-semibold text-foreground">Modelo de Visão</label>
+                  <button
+                    type="button"
+                    onClick={() => setIsCustomModel(!isCustomModel)}
+                    className="text-[10px] text-primary hover:underline cursor-pointer"
+                  >
+                    {isCustomModel ? 'Selecionar da lista' : 'Digitar ID manualmente'}
+                  </button>
+                </div>
+
+                {isCustomModel ? (
+                  <input
+                    type="text"
+                    value={aiConfig.model}
+                    onChange={(e) => setAiConfig({ ...aiConfig, model: e.target.value.trim() })}
+                    placeholder="Ex: ag/gemini-3.8-flash-high ou qwen2.5-vl"
+                    className="w-full px-3 py-2 rounded-md border border-border bg-background font-mono text-xs text-foreground focus:border-primary outline-none"
+                  />
+                ) : (
+                  <select
+                    value={aiConfig.model}
+                    onChange={(e) => {
+                      if (e.target.value === '__custom__') {
+                        setIsCustomModel(true);
+                      } else {
+                        setAiConfig({ ...aiConfig, model: e.target.value });
+                      }
+                    }}
+                    className="w-full px-3 py-2 rounded-md border border-border bg-background text-xs text-foreground focus:border-primary outline-none cursor-pointer"
+                  >
+                    <optgroup label="Modelos Recomendados">
+                      {AVAILABLE_MODELS.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.name} — {m.badge}
+                        </option>
+                      ))}
+                    </optgroup>
+                    {detectedModels.filter((id) => !AVAILABLE_MODELS.some((m) => m.id === id)).length > 0 && (
+                      <optgroup label="Modelos Detectados no Endpoint">
+                        {detectedModels
+                          .filter((id) => !AVAILABLE_MODELS.some((m) => m.id === id))
+                          .map((id) => (
+                            <option key={id} value={id}>
+                              {id} (Endpoint)
+                            </option>
+                          ))}
+                      </optgroup>
+                    )}
+                    <option value="__custom__">Outro modelo personalizado...</option>
+                  </select>
+                )}
               </div>
 
               <div className="space-y-1">
@@ -3188,10 +3255,13 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
               <div className="flex items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => setAiConfig(DEFAULT_AI_CONFIG)}
+                  onClick={() => {
+                    setAiConfig(DEFAULT_AI_CONFIG);
+                    setIsCustomModel(!AVAILABLE_MODELS.some((m) => m.id === DEFAULT_AI_CONFIG.model));
+                  }}
                   className="px-3 py-1.5 rounded-md text-xs text-muted-foreground hover:text-foreground cursor-pointer"
                 >
-                  Restaurar Padrão
+                  Restaurar Padrão (.env)
                 </button>
                 <button
                   type="button"

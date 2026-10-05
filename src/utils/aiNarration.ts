@@ -4,7 +4,7 @@
  * Powered by OpenAI-compatible vision endpoints (9router, local LLMs, or cloud models).
  */
 
-import { FrameItem, TransitionType } from '../types';
+import { FrameItem, SceneItem, TransitionType } from '../types';
 import { generateSoMAnnotatedPage } from './somAnnotator';
 
 export function normalizeTransitionType(rawTrans: string, index: number = 0): TransitionType {
@@ -165,12 +165,17 @@ export const AVAILABLE_TTS_MODELS = [
   },
 ];
 
+const ENV_BASE_URL = (import.meta.env.VITE_AI_BASE_URL as string)?.trim() || 'http://localhost:20128/v1';
+const ENV_API_KEY = (import.meta.env.VITE_AI_API_KEY as string)?.trim() || '';
+const ENV_MODEL = (import.meta.env.VITE_AI_MODEL as string)?.trim() || 'ag/gemini-3.8-flash-high';
+const ENV_TTS_MODEL = (import.meta.env.VITE_AI_TTS_MODEL as string)?.trim() || 'edge-tts/pt-BR-AntonioNeural';
+
 export const DEFAULT_AI_CONFIG: AiNarrationConfig = {
   provider: '9router',
-  baseURL: 'https://rg5g7il.abc-tunnel.us/v1',
-  apiKey: 'sk-9f0701a12df427ea-ktrke6-b72acfe0',
-  model: 'ag/gemini-3.8-flash-high',
-  ttsModel: 'edge-tts/pt-BR-AntonioNeural',
+  baseURL: ENV_BASE_URL,
+  apiKey: ENV_API_KEY,
+  model: ENV_MODEL,
+  ttsModel: ENV_TTS_MODEL,
   stylePreset: 'sarcastico',
   temperature: 0.72,
 };
@@ -182,23 +187,30 @@ export function loadAiNarrationConfig(): AiNarrationConfig {
     const saved = localStorage.getItem(STORAGE_KEY_CONFIG);
     if (saved) {
       const parsed = JSON.parse(saved);
-      if (!parsed.baseURL || parsed.baseURL === 'http://127.0.0.1:20128/v1') {
-        parsed.baseURL = 'https://rg5g7il.abc-tunnel.us/v1';
+      // Limpa URLs antigas de túneis temporários ou legados
+      if (parsed.baseURL && parsed.baseURL.includes('abc-tunnel.us')) {
+        parsed.baseURL = DEFAULT_AI_CONFIG.baseURL;
+      }
+      // Se a chave salva for o token de teste antigo, migra para o valor configurado
+      if (parsed.apiKey === 'sk-9f0701a12df427ea-ktrke6-b72acfe0') {
+        parsed.apiKey = DEFAULT_AI_CONFIG.apiKey;
       }
       // Migrate legacy default gemini voice to the requested edge-tts AntonioNeural
       let ttsModel = parsed.ttsModel || DEFAULT_AI_CONFIG.ttsModel;
       if (!ttsModel || ttsModel.includes('gemini-3.1-flash-tts-preview/Fenrir')) {
-        ttsModel = 'edge-tts/pt-BR-AntonioNeural';
+        ttsModel = DEFAULT_AI_CONFIG.ttsModel;
       }
       return {
         ...DEFAULT_AI_CONFIG,
         ...parsed,
-        apiKey: parsed.apiKey || DEFAULT_AI_CONFIG.apiKey,
+        baseURL: parsed.baseURL || DEFAULT_AI_CONFIG.baseURL,
+        apiKey: parsed.apiKey ?? DEFAULT_AI_CONFIG.apiKey,
+        model: parsed.model || DEFAULT_AI_CONFIG.model,
         ttsModel,
       };
     }
   } catch {}
-  return DEFAULT_AI_CONFIG;
+  return { ...DEFAULT_AI_CONFIG };
 }
 
 export function saveAiNarrationConfig(config: AiNarrationConfig): void {
@@ -351,88 +363,135 @@ async function decodeAudioDataDuration(blob: Blob): Promise<number> {
 }
 
 /**
+ * Calcula os pesos fonéticos de um trecho de texto considerando palavras,
+ * comprimento de caracteres e pausas naturais de pontuação (vírgulas, pontos).
+ */
+export function estimateTextPhoneticWeight(text: string): number {
+  if (!text || !text.trim()) return 0;
+  const clean = text.trim();
+
+  const words = clean.split(/\s+/).filter(Boolean);
+  const wordCount = words.length;
+  if (wordCount === 0) return 0;
+
+  // Caracteres sem espaços
+  const charCount = clean.replace(/\s+/g, '').length;
+
+  // Pausas curtas (vírgulas, dois pontos, ponto e vírgula, travessões)
+  const shortPauses = (clean.match(/[,;:\-—–]/g) || []).length;
+
+  // Pausas longas de término de frase (pontos finais, exclamações, interrogações, reticências)
+  const longPauses = (clean.match(/(\.{3}|\.|\!|\?|\n+)/g) || []).length;
+
+  // Fórmula empírica alinhada à cadência de modelos neurais TTS (Edge-TTS / OpenAI)
+  // Palavras base + peso por caracteres + peso proporcional das pausas acústicas
+  const weight = wordCount * 1.0 + charCount * 0.12 + shortPauses * 1.5 + longPauses * 3.0;
+
+  return Math.max(1.0, weight);
+}
+
+/**
  * Passo D: Distribuição Ponderada por Duração Real do Áudio
- * Fórmula: Tempo_Cena_i = audio.duration * (Palavras_Cena_i / Total_Palavras_Pagina)
- * Injeta o tempo calculado no valor de cada quadro/slider (arredondado para 1 casa decimal).
- * Garante que a soma de todos os tempos das cenas seja rigorosamente igual a audio.duration,
- * evitando silêncio excedente ou cortes de fala no final.
+ * Calcula com precisão a duração proporcional de cada quadro em relação ao áudio total gerado,
+ * garantindo que o tempo de exibição do quadro case com o tempo de leitura do seu trecho de texto (narrationSnippet).
+ * Evita atropelos de fala, silêncio fantasma e garante que a soma dos quadros seja rigorosamente igual à duração do áudio.
  */
 export function calculateWeightedSceneDurations(
   frames: { id: string; narrationSnippet?: string; label?: string }[],
   totalAudioDuration: number,
   fallbackFullText?: string
-): { id: string; duration: number }[] {
+): { id: string; duration: number; narrationSnippet?: string }[] {
   if (!frames || frames.length === 0) return [];
 
-  const targetTotal = Number(totalAudioDuration.toFixed(1));
+  const targetTotal = Number(totalAudioDuration.toFixed(2));
 
   if (frames.length === 1) {
-    return [{ id: frames[0].id, duration: Math.max(1.0, targetTotal) }];
+    const singleSnippet = frames[0].narrationSnippet || fallbackFullText || '';
+    return [{ id: frames[0].id, duration: Math.max(1.0, targetTotal), narrationSnippet: singleSnippet }];
   }
 
-  // Conta a quantidade de palavras de cada cena
-  let wordCounts = frames.map((f) => {
-    const txt = (f.narrationSnippet || '').trim();
-    return txt ? txt.split(/\s+/).filter(Boolean).length : 0;
-  });
+  // 1. Calcula os pesos fonéticos individuais com base no narrationSnippet de cada quadro
+  const snippets = frames.map((f) => (f.narrationSnippet || '').trim());
+  let weights = snippets.map((snip) => estimateTextPhoneticWeight(snip));
 
-  // Se os snippets individuais estiverem vazios, divide o texto completo da página proporcionalmente
-  const totalSnippetWords = wordCounts.reduce((a, b) => a + b, 0);
-  if (totalSnippetWords === 0 && fallbackFullText && fallbackFullText.trim()) {
-    const allWords = fallbackFullText.trim().split(/\s+/).filter(Boolean);
-    const wordsPerFrame = Math.max(1, Math.floor(allWords.length / frames.length));
-    wordCounts = frames.map((_, idx) => {
-      if (idx === frames.length - 1) {
-        return Math.max(1, allWords.length - wordsPerFrame * (frames.length - 1));
+  let totalSnippetWeight = weights.reduce((a, b) => a + b, 0);
+
+  // 2. Se os snippets individuais estiverem vazios mas houver fallbackFullText, segmenta as frases do texto
+  if (totalSnippetWeight === 0 && fallbackFullText && fallbackFullText.trim()) {
+    const fullText = fallbackFullText.trim();
+    const sentences = fullText.split(/(?<=[.!?\n])\s+/).filter(Boolean);
+
+    if (sentences.length >= frames.length) {
+      const sentencesPerFrame = Math.max(1, Math.floor(sentences.length / frames.length));
+      for (let i = 0; i < frames.length; i++) {
+        let chunk: string;
+        if (i === frames.length - 1) {
+          chunk = sentences.slice(i * sentencesPerFrame).join(' ');
+        } else {
+          chunk = sentences.slice(i * sentencesPerFrame, (i + 1) * sentencesPerFrame).join(' ');
+        }
+        snippets[i] = chunk;
+        weights[i] = estimateTextPhoneticWeight(chunk);
       }
-      return wordsPerFrame;
-    });
+    } else {
+      const allWords = fullText.split(/\s+/).filter(Boolean);
+      const wordsPerFrame = Math.max(1, Math.floor(allWords.length / frames.length));
+      for (let i = 0; i < frames.length; i++) {
+        let chunk: string;
+        if (i === frames.length - 1) {
+          chunk = allWords.slice(i * wordsPerFrame).join(' ');
+        } else {
+          chunk = allWords.slice(i * wordsPerFrame, (i + 1) * wordsPerFrame).join(' ');
+        }
+        snippets[i] = chunk;
+        weights[i] = estimateTextPhoneticWeight(chunk);
+      }
+    }
+    totalSnippetWeight = weights.reduce((a, b) => a + b, 0);
   }
 
   // Assegura peso mínimo de 1 para evitar divisão por 0
-  const safeWeights = wordCounts.map((w) => Math.max(1, w));
-  const totalWeight = safeWeights.reduce((a, b) => a + b, 0);
+  const safeWeights = weights.map((w) => (w > 0 ? w : 1.0));
+  const finalTotalWeight = safeWeights.reduce((a, b) => a + b, 0);
 
-  // Mínimo por cena para evitar flash imperceptível
-  const minPerScene = targetTotal >= frames.length * 1.0 ? 1.0 : Math.max(0.5, Number((targetTotal / frames.length).toFixed(1)));
+  // Mínimo de segurança por cena (0.6s ou fração segura)
+  const minPerScene = targetTotal >= frames.length * 0.8 ? 0.8 : Math.max(0.4, Number((targetTotal / frames.length).toFixed(2)));
 
-  // Proporção matemática inicial: audio.duration * (Palavras_Cena_i / Total_Palavras_Pagina)
+  // 3. Proporção matemática inicial: audio.duration * (Peso_Cena_i / Total_Pesos)
   const durations = safeWeights.map((w) => {
-    const rawVal = (targetTotal * w) / totalWeight;
-    return Math.max(minPerScene, Number(rawVal.toFixed(1)));
+    const rawVal = (targetTotal * w) / finalTotalWeight;
+    return Math.max(minPerScene, Number(rawVal.toFixed(2)));
   });
 
-  // Calcula discrepância decorrente de arredondamento para 1 casa decimal
-  let currentSum = Number(durations.reduce((acc, d) => acc + d, 0).toFixed(1));
-  let diff = Number((targetTotal - currentSum).toFixed(1));
+  // 4. Ajusta pequenas discrepâncias de arredondamento em centésimos para que sum(durations) === targetTotal
+  let currentSum = Number(durations.reduce((acc, d) => acc + d, 0).toFixed(2));
+  let diff = Number((targetTotal - currentSum).toFixed(2));
 
-  // Ajusta os décimos (±0.1s) nas cenas com maior peso para garantir que a soma seja rigorosamente igual a targetTotal
   let iterations = 0;
-  while (Math.abs(diff) >= 0.05 && iterations < 50) {
+  while (Math.abs(diff) >= 0.01 && iterations < 100) {
     iterations++;
+    const step = diff > 0 ? 0.01 : -0.01;
     if (diff > 0) {
-      // Falta tempo: adiciona +0.1s à cena com maior peso
       let bestIdx = 0;
       for (let i = 1; i < durations.length; i++) {
         if (safeWeights[i] > safeWeights[bestIdx]) {
           bestIdx = i;
         }
       }
-      durations[bestIdx] = Number((durations[bestIdx] + 0.1).toFixed(1));
-      diff = Number((diff - 0.1).toFixed(1));
+      durations[bestIdx] = Number((durations[bestIdx] + step).toFixed(2));
+      diff = Number((diff - step).toFixed(2));
     } else {
-      // Sobra tempo: subtrai -0.1s da cena com maior duração (respeitando o mínimo de segurança)
       let maxIdx = -1;
       let maxVal = -Infinity;
       for (let i = 0; i < durations.length; i++) {
-        if (durations[i] > minPerScene && durations[i] > maxVal) {
+        if (durations[i] > minPerScene + 0.05 && durations[i] > maxVal) {
           maxVal = durations[i];
           maxIdx = i;
         }
       }
       if (maxIdx >= 0) {
-        durations[maxIdx] = Number((durations[maxIdx] - 0.1).toFixed(1));
-        diff = Number((diff + 0.1).toFixed(1));
+        durations[maxIdx] = Number((durations[maxIdx] + step).toFixed(2));
+        diff = Number((diff - step).toFixed(2));
       } else {
         break;
       }
@@ -441,8 +500,116 @@ export function calculateWeightedSceneDurations(
 
   return frames.map((f, idx) => ({
     id: f.id,
-    duration: Number(durations[idx].toFixed(1)),
+    duration: Number(durations[idx].toFixed(2)),
+    narrationSnippet: snippets[idx] || f.narrationSnippet,
   }));
+}
+
+/**
+ * Retorna o trecho de texto específico associado a um determinado quadro.
+ * Se o quadro possuir um narrationSnippet explícito, utiliza-o.
+ * Caso contrário, segmenta o texto completo da página proporcionalmente por frases ou palavras.
+ */
+export function getFrameNarrationText(
+  frame: FrameItem,
+  allPageFrames: FrameItem[],
+  fullPageText: string
+): string {
+  if (frame.narrationSnippet && frame.narrationSnippet.trim()) {
+    return frame.narrationSnippet.trim();
+  }
+  if (!fullPageText || !fullPageText.trim()) return '';
+
+  const sentences = fullPageText
+    .split(/(?<=[.!?…])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (sentences.length === 0) return fullPageText.trim();
+
+  const frameIdx = allPageFrames.findIndex((f) => f.id === frame.id);
+  if (frameIdx < 0) return fullPageText.trim();
+
+  if (sentences.length === allPageFrames.length) {
+    return sentences[frameIdx];
+  }
+
+  const sentencesPerFrame = Math.max(
+    1,
+    Math.round(sentences.length / Math.max(1, allPageFrames.length))
+  );
+  const start = frameIdx * sentencesPerFrame;
+  const slice = sentences.slice(start, start + sentencesPerFrame);
+  return slice.join(' ') || sentences[sentences.length - 1] || fullPageText.trim();
+}
+
+/**
+ * Alinha e sincroniza rigorosamente a duração de todos os quadros com os áudios gerados,
+ * distribuindo o tempo de cada quadro proporcionalmente ao peso fonético de seu trecho de texto (narrationSnippet).
+ * Garante que:
+ * 1. Cada quadro fique na tela exatamente o tempo necessário para que seu texto seja narrado.
+ * 2. A soma dos tempos dos quadros de cada página/cena seja exatamente igual à duração do áudio daquela página.
+ * 3. O áudio do próximo capítulo/página entre sem nenhum atraso acumulado ou silêncio.
+ */
+export function realignAllFramesWithAudio(
+  frames: FrameItem[],
+  scenes: SceneItem[]
+): { id: string; duration: number; narrationSnippet?: string }[] {
+  if (!frames || frames.length === 0) return [];
+
+  const updates: { id: string; duration: number; narrationSnippet?: string }[] = [];
+
+  // Agrupa os quadros por chave (chapterId + pageNumber)
+  const pageMap = new Map<string, FrameItem[]>();
+  frames.forEach((f) => {
+    const key = `${f.chapterId || ''}_p${f.pageNumber ?? 1}`;
+    if (!pageMap.has(key)) {
+      pageMap.set(key, []);
+    }
+    pageMap.get(key)!.push(f);
+  });
+
+  // Para cada grupo de quadros da página:
+  pageMap.forEach((pageFrames) => {
+    const sample = pageFrames[0];
+    const matchedScene = scenes.find(
+      (s) =>
+        (s.chapterId && sample.chapterId && s.pageNumber && sample.pageNumber &&
+          s.chapterId === sample.chapterId && Number(s.pageNumber) === Number(sample.pageNumber)) ||
+        s.frames?.some((sf) => pageFrames.some((pf) => pf.id === sf.id)) ||
+        (s.pageNumber && sample.pageNumber && Number(s.pageNumber) === Number(sample.pageNumber))
+    );
+
+    const fullText = matchedScene?.text?.trim() || '';
+    const audioDur = matchedScene?.audioDuration;
+
+    // Se temos áudio gerado com duração válida:
+    if (audioDur && audioDur > 0) {
+      const framesWithText = pageFrames.map((f) => ({
+        id: f.id,
+        narrationSnippet: getFrameNarrationText(f, pageFrames, fullText),
+        label: f.label,
+      }));
+
+      const weighted = calculateWeightedSceneDurations(framesWithText, audioDur, fullText);
+      updates.push(...weighted);
+    } else if (fullText) {
+      // Se não há áudio gerado mas há texto, calcula a duração estimada com base na fala natural (~135 palavras/min)
+      const totalWords = fullText.split(/\s+/).filter(Boolean).length;
+      const estimatedAudioDur = Math.max(pageFrames.length * 1.5, (totalWords / 135) * 60);
+
+      const framesWithText = pageFrames.map((f) => ({
+        id: f.id,
+        narrationSnippet: getFrameNarrationText(f, pageFrames, fullText),
+        label: f.label,
+      }));
+
+      const weighted = calculateWeightedSceneDurations(framesWithText, estimatedAudioDur, fullText);
+      updates.push(...weighted);
+    }
+  });
+
+  return updates;
 }
 
 export interface GenerateSpeechOptions {
@@ -471,23 +638,27 @@ export async function generate9routerSpeech(
     throw new Error('Nenhum texto de narração para gerar áudio.');
   }
 
-  let base = (config.baseURL || 'https://rg5g7il.abc-tunnel.us/v1').replace(/\/+$/, '');
+  let base = (config.baseURL || DEFAULT_AI_CONFIG.baseURL).replace(/\/+$/, '');
   const ttsUrl = base.endsWith('/v1') ? `${base}/audio/speech` : `${base}/v1/audio/speech`;
   const model =
-    options.model || config.ttsModel || 'edge-tts/pt-BR-AntonioNeural';
-  const apiKey = config.apiKey || 'sk-9f0701a12df427ea-ktrke6-b72acfe0';
+    options.model || config.ttsModel || DEFAULT_AI_CONFIG.ttsModel;
+  const apiKey = (config.apiKey ?? DEFAULT_AI_CONFIG.apiKey).trim();
 
   const payload = {
     model,
     input: text,
   };
 
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (apiKey) {
+    headers['Authorization'] = `Bearer ${apiKey}`;
+  }
+
   const response = await fetch(ttsUrl, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
+    headers,
     body: JSON.stringify(payload),
   });
 
@@ -570,31 +741,83 @@ export async function prepareImageForAi(
   });
 }
 
+export interface TestAiConnectionResult {
+  success: boolean;
+  message: string;
+  models?: string[];
+}
+
+/**
+ * Busca a lista de modelos disponíveis no endpoint compatível com OpenAI (/models)
+ */
+export async function fetchAvailableModels(config: AiNarrationConfig): Promise<string[]> {
+  const base = (config.baseURL || DEFAULT_AI_CONFIG.baseURL).replace(/\/+$/, '');
+  const url = base.endsWith('/v1') ? `${base}/models` : `${base}/v1/models`;
+  const apiKey = (config.apiKey ?? DEFAULT_AI_CONFIG.apiKey).trim();
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (apiKey) {
+    headers['Authorization'] = `Bearer ${apiKey}`;
+  }
+
+  const res = await fetch(url, {
+    method: 'GET',
+    headers,
+  });
+
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+  }
+
+  const data = await res.json().catch(() => null);
+  const modelList: string[] = [];
+  if (Array.isArray(data?.data)) {
+    for (const item of data.data) {
+      if (item?.id && typeof item.id === 'string') {
+        modelList.push(item.id);
+      }
+    }
+  }
+  return modelList;
+}
+
 /**
  * Tests connection to the 9router / OpenAI-compatible endpoint
  */
-export async function testAiConnection(config: AiNarrationConfig): Promise<{
-  success: boolean;
-  message: string;
-}> {
-  const base = config.baseURL.replace(/\/+$/, '');
-  const url = `${base}/models`;
+export async function testAiConnection(config: AiNarrationConfig): Promise<TestAiConnectionResult> {
+  const base = (config.baseURL || DEFAULT_AI_CONFIG.baseURL).replace(/\/+$/, '');
+  const url = base.endsWith('/v1') ? `${base}/models` : `${base}/v1/models`;
+  const apiKey = (config.apiKey ?? DEFAULT_AI_CONFIG.apiKey).trim();
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (apiKey) {
+    headers['Authorization'] = `Bearer ${apiKey}`;
+  }
 
   try {
     const res = await fetch(url, {
       method: 'GET',
-      headers: {
-        Authorization: `Bearer ${config.apiKey}`,
-        'Content-Type': 'application/json',
-      },
+      headers,
     });
 
     if (res.ok) {
       const data = await res.json().catch(() => null);
-      const modelCount = data?.data?.length || 0;
+      const modelList: string[] = [];
+      if (Array.isArray(data?.data)) {
+        for (const item of data.data) {
+          if (item?.id && typeof item.id === 'string') {
+            modelList.push(item.id);
+          }
+        }
+      }
       return {
         success: true,
-        message: `Conexão bem-sucedida com o 9router! (${modelCount > 0 ? `${modelCount} modelos disponíveis` : 'Online'})`,
+        message: `Conexão bem-sucedida! (${modelList.length > 0 ? `${modelList.length} modelos detectados` : 'Online'})`,
+        models: modelList,
       };
     } else {
       return {
@@ -608,7 +831,7 @@ export async function testAiConnection(config: AiNarrationConfig): Promise<{
       return {
         success: false,
         message:
-          `Não foi possível conectar em ${config.baseURL}. Verifique se o túnel ou 9router está ativo.`,
+          `Não foi possível conectar em ${base}. Verifique se o servidor de IA ou 9router está ativo.`,
       };
     }
     return {
@@ -874,10 +1097,11 @@ Gere no array "cenas" desta página exatamente as cenas correspondentes a cada m
     });
   }
 
-  const endpoint = `${config.baseURL.replace(/\/+$/, '')}/chat/completions`;
+  const base = (config.baseURL || DEFAULT_AI_CONFIG.baseURL).replace(/\/+$/, '');
+  const endpoint = base.endsWith('/v1') ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
 
   const payload = {
-    model: config.model,
+    model: config.model || DEFAULT_AI_CONFIG.model,
     stream: false,
     response_format: { type: 'json_object' },
     messages: [
@@ -894,13 +1118,18 @@ Gere no array "cenas" desta página exatamente as cenas correspondentes a cada m
     max_tokens: 4500,
   };
 
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json, text/event-stream, */*',
+  };
+  const apiKey = (config.apiKey ?? DEFAULT_AI_CONFIG.apiKey).trim();
+  if (apiKey) {
+    headers['Authorization'] = `Bearer ${apiKey}`;
+  }
+
   const response = await fetch(endpoint, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json, text/event-stream, */*',
-      Authorization: `Bearer ${config.apiKey}`,
-    },
+    headers,
     body: JSON.stringify(payload),
   });
 
@@ -1084,10 +1313,11 @@ Retorne no formato JSON:
   ]
 }`;
 
-  const endpoint = `${config.baseURL.replace(/\/+$/, '')}/chat/completions`;
+  const base = (config.baseURL || DEFAULT_AI_CONFIG.baseURL).replace(/\/+$/, '');
+  const endpoint = base.endsWith('/v1') ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
 
   const payload = {
-    model: config.model,
+    model: config.model || DEFAULT_AI_CONFIG.model,
     stream: false,
     response_format: { type: 'json_object' },
     messages: [
@@ -1115,13 +1345,18 @@ Retorne no formato JSON:
     max_tokens: 2000,
   };
 
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json, text/event-stream, */*',
+  };
+  const apiKey = (config.apiKey ?? DEFAULT_AI_CONFIG.apiKey).trim();
+  if (apiKey) {
+    headers['Authorization'] = `Bearer ${apiKey}`;
+  }
+
   const response = await fetch(endpoint, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json, text/event-stream, */*',
-      Authorization: `Bearer ${config.apiKey}`,
-    },
+    headers,
     body: JSON.stringify(payload),
   });
 
