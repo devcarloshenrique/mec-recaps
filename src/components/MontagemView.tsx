@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   Play,
   Pause,
@@ -26,6 +26,7 @@ import {
 } from 'lucide-react';
 import { ChapterItem, FrameItem, SceneItem } from '../types';
 import { FramingMode, FRAMING_MODES } from '../utils/videoRenderer';
+import { realignAllFramesWithAudio } from '../utils/aiNarration';
 
 interface MontagemViewProps {
   chapters?: ChapterItem[];
@@ -33,6 +34,7 @@ interface MontagemViewProps {
   scenes: SceneItem[];
   onExportRecap: (format?: 'mp4' | 'webm' | 'shotcut' | string) => void;
   onUpdateFrameDuration?: (frameId: string, duration: number) => void;
+  onUpdateMultipleFrames?: (updates: { id: string; duration?: number; transition?: any; narrationSnippet?: string }[]) => void;
   onReorderFrames?: (newFrames: FrameItem[]) => void;
   onRemoveFrame?: (frameId: string) => void;
   onGoToRecorte?: () => void;
@@ -71,6 +73,7 @@ export const MontagemView: React.FC<MontagemViewProps> = ({
   scenes,
   onExportRecap,
   onUpdateFrameDuration,
+  onUpdateMultipleFrames,
   onReorderFrames,
   onRemoveFrame,
   onGoToRecorte,
@@ -85,6 +88,7 @@ export const MontagemView: React.FC<MontagemViewProps> = ({
   const [previewAspect, setPreviewAspect] = useState<'16:9' | '9:16'>('16:9');
   const [enableTtsPlayback, setEnableTtsPlayback] = useState<boolean>(true);
   const [playingClipAudioId, setPlayingClipAudioId] = useState<string | null>(null);
+  const [frameAspectMap, setFrameAspectMap] = useState<Record<string, number>>({});
   const lastSpokenSceneIdRef = useRef<string | null>(null);
 
   // Drag and drop state for timeline frames
@@ -127,27 +131,61 @@ export const MontagemView: React.FC<MontagemViewProps> = ({
     return () => clearInterval(interval);
   }, [isPlaying, totalDuration]);
 
-  // Determine which frame is active at currentTime
+  // Cache of object URLs created from audioBlob to ensure audio playback works seamlessly
+  const [blobAudioUrls, setBlobAudioUrls] = useState<{ [sceneId: string]: string }>({});
+
+  useEffect(() => {
+    const newUrls: { [sceneId: string]: string } = {};
+    let hasNew = false;
+    scenes.forEach((s) => {
+      if (!s.audioUrl && s.audioBlob && !blobAudioUrls[s.id]) {
+        try {
+          newUrls[s.id] = URL.createObjectURL(s.audioBlob);
+          hasNew = true;
+        } catch {}
+      }
+    });
+    if (hasNew) {
+      setBlobAudioUrls((prev) => ({ ...prev, ...newUrls }));
+    }
+  }, [scenes, blobAudioUrls]);
+
+  useEffect(() => {
+    return () => {
+      Object.values(blobAudioUrls).forEach((url) => {
+        try {
+          URL.revokeObjectURL(url);
+        } catch {}
+      });
+    };
+  }, [blobAudioUrls]);
+
+  // Determine which frame is active at currentTime and compute its progress
   let accumulatedTime = 0;
   let activeFrameIndex = 0;
+  let activeFrameStart = 0;
   for (let i = 0; i < frames.length; i++) {
     const dur = frames[i].duration || 4;
-    accumulatedTime += dur;
-    if (currentTime <= accumulatedTime) {
+    if (currentTime < accumulatedTime + dur || i === frames.length - 1) {
       activeFrameIndex = i;
+      activeFrameStart = accumulatedTime;
       break;
     }
+    accumulatedTime += dur;
   }
   const activeFrame = frames[activeFrameIndex] || frames[0] || null;
+  const activeFrameDuration = Math.max(0.1, activeFrame?.duration || 4);
+  const frameProgress = Math.max(0, Math.min(1, (currentTime - activeFrameStart) / activeFrameDuration));
 
-  // Find active scene strictly matching activeFrame's chapter and page
+  // Find active scene matching activeFrame
   const activeScene =
     (activeFrame
       ? scenes.find(
           (s) =>
             (s.chapterId && activeFrame.chapterId && s.pageNumber && activeFrame.pageNumber &&
-              s.chapterId === activeFrame.chapterId && s.pageNumber === activeFrame.pageNumber) ||
-            s.frames?.some((sf) => sf.id === activeFrame.id)
+              s.chapterId === activeFrame.chapterId && Number(s.pageNumber) === Number(activeFrame.pageNumber)) ||
+            s.frames?.some((sf) => sf.id === activeFrame.id) ||
+            (s.pageNumber && activeFrame.pageNumber && Number(s.pageNumber) === Number(activeFrame.pageNumber))
         )
       : null) ||
     (scenes.length > 0
@@ -187,33 +225,116 @@ export const MontagemView: React.FC<MontagemViewProps> = ({
     }
   };
 
-  // Speak / play active scene audio or fallback TTS text if toggle is enabled during playback
+  // Build audio schedule matching exported video timeline
+  const audioSchedule = useMemo(() => {
+    const sceneStartTimes: { [sceneId: string]: number } = {};
+    let accTime = 0;
+    for (let i = 0; i < frames.length; i++) {
+      const f = frames[i];
+      const dur = f.duration || 4;
+      const matchedScene = scenes.find(
+        (s) =>
+          (s.chapterId && f.chapterId && s.pageNumber && f.pageNumber &&
+            s.chapterId === f.chapterId && Number(s.pageNumber) === Number(f.pageNumber)) ||
+          s.frames?.some((sf) => sf.id === f.id) ||
+          (s.pageNumber && f.pageNumber && Number(s.pageNumber) === Number(f.pageNumber))
+      );
+      if (matchedScene && sceneStartTimes[matchedScene.id] === undefined) {
+        sceneStartTimes[matchedScene.id] = accTime;
+      }
+      accTime += dur;
+    }
+
+    const schedule: {
+      sceneId: string;
+      audioUrl: string;
+      startTime: number;
+      duration: number;
+      scene: SceneItem;
+    }[] = [];
+
+    const scenesWithAudio = scenes.filter((s) => s.audioUrl || s.audioBlob || blobAudioUrls[s.id]);
+    scenesWithAudio.forEach((s, idx) => {
+      const audioUrl = s.audioUrl || blobAudioUrls[s.id];
+      if (!audioUrl) return;
+
+      let startTime = sceneStartTimes[s.id];
+      if (startTime === undefined) {
+        if (s.pageNumber && frames.length > 0) {
+          const pages = [...new Set(frames.map((f) => Number(f.pageNumber) || 1))].sort((a, b) => a - b);
+          const pIdx = pages.indexOf(Number(s.pageNumber));
+          startTime = pIdx !== -1 ? (pIdx / pages.length) * totalDuration : (idx / scenesWithAudio.length) * totalDuration;
+        } else {
+          startTime = (idx / scenesWithAudio.length) * totalDuration;
+        }
+      }
+      const dur = s.audioDuration || 4;
+      schedule.push({
+        sceneId: s.id,
+        audioUrl,
+        startTime,
+        duration: dur,
+        scene: s,
+      });
+    });
+
+    return schedule;
+  }, [scenes, frames, totalDuration, blobAudioUrls]);
+
+  // Synchronized audio playback with timeline currentTime
+  const currentAudioScheduleItem = useMemo(() => {
+    if (!enableTtsPlayback) return null;
+    return (
+      audioSchedule.find(
+        (item: { startTime: number; duration: number }) =>
+          currentTime >= item.startTime && currentTime < item.startTime + item.duration
+      ) || null
+    );
+  }, [audioSchedule, currentTime, enableTtsPlayback]);
+
   useEffect(() => {
-    if (isPlaying && enableTtsPlayback && activeScene && activeScene.id !== lastSpokenSceneIdRef.current) {
-      lastSpokenSceneIdRef.current = activeScene.id;
-      if (activeScene.audioUrl && montagemAudioRef.current) {
-        if ('speechSynthesis' in window) window.speechSynthesis.cancel();
-        montagemAudioRef.current.src = activeScene.audioUrl;
-        montagemAudioRef.current.currentTime = 0;
-        montagemAudioRef.current.play().catch(() => {});
-      } else if ('speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
-        const utter = new SpeechSynthesisUtterance(activeScene.text);
-        utter.lang = 'pt-BR';
-        utter.rate = 1.15;
-        window.speechSynthesis.speak(utter);
+    if (playingClipAudioId) return; // Dedicated clip preview is playing
+    const audioEl = montagemAudioRef.current;
+    if (!audioEl) return;
+
+    if (!isPlaying || !enableTtsPlayback) {
+      if (!audioEl.paused) audioEl.pause();
+      if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+      return;
+    }
+
+    if (currentAudioScheduleItem) {
+      if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+      const targetTime = Math.max(0, currentTime - currentAudioScheduleItem.startTime);
+
+      if (audioEl.src !== currentAudioScheduleItem.audioUrl) {
+        audioEl.src = currentAudioScheduleItem.audioUrl;
+        audioEl.currentTime = targetTime;
+        audioEl.play().catch(() => {});
+      } else {
+        if (Math.abs(audioEl.currentTime - targetTime) > 0.35) {
+          audioEl.currentTime = targetTime;
+        }
+        if (audioEl.paused) {
+          audioEl.play().catch(() => {});
+        }
+      }
+    } else {
+      if (!audioEl.paused) audioEl.pause();
+
+      // Fallback: only use robotic browser SpeechSynthesis if the project has NO API narration audio at all
+      if (audioSchedule.length === 0 && activeScene?.text && activeScene.id !== lastSpokenSceneIdRef.current) {
+        lastSpokenSceneIdRef.current = activeScene.id;
+        if ('speechSynthesis' in window) {
+          window.speechSynthesis.cancel();
+          const utter = new SpeechSynthesisUtterance(activeScene.text);
+          utter.lang = 'pt-BR';
+          utter.rate = 1.15;
+          window.speechSynthesis.speak(utter);
+        }
       }
     }
-    if (!isPlaying) {
-      lastSpokenSceneIdRef.current = null;
-      if (montagemAudioRef.current && !montagemAudioRef.current.paused && !playingClipAudioId) {
-        montagemAudioRef.current.pause();
-      }
-      if ('speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
-      }
-    }
-  }, [isPlaying, enableTtsPlayback, activeScene, playingClipAudioId]);
+  }, [isPlaying, currentTime, currentAudioScheduleItem, enableTtsPlayback, playingClipAudioId, audioSchedule.length, activeScene]);
 
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
@@ -472,34 +593,71 @@ export const MontagemView: React.FC<MontagemViewProps> = ({
                       <img
                         src={activeFrame.src}
                         alt=""
-                        className="w-full h-full object-cover scale-115 filter blur-[32px] opacity-80 transition-all duration-1000 transform-gpu"
+                        className="w-full h-full object-cover scale-120 filter blur-[32px] opacity-75 transform-gpu"
                       />
-                      {/* Leve escurecimento / overlay de contraste (20%-30%) */}
-                      <div className="absolute inset-0 bg-black/28" />
+                      {/* Escurecimento para contraste idêntico à imagem de referência */}
+                      <div className="absolute inset-0 bg-black/32" />
                     </div>
 
-                    {/* 2. Camada Principal (Foreground Layer): Proporção Real, Fit 96% e Sombra Suave */}
-                    <div className="relative z-1 h-full w-full flex items-center justify-center p-2.5">
-                      <img
-                        src={activeFrame.src}
-                        alt={activeFrame.label}
-                        className={`max-h-[96%] max-w-full object-contain rounded-xs shadow-[0_16px_40px_rgba(0,0,0,0.8)] ring-1 ring-white/10 transition-all duration-1000 ${
-                          isPlaying
-                            ? activeFrame.transition === 'zoom_in'
-                              ? 'scale-104'
-                              : activeFrame.transition === 'zoom_out'
-                              ? 'scale-96'
-                              : activeFrame.transition === 'pan_down'
-                              ? 'translate-y-1 scale-102'
-                              : activeFrame.transition === 'fade'
-                              ? 'animate-fade-in'
-                              : selectedTransition === 'Zoom dinâmico'
-                              ? 'scale-104'
-                              : 'scale-100'
-                            : 'scale-100'
-                        }`}
-                      />
-                    </div>
+                    {/* 2. Camada Principal (Foreground Layer): Sangria Permanente (Overbleed), Borda Espessa e Animação Travada */}
+                    {(() => {
+                      const canvasRatio = previewAspect === '16:9' ? 16 / 9 : 9 / 16;
+                      const detectedAspect =
+                        frameAspectMap[activeFrame.id] ||
+                        (activeFrame.cropRect && activeFrame.cropRect.height > 0
+                          ? activeFrame.cropRect.width / activeFrame.cropRect.height
+                          : activeFrame.ratio === '16:9'
+                          ? 16 / 9
+                          : activeFrame.ratio === '1:1'
+                          ? 1
+                          : activeFrame.ratio === '4:3'
+                          ? 4 / 3
+                          : 0.55);
+                      const isPortraitDominant = detectedAspect < canvasRatio;
+
+                      // Calcula a escala da animação travando um piso mínimo de 1.0 (de modo que as bordas no eixo de sangria NUNCA entrem na tela, mesmo em zoom out)
+                      let animScale = 1.0;
+                      let animTranslateY = 0;
+                      if (isPlaying) {
+                        const trans = activeFrame.transition || (selectedTransition === 'Zoom dinâmico' ? 'zoom_in' : 'cut');
+                        if (trans === 'zoom_out') {
+                          animScale = 1.045 - frameProgress * 0.045; // Inicia em 1.045 e reduz somente até 1.0 (piso de 104.5%)
+                        } else if (trans === 'pan_down') {
+                          animScale = 1.05;
+                          animTranslateY = (frameProgress - 0.5) * -8;
+                        } else {
+                          // zoom_in ou avanço suave padrão
+                          animScale = 1.0 + frameProgress * 0.045; // Inicia em 1.0 (104.5%) e cresce até 1.045
+                        }
+                      }
+
+                      return (
+                        <div className="relative z-1 h-full w-full flex items-center justify-center overflow-hidden">
+                          <img
+                            src={activeFrame.src}
+                            alt={activeFrame.label}
+                            onLoad={(e) => {
+                              const nw = e.currentTarget.naturalWidth;
+                              const nh = e.currentTarget.naturalHeight;
+                              if (nw && nh) {
+                                const asp = nw / nh;
+                                setFrameAspectMap((prev) =>
+                                  prev[activeFrame.id] === asp ? prev : { ...prev, [activeFrame.id]: asp }
+                                );
+                              }
+                            }}
+                            style={{
+                              ...(isPortraitDominant
+                                ? { height: '104.5%', width: 'auto', maxWidth: 'none', maxHeight: 'none' }
+                                : { width: '104.5%', height: 'auto', maxWidth: 'none', maxHeight: 'none' }),
+                              transform: `scale(${animScale}) translate3d(0, ${animTranslateY}px, 0)`,
+                              transition: isPlaying ? 'transform 120ms linear' : 'transform 300ms ease-out',
+                            }}
+                            className="object-contain shrink-0 shadow-[0_20px_50px_rgba(0,0,0,0.85)] border-[5px] md:border-[6px] border-white"
+                          />
+                        </div>
+                      );
+                    })()}
                   </>
                 ) : previewFramingMode === 'cover' ? (
                   <img
@@ -531,16 +689,20 @@ export const MontagemView: React.FC<MontagemViewProps> = ({
                   </div>
                 )}
 
-                {/* Subtitle Box at Bottom of Player if active scene text exists */}
-                {activeScene?.text && (
-                  <div className="absolute bottom-3 left-4 right-4 z-10 flex justify-center pointer-events-none">
-                    <div className="max-w-[85%] rounded-lg bg-black/80 backdrop-blur-md px-3.5 py-1.5 border border-white/15 shadow-xl text-center">
-                      <p className="text-white text-xs sm:text-sm font-medium drop-shadow-md line-clamp-2">
-                        {activeScene.text}
-                      </p>
+                {/* Subtitle Box at Bottom of Player (shows active frame's snippet or page text) */}
+                {(() => {
+                  const subtitleText = activeFrame?.narrationSnippet?.trim() || activeScene?.text;
+                  if (!subtitleText) return null;
+                  return (
+                    <div className="absolute bottom-3 left-4 right-4 z-10 flex justify-center pointer-events-none">
+                      <div className="max-w-[85%] rounded-lg bg-black/85 backdrop-blur-md px-3.5 py-1.5 border border-white/15 shadow-xl text-center">
+                        <p className="text-white text-xs sm:text-sm font-medium drop-shadow-md line-clamp-2">
+                          {subtitleText}
+                        </p>
+                      </div>
                     </div>
-                  </div>
-                )}
+                  );
+                })()}
               </div>
             ) : (
               <div className="text-center text-muted-foreground">
@@ -563,26 +725,39 @@ export const MontagemView: React.FC<MontagemViewProps> = ({
                 </span>
 
                 {/* AI Audio Status in Player Overlay */}
-                {activeScene?.audioUrl ? (
-                  <span className="px-2.5 py-1 rounded bg-emerald-950/85 text-emerald-300 text-[11px] font-semibold backdrop-blur border border-emerald-500/40 shadow flex items-center gap-1.5 animate-fade-in">
-                    <span className="relative flex h-2 w-2">
-                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                      <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-                    </span>
-                    <Volume2 className="h-3 w-3 text-emerald-400" />
-                    <span>Áudio IA Pronto</span>
-                    {activeScene.audioDuration && (
-                      <span className="font-mono text-[10px] text-emerald-400/80">
-                        ({activeScene.audioDuration.toFixed(1)}s)
+                {(() => {
+                  const hasApiAudio = Boolean(
+                    activeScene?.audioUrl ||
+                    activeScene?.audioBlob ||
+                    (activeScene?.id && blobAudioUrls[activeScene.id])
+                  );
+                  if (hasApiAudio) {
+                    return (
+                      <span className="px-2.5 py-1 rounded bg-emerald-950/85 text-emerald-300 text-[11px] font-semibold backdrop-blur border border-emerald-500/40 shadow flex items-center gap-1.5 animate-fade-in">
+                        <span className="relative flex h-2 w-2">
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                          <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                        </span>
+                        <Volume2 className="h-3 w-3 text-emerald-400" />
+                        <span>Áudio IA Pronto</span>
+                        {activeScene?.audioDuration && (
+                          <span className="font-mono text-[10px] text-emerald-400/80">
+                            ({activeScene.audioDuration.toFixed(1)}s)
+                          </span>
+                        )}
                       </span>
-                    )}
-                  </span>
-                ) : activeScene?.text ? (
-                  <span className="px-2 py-1 rounded bg-amber-950/80 text-amber-300 text-[11px] font-medium backdrop-blur border border-amber-500/40 shadow flex items-center gap-1.5">
-                    <VolumeX className="h-3 w-3 text-amber-400" />
-                    <span>Voz Navegador</span>
-                  </span>
-                ) : null}
+                    );
+                  }
+                  if (activeScene?.text) {
+                    return (
+                      <span className="px-2 py-1 rounded bg-amber-950/80 text-amber-300 text-[11px] font-medium backdrop-blur border border-amber-500/40 shadow flex items-center gap-1.5">
+                        <VolumeX className="h-3 w-3 text-amber-400" />
+                        <span>Voz Navegador</span>
+                      </span>
+                    );
+                  }
+                  return null;
+                })()}
               </div>
             )}
 
@@ -691,6 +866,17 @@ export const MontagemView: React.FC<MontagemViewProps> = ({
                   {' · '}Página {activeFrame.pageNumber || 1}
                 </p>
               </div>
+
+              {activeFrame.narrationSnippet && (
+                <div className="pt-1.5 border-t border-border/60">
+                  <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider mb-1">
+                    Fala deste Quadro:
+                  </p>
+                  <p className="text-xs text-foreground bg-secondary/50 p-2 rounded border border-border/40 italic line-clamp-3">
+                    "{activeFrame.narrationSnippet}"
+                  </p>
+                </div>
+              )}
 
               <div className="flex items-center justify-between pt-1 border-t border-border text-[11px] text-muted-foreground">
                 <span>Duração do Quadro:</span>
@@ -868,6 +1054,24 @@ export const MontagemView: React.FC<MontagemViewProps> = ({
               <RotateCcw className="h-3 w-3 text-primary" />
               <span>Ordem Cronológica</span>
             </button>
+
+            {/* Auto-sync frame durations with speech snippets */}
+            {onUpdateMultipleFrames && scenes.some((s) => s.audioUrl || s.audioBlob || s.audioDuration) && (
+              <button
+                onClick={() => {
+                  const updates = realignAllFramesWithAudio(frames, scenes);
+                  if (updates.length > 0) {
+                    onUpdateMultipleFrames(updates);
+                  }
+                }}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-md border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 font-medium transition-colors shadow-2xs cursor-pointer"
+                title="Sincroniza o tempo de cada quadro com a leitura de seu trecho de texto, casando perfeitamente com a narração"
+              >
+                <Sparkles className="h-3 w-3 text-emerald-400" />
+                <span className="hidden md:inline">Sincronizar Fala dos Quadros</span>
+                <span className="md:hidden">Sincronizar</span>
+              </button>
+            )}
 
             {/* Zoom Controls */}
             <div className="flex items-center gap-1 bg-card border border-border rounded-md p-0.5">
@@ -1153,7 +1357,10 @@ export const MontagemView: React.FC<MontagemViewProps> = ({
                           s.frames?.some((sf) => pGroup.frames.some((pf) => pf.id === sf.id))
                       ) || scenes.find((s) => s.pageNumber === pGroup.pageNumber);
 
-                    const hasAudio = Boolean(pageScene?.audioUrl);
+                    const clipAudioUrl =
+                      pageScene?.audioUrl ||
+                      (pageScene?.id ? blobAudioUrls[pageScene.id] : null);
+                    const hasAudio = Boolean(clipAudioUrl);
                     const hasText = Boolean(pageScene?.text?.trim());
                     const isClipPlaying = pageScene && playingClipAudioId === pageScene.id;
 
@@ -1180,8 +1387,8 @@ export const MontagemView: React.FC<MontagemViewProps> = ({
                               type="button"
                               onClick={(e) => {
                                 e.stopPropagation();
-                                if (pageScene && pageScene.audioUrl) {
-                                  handlePlayClipAudio(pageScene.audioUrl, pageScene.id);
+                                if (pageScene && clipAudioUrl) {
+                                  handlePlayClipAudio(clipAudioUrl, pageScene.id);
                                 }
                               }}
                               className="h-6 w-6 rounded-full bg-emerald-600 hover:bg-emerald-500 text-white flex items-center justify-center shrink-0 cursor-pointer shadow-xs"

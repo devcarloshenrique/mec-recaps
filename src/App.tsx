@@ -745,6 +745,7 @@ export default function App() {
             setIsExportModalOpen(true);
           }}
           onUpdateFrameDuration={handleUpdateFrameDuration}
+          onUpdateMultipleFrames={handleUpdateMultipleFrames}
           onReorderFrames={handleReorderFrames}
           onRemoveFrame={handleRemoveFrame}
           onGoToRecorte={() => setCurrentTab('recorte')}
