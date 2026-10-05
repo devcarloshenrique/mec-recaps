@@ -1,6 +1,7 @@
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 import JSZip from 'jszip';
 import { ChapterItem, FrameItem, SceneItem } from '../types';
+import { exportRecapWithWorker } from './videoExportService';
 
 export type ExportFormat = 'mp4' | 'webm' | 'shotcut';
 export type ExportResolution = '16:9' | '9:16';
@@ -269,22 +270,42 @@ export function drawRecapFrame({
   ctx.fillRect(0, 0, width, height);
   ctx.restore();
 
-  // 3. Foreground Layer: Contained Image with subtle Ken Burns zoom
+  // 3. Foreground Layer: Sangria Permanente (Overbleed), borda de 7px e zoom suave
   ctx.save();
-  const baseScale = Math.min((width * 0.94) / imgW, (height * 0.94) / imgH);
-  const zoomFactor = 1.0 + 0.05 * progress; // Smooth 5% zoom
-  const mainW = imgW * baseScale * zoomFactor;
-  const mainH = imgH * baseScale * zoomFactor;
+  const imgAspect = imgW / imgH;
+  const canvasAspect = width / height;
+  const isPortraitDominant = imgAspect < canvasAspect;
+
+  let baseW: number;
+  let baseH: number;
+  if (isPortraitDominant) {
+    baseH = height * 1.045;
+    baseW = baseH * imgAspect;
+  } else {
+    baseW = width * 1.045;
+    baseH = baseW / imgAspect;
+  }
+
+  const zoomFactor = 1.0 + 0.04 * progress;
+  const mainW = baseW * zoomFactor;
+  const mainH = baseH * zoomFactor;
   const mainX = (width - mainW) / 2;
   const mainY = (height - mainH) / 2;
 
   // Cinematic drop shadow
-  ctx.shadowColor = 'rgba(0, 0, 0, 0.75)';
-  ctx.shadowBlur = 28;
+  ctx.shadowColor = 'rgba(0, 0, 0, 0.85)';
+  ctx.shadowBlur = Math.round(width * 0.018);
   ctx.shadowOffsetX = 0;
-  ctx.shadowOffsetY = 6;
+  ctx.shadowOffsetY = Math.round(height * 0.006);
 
   ctx.drawImage(img, mainX, mainY, mainW, mainH);
+  ctx.restore();
+
+  // Borda branca mais espessa (7px em 1080p)
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.98)';
+  ctx.lineWidth = Math.max(6, Math.round(width * 0.0036));
+  ctx.strokeRect(mainX, mainY, mainW, mainH);
   ctx.restore();
 
   // 4. Subtitles Layer
@@ -1094,6 +1115,7 @@ export async function generateShotcutMLT({
     filename: string;
     durationFrames: number;
     durationSeconds: number;
+    rect: string;
   }[] = [];
 
   for (let i = 0; i < frames.length; i++) {
@@ -1121,11 +1143,37 @@ export async function generateShotcutMLT({
     }
 
     mediaFolder.file(filename, blob);
+
+    let aspect = (frame as { aspectRatio?: number }).aspectRatio;
+    if (!aspect && typeof Image !== 'undefined') {
+      try {
+        const img = new Image();
+        img.src = frame.src;
+        if (img.complete && img.naturalWidth) {
+          aspect = img.naturalWidth / img.naturalHeight;
+        } else {
+          await new Promise<void>((resolve) => {
+            img.onload = () => resolve();
+            img.onerror = () => resolve();
+          });
+          if (img.naturalWidth) {
+            aspect = img.naturalWidth / img.naturalHeight;
+          }
+        }
+      } catch {}
+    }
+
+    const aspectVal = aspect && aspect > 0 ? aspect : 0.55;
+    const fitW = Math.min(width, Math.round(height * aspectVal));
+    const fitX = Math.round((width - fitW) / 2);
+    const rect = `${fitX} 0 ${fitW} ${height}`;
+
     frameMediaEntries.push({
       index: i,
       filename,
       durationFrames,
       durationSeconds,
+      rect,
     });
 
     if (i % 5 === 0) {
@@ -1187,6 +1235,16 @@ export async function generateShotcutMLT({
     Math.max(totalFramesDuration, audioTimeline.totalAudioDuration) * fps
   );
 
+  // Extend the last video frame if total audio duration is longer than the raw frames sum
+  // to ensure that video tracks match the total project duration without a black screen gap at the end
+  const currentTotalVideoFrames = frameMediaEntries.reduce((acc, f) => acc + f.durationFrames, 0);
+  if (totalFramesCount > currentTotalVideoFrames && frameMediaEntries.length > 0) {
+    const extraFrames = totalFramesCount - currentTotalVideoFrames;
+    const lastEntry = frameMediaEntries[frameMediaEntries.length - 1];
+    lastEntry.durationFrames += extraFrames;
+    lastEntry.durationSeconds = lastEntry.durationFrames / fps;
+  }
+
   // 3. Build MLT XML String
   onProgress?.({
     currentFrame: frames.length,
@@ -1200,31 +1258,53 @@ export async function generateShotcutMLT({
 <mlt LC_NUMERIC="C" version="7.28.0" title="Manhwa Recap Project" producer="main_tractor">
   <profile description="HD ${width}x${height} ${fps} fps" width="${width}" height="${height}" progressive="1" sample_aspect_num="1" sample_aspect_den="1" display_aspect_num="${aspectNum}" display_aspect_den="${aspectDen}" frame_rate_num="${fps}" frame_rate_den="1" colorspace="709"/>
 
-  <!-- PRODUCERS: Faixa V1 (Fundo com desfoque) -->
+  <!-- PRODUCERS: Faixa V1 (Fundo com desfoque e cobertura total 16:9) -->
 ${frameMediaEntries
   .map(
     (f) => `  <producer id="bg_prod_${f.index}" in="0" out="${f.durationFrames - 1}">
     <property name="length">${f.durationFrames}</property>
     <property name="eof">pause</property>
     <property name="resource">media/${f.filename}</property>
-    <property name="mlt_service">pixbuf</property>
+    <property name="mlt_service">qimage</property>
+    <filter id="echo_${f.index}">
+      <property name="mlt_service">pillar_echo</property>
+      <property name="rect">${f.rect}</property>
+      <property name="blur">6.0</property>
+    </filter>
     <filter id="blur_${f.index}">
       <property name="mlt_service">boxblur</property>
-      <property name="hori">24</property>
-      <property name="vert">24</property>
+      <property name="hori">12</property>
+      <property name="vert">12</property>
+    </filter>
+    <filter id="dark_${f.index}">
+      <property name="mlt_service">brightness</property>
+      <property name="level">0.7</property>
     </filter>
   </producer>`
   )
   .join('\n')}
 
-  <!-- PRODUCERS: Faixa V2 (Quadros principais) -->
+  <!-- PRODUCERS: Faixa V2 (Quadros principais com borda branca e zoom sutil) -->
 ${frameMediaEntries
   .map(
     (f) => `  <producer id="main_prod_${f.index}" in="0" out="${f.durationFrames - 1}">
     <property name="length">${f.durationFrames}</property>
     <property name="eof">pause</property>
     <property name="resource">media/${f.filename}</property>
-    <property name="mlt_service">pixbuf</property>
+    <property name="mlt_service">qimage</property>
+    <filter id="border_${f.index}">
+      <property name="mlt_service">avfilter.drawbox</property>
+      <property name="av.x">0</property>
+      <property name="av.y">0</property>
+      <property name="av.w">iw</property>
+      <property name="av.h">ih</property>
+      <property name="av.color">white</property>
+      <property name="av.t">7</property>
+    </filter>
+    <filter id="zoom_${f.index}">
+      <property name="mlt_service">affine</property>
+      <property name="transition.geometry">0=${Math.round(-width * 0.033)} ${Math.round(-height * 0.033)} ${Math.round(width * 1.066)} ${Math.round(height * 1.066)}:100%; ${f.durationFrames - 1}=${Math.round(-width * 0.05)} ${Math.round(-height * 0.05)} ${Math.round(width * 1.1)} ${Math.round(height * 1.1)}:100%</property>
+    </filter>
   </producer>`
   )
   .join('\n')}
@@ -1243,16 +1323,19 @@ ${audioMediaEntries
 
   <!-- PLAYLISTS -->
   <playlist id="playlist_v1">
+    <property name="shotcut:video">1</property>
     <property name="shotcut:name">V1 (Fundo Desfocado)</property>
 ${frameMediaEntries.map((f) => `    <entry producer="bg_prod_${f.index}" in="0" out="${f.durationFrames - 1}"/>`).join('\n')}
   </playlist>
 
   <playlist id="playlist_v2">
+    <property name="shotcut:video">1</property>
     <property name="shotcut:name">V2 (Quadros Principais)</property>
 ${frameMediaEntries.map((f) => `    <entry producer="main_prod_${f.index}" in="0" out="${f.durationFrames - 1}"/>`).join('\n')}
   </playlist>
 
   <playlist id="playlist_a1">
+    <property name="shotcut:audio">1</property>
     <property name="shotcut:name">A1 (Narração)</property>
 ${(() => {
   let entries: string[] = [];
@@ -1272,6 +1355,8 @@ ${(() => {
 
   <!-- TRACTOR MULTI-TRACK -->
   <tractor id="main_tractor" in="0" out="${Math.max(1, totalFramesCount - 1)}">
+    <property name="shotcut">1</property>
+    <property name="shotcut:scaleFactor">1</property>
     <property name="shotcut:projectAudioChannels">2</property>
     <track producer="playlist_v1"/>
     <track producer="playlist_v2"/>
@@ -1280,9 +1365,7 @@ ${(() => {
       <property name="a_track">0</property>
       <property name="b_track">1</property>
       <property name="mlt_service">composite</property>
-      <property name="halign">centre</property>
-      <property name="valign">centre</property>
-      <property name="distort">0</property>
+      <property name="geometry">0 0 ${width} ${height}:100%</property>
     </transition>
   </tractor>
 </mlt>
@@ -1395,11 +1478,9 @@ export async function exportRecap({
     });
   }
 
-  // Default: MP4 with WebCodecs (falls back to WebM if WebCodecs unavailable)
+  // Default: MP4 with Dedicated Web Worker (high-performance, downscaled blur cache & OffscreenCanvas)
   try {
-    return await renderMP4WithWebCodecs({
-      frames,
-      scenes,
+    return await exportRecapWithWorker(frames, scenes, {
       resolution,
       fps,
       includeAudio,
@@ -1409,8 +1490,8 @@ export async function exportRecap({
       onProgress,
     });
   } catch (err: any) {
-    if (err.message && err.message.includes('WebCodecs')) {
-      console.warn('WebCodecs indisponível, acionando fallback WebM:', err);
+    if (err.message && (err.message.includes('WebCodecs') || err.message.includes('VideoEncoder'))) {
+      console.warn('Worker WebCodecs indisponível, acionando fallback WebM:', err);
       return await renderWebM({
         frames,
         scenes,

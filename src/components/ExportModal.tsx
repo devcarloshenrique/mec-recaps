@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import {
   X,
   Download,
@@ -20,6 +20,7 @@ import {
   Clock,
   StopCircle,
   FileSpreadsheet,
+  Sparkles,
 } from 'lucide-react';
 import JSZip from 'jszip';
 import { ChapterItem, FrameItem, SceneItem } from '../types';
@@ -31,6 +32,7 @@ import {
   ExportProgress,
   ExportResult,
 } from '../utils/videoExporter';
+import { checkWebCodecsSupport } from '../utils/videoExportService';
 
 interface ExportModalProps {
   isOpen: boolean;
@@ -91,18 +93,20 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     };
   }, [previewVideoUrl]);
 
+  const webCodecsSupport = useMemo(() => checkWebCodecsSupport(), []);
+
   // Sync format when initialFormat changes or modal opens
   useEffect(() => {
     if (isOpen && initialFormat) {
       if (initialFormat === 'shotcut') {
         setSelectedFormat('shotcut');
-      } else if (initialFormat === 'webm') {
+      } else if (initialFormat === 'webm' || !webCodecsSupport.supported) {
         setSelectedFormat('webm');
       } else {
         setSelectedFormat('mp4');
       }
     }
-  }, [isOpen, initialFormat]);
+  }, [isOpen, initialFormat, webCodecsSupport.supported]);
 
   if (!isOpen) return null;
 
@@ -385,25 +389,38 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                   {/* MP4 Card */}
                   <div
-                    onClick={() => !isExporting && setSelectedFormat('mp4')}
-                    className={`relative flex flex-col p-4 rounded-xl border transition-all cursor-pointer select-none ${
-                      selectedFormat === 'mp4'
-                        ? 'border-primary bg-primary/10 shadow-md ring-1 ring-primary'
-                        : 'border-border bg-card hover:bg-secondary/60'
+                    onClick={() => {
+                      if (isExporting) return;
+                      if (webCodecsSupport.supported) {
+                        setSelectedFormat('mp4');
+                      }
+                    }}
+                    className={`relative flex flex-col p-4 rounded-xl border transition-all select-none ${
+                      !webCodecsSupport.supported
+                        ? 'opacity-50 cursor-not-allowed border-border bg-card'
+                        : selectedFormat === 'mp4'
+                        ? 'border-primary bg-primary/10 shadow-md ring-1 ring-primary cursor-pointer'
+                        : 'border-border bg-card hover:bg-secondary/60 cursor-pointer'
                     }`}
                   >
                     <div className="flex items-center justify-between mb-2">
                       <span className="font-bold text-sm text-foreground flex items-center gap-1.5">
                         <Film className="h-4 w-4 text-primary" />
-                        <span>MP4 (.mp4)</span>
+                        <span>MP4 Ultra Rápido</span>
                       </span>
-                      <span className="text-[10px] font-bold text-primary bg-primary/20 px-2 py-0.5 rounded-full">
-                        Recomendado
+                      <span className="text-[10px] font-bold text-emerald-400 bg-emerald-500/20 px-2 py-0.5 rounded-full flex items-center gap-1">
+                        <Sparkles className="h-3 w-3" />
+                        60-90+ FPS
                       </span>
                     </div>
                     <p className="text-xs text-muted-foreground leading-relaxed">
-                      Renderização offline acelerada por GPU via <strong>WebCodecs</strong> e multiplexador H.264 / AAC. Alta performance e compatibilidade total.
+                      Desacoplado em <strong>Dedicated Web Worker</strong> com cache de blur otimizado e aceleração por hardware (H.264 / AAC). Interface 100% fluida sem travar o navegador.
                     </p>
+                    {!webCodecsSupport.supported && (
+                      <span className="mt-2 text-[11px] text-amber-400 font-medium">
+                        Não suportado neste navegador. Use WebM ou Shotcut.
+                      </span>
+                    )}
                   </div>
 
                   {/* WebM Card */}
