@@ -1,5 +1,5 @@
 import React from 'react';
-import { Crop, Mic, Film, Sparkles, Download } from 'lucide-react';
+import { Crop, ScrollText, Mic, Film, Sparkles, Download } from 'lucide-react';
 import { StudioTab } from '../types';
 
 interface StudioShellProps {
@@ -14,7 +14,8 @@ interface StudioShellProps {
 
 const NAV_ITEMS: { id: StudioTab; label: string; icon: React.FC<{ className?: string }>; hint: string }[] = [
   { id: 'recorte', label: 'Recorte', icon: Crop, hint: 'Quadros' },
-  { id: 'narracao', label: 'Narração', icon: Mic, hint: 'Cenas' },
+  { id: 'roteiro', label: 'Roteiro', icon: ScrollText, hint: 'Texto & IA' },
+  { id: 'narracao', label: 'Narração', icon: Mic, hint: 'Áudio & TTS' },
   { id: 'montagem', label: 'Montagem', icon: Film, hint: 'Timeline' },
 ];
 

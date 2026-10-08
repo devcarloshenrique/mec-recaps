@@ -1,10 +1,20 @@
 import React, { useState, useEffect } from 'react';
 import { StudioShell } from './components/StudioShell';
 import { RecorteView } from './components/RecorteView';
+import { RoteiroView } from './components/RoteiroView';
 import { NarracaoView } from './components/NarracaoView';
 import { MontagemView } from './components/MontagemView';
 import { ExportModal } from './components/ExportModal';
-import { ChapterItem, FrameItem, SceneItem, StudioTab, TransitionType } from './types';
+import {
+  ChapterItem,
+  FrameItem,
+  SceneItem,
+  StudioTab,
+  TransitionType,
+  ProjectMetadata,
+  ChapterMetadata,
+  PageScriptState,
+} from './types';
 import { DetectedPanel } from './utils/panelDetection';
 import {
   saveProject,
@@ -98,6 +108,14 @@ export default function App() {
   const [frames, setFrames] = useState<FrameItem[]>([]);
   const [scenes, setScenes] = useState<SceneItem[]>([]);
   const [chapterPanels, setChapterPanels] = useState<Record<string, Record<number, DetectedPanel[]>>>({});
+  const [projectMetadata, setProjectMetadata] = useState<ProjectMetadata>({
+    workTitle: '',
+    universeLore: '',
+    glossary: {},
+    characters: [],
+  });
+  const [chapterMetadata, setChapterMetadata] = useState<Record<string, ChapterMetadata>>({});
+  const [pageScripts, setPageScripts] = useState<Record<string, PageScriptState>>({});
   const [isExportModalOpen, setIsExportModalOpen] = useState<boolean>(false);
   const [exportModalFormat, setExportModalFormat] = useState<'mp4' | 'webm' | 'shotcut' | string>('mp4');
   const [toastMessage, setToastMessage] = useState<{ text: string; type: 'success' | 'info' | 'error' } | null>(null);
@@ -134,6 +152,15 @@ export default function App() {
           }
           if (stored.currentTab) {
             setCurrentTab(stored.currentTab);
+          }
+          if (stored.projectMetadata) {
+            setProjectMetadata(stored.projectMetadata);
+          }
+          if (stored.chapterMetadata) {
+            setChapterMetadata(stored.chapterMetadata);
+          }
+          if (stored.pageScripts) {
+            setPageScripts(stored.pageScripts);
           }
           setLastSavedAt(stored.updatedAt);
           setSaveStatus('saved');
@@ -177,6 +204,9 @@ export default function App() {
           currentChapterId,
           currentPageNumber,
           currentTab,
+          projectMetadata,
+          chapterMetadata,
+          pageScripts,
         });
 
         if (success) {
@@ -192,7 +222,7 @@ export default function App() {
     }, 1000);
 
     return () => clearTimeout(timer);
-  }, [chapters, frames, scenes, chapterPanels, currentChapterId, currentPageNumber, currentTab, isProjectLoaded, isHydrating]);
+  }, [chapters, frames, scenes, chapterPanels, currentChapterId, currentPageNumber, currentTab, projectMetadata, chapterMetadata, pageScripts, isProjectLoaded, isHydrating]);
 
   const showToast = (text: string, type: 'success' | 'info' | 'error' = 'success') => {
     setToastMessage({ text, type });
@@ -213,6 +243,9 @@ export default function App() {
         currentChapterId,
         currentPageNumber,
         currentTab,
+        projectMetadata,
+        chapterMetadata,
+        pageScripts,
       });
       if (ok) {
         setSaveStatus('saved');
@@ -237,6 +270,14 @@ export default function App() {
       setFrames([]);
       setScenes([]);
       setChapterPanels({});
+      setProjectMetadata({
+        workTitle: '',
+        universeLore: '',
+        glossary: {},
+        characters: [],
+      });
+      setChapterMetadata({});
+      setPageScripts({});
       setCurrentChapterId('');
       setCurrentPageNumber(1);
       setSaveStatus('idle');
@@ -493,6 +534,28 @@ export default function App() {
     );
   };
 
+  const handleUpdateSceneText = (sceneId: string, text: string) => {
+    setScenes((prev) =>
+      prev.map((s) => (s.id === sceneId ? { ...s, text } : s))
+    );
+  };
+
+  const handleUpdateProjectMetadata = (meta: ProjectMetadata) => {
+    setProjectMetadata(meta);
+  };
+
+  const handleUpdateChapterMetadata = (chapterId: string, meta: ChapterMetadata) => {
+    setChapterMetadata((prev) => ({ ...prev, [chapterId]: meta }));
+  };
+
+  const handleUpdatePageScript = (key: string, scriptState: PageScriptState) => {
+    setPageScripts((prev) => ({ ...prev, [key]: scriptState }));
+  };
+
+  const handleUpdateMultiplePageScripts = (updates: Record<string, PageScriptState>) => {
+    setPageScripts((prev) => ({ ...prev, ...updates }));
+  };
+
   // Reorder frames in timeline
   const handleReorderFrames = (newFrames: FrameItem[]) => {
     setFrames(newFrames);
@@ -631,6 +694,14 @@ export default function App() {
         </label>
       </div>
     );
+  } else if (currentTab === 'roteiro') {
+    title = '2. Roteiro e Contexto';
+    subtitle = `${currentChapter.label} · página ${currentPageNumber} de ${Math.max(1, currentChapter.pages)} · Fase 1 (Visão 1x) & Fase 2 (Perfis de Roteiro)`;
+    actionsNode = (
+      <div className="flex items-center gap-2">
+        {persistenceControlsNode}
+      </div>
+    );
   } else if (currentTab === 'narracao') {
     const chaptersWithCuts = chapters.filter((ch) =>
       frames.some((f) => f.chapterId === ch.id)
@@ -639,18 +710,18 @@ export default function App() {
       frames.filter((f) => f.chapterId && f.pageNumber).map((f) => `${f.chapterId}_${f.pageNumber}`)
     ).size;
 
-    title = '2. Narração e Roteiro';
+    title = '3. Narração e Síntese de Voz (TTS)';
     subtitle =
       pagesWithCutsCount > 0
         ? `${pagesWithCutsCount} páginas com recortes · ${frames.length} cenas em ${chaptersWithCuts.length} capítulo(s)`
-        : 'Recorte quadros no Capítulo para gerar a narração com IA';
+        : 'Recorte quadros no Capítulo para gerar a narração';
     actionsNode = (
       <div className="flex items-center gap-2">
         {persistenceControlsNode}
       </div>
     );
   } else if (currentTab === 'montagem') {
-    title = '3. Montagem e timeline';
+    title = '4. Montagem e timeline';
     subtitle = `${frames.length} quadros na timeline · ${scenes.length} cenas`;
     actionsNode = (
       <div className="flex items-center gap-2">
@@ -687,6 +758,8 @@ export default function App() {
     );
   }
 
+  const effectiveChapterId = currentChapterId || currentChapter?.id || (chapters.length > 0 ? chapters[0].id : '');
+
   return (
     <StudioShell
       currentTab={currentTab}
@@ -699,7 +772,7 @@ export default function App() {
       <div className={currentTab === 'recorte' ? 'flex flex-1 flex-col' : 'hidden'}>
         <RecorteView
           chapters={chapters}
-          currentChapterId={currentChapterId}
+          currentChapterId={effectiveChapterId}
           onSelectChapter={setCurrentChapterId}
           currentPageNumber={currentPageNumber}
           onSelectPageNumber={setCurrentPageNumber}
@@ -718,6 +791,28 @@ export default function App() {
         />
       </div>
 
+      <div className={currentTab === 'roteiro' ? 'flex flex-1 flex-col' : 'hidden'}>
+        <RoteiroView
+          chapters={chapters}
+          frames={frames}
+          scenes={scenes}
+          currentChapterId={effectiveChapterId}
+          currentPageNumber={currentPageNumber}
+          projectMetadata={projectMetadata}
+          chapterMetadata={chapterMetadata}
+          pageScripts={pageScripts}
+          onUpdateProjectMetadata={handleUpdateProjectMetadata}
+          onUpdateChapterMetadata={handleUpdateChapterMetadata}
+          onUpdatePageScript={handleUpdatePageScript}
+          onUpdateMultiplePageScripts={handleUpdateMultiplePageScripts}
+          onUpdateFrameSnippets={handleUpdateMultipleFrames}
+          onUpdateSceneText={handleUpdateSceneText}
+          onSelectChapter={setCurrentChapterId}
+          onSelectPage={setCurrentPageNumber}
+          onNavigateTab={setCurrentTab}
+        />
+      </div>
+
       <div className={currentTab === 'narracao' ? 'flex flex-1 flex-col' : 'hidden'}>
         <NarracaoView
           chapters={chapters}
@@ -730,7 +825,7 @@ export default function App() {
           onRemoveFrame={handleRemoveFrame}
           onUpdateFrame={handleUpdateFrame}
           onUpdateMultipleFrames={handleUpdateMultipleFrames}
-          onGoToRecorte={() => setCurrentTab('recorte')}
+          onGoToRecorte={() => setCurrentTab('roteiro')}
           onGoToMontagem={() => setCurrentTab('montagem')}
         />
       </div>
