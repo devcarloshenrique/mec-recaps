@@ -18,6 +18,7 @@ import {
   AlertCircle,
   CheckCircle2,
   Scissors,
+  ScrollText,
   FileText,
   BookOpen,
   ArrowRight,
@@ -48,15 +49,14 @@ import {
   AVAILABLE_TTS_MODELS,
   DEFAULT_AI_CONFIG,
   NARRATION_PROFILES,
-  ChapterPageItem,
   calculateRequiredSpeechDuration,
   estimateNarrationDuration,
-  generateChapterNarrationWithVision,
-  generatePageNarrationWithVision,
   generate9routerSpeech,
   getAudioBlobDuration,
   calculateWeightedSceneDurations,
   getFrameNarrationText,
+  distributeTextToFrames,
+  matchAiSceneToFrame,
   realignAllFramesWithAudio,
   consolidatePageNarrationText,
   loadAiNarrationConfig,
@@ -78,6 +78,7 @@ interface NarracaoViewProps {
   onUpdateMultipleFrames?: (
     updates: { id: string; duration?: number; transition?: TransitionType; narrationSnippet?: string }[]
   ) => void;
+  onGoToRoteiro?: () => void;
   onGoToRecorte?: () => void;
   onGoToMontagem?: () => void;
 }
@@ -453,6 +454,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
   onRemoveFrame,
   onUpdateFrame,
   onUpdateMultipleFrames,
+  onGoToRoteiro,
   onGoToRecorte,
   onGoToMontagem,
 }) => {
@@ -1524,362 +1526,6 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
     }
   };
 
-  // Generate narration with Vision AI for a single page row
-  const handleGeneratePageNarration = async (row: PageRowData) => {
-    if (!row.rawPageUrl) {
-      showToast(`A página ${row.pageNumber} não possui imagem bruta carregada.`, 'error');
-      return;
-    }
-
-    const sceneId = row.scene.id;
-    setGeneratingSceneIds((prev) => ({ ...prev, [sceneId]: true }));
-    setSceneErrors((prev) => {
-      const next = { ...prev };
-      delete next[sceneId];
-      return next;
-    });
-
-    try {
-      const frameLabels = row.frames.map((f) => f.label);
-      const prevRowIndex = pageRows.findIndex(
-        (r) => r.chapterId === row.chapterId && r.pageNumber === row.pageNumber - 1
-      );
-      const prevNarration = prevRowIndex >= 0 ? pageRows[prevRowIndex].scene.text : undefined;
-
-      const pageResult = await generatePageNarrationWithVision({
-        rawImageUrl: row.rawPageUrl,
-        chapterLabel: row.chapterLabel,
-        pageNumber: row.pageNumber,
-        totalPages: row.totalPages,
-        croppedFramesCount: row.frames.length,
-        croppedFramesLabels: frameLabels,
-        frames: row.frames,
-        previousPageNarration: prevNarration,
-        config: aiConfig,
-        stylePresetId: selectedProfileId,
-      });
-
-      // Update frame durations and transitions atomically from AI (SoM anchored)
-      let generatedFrameUpdates: {
-        id: string;
-        duration?: number;
-        transition?: TransitionType;
-        narrationSnippet?: string;
-      }[] = [];
-
-      if (pageResult.cenas && pageResult.cenas.length > 0 && row.frames.length > 0) {
-        row.frames.forEach((frame, idx) => {
-          const cleanFrameLabel = frame.label.toLowerCase().replace(/[\[\]]/g, '').trim();
-          const aiScene =
-            pageResult.cenas.find((c) => {
-              const cleanQuadroId = c.quadro_id.toLowerCase().replace(/[\[\]]/g, '').trim();
-              return (
-                cleanQuadroId === cleanFrameLabel ||
-                cleanQuadroId.includes(cleanFrameLabel) ||
-                cleanFrameLabel.includes(cleanQuadroId)
-              );
-            }) || pageResult.cenas[idx];
-
-          if (aiScene) {
-            generatedFrameUpdates.push({
-              id: frame.id,
-              duration: Number(Math.max(1, Math.min(10, aiScene.duracao_segundos)).toFixed(1)),
-              transition: aiScene.transicao,
-              narrationSnippet: aiScene.roteiro_cena?.trim(),
-            });
-          }
-        });
-
-        if (generatedFrameUpdates.length > 0) {
-          if (onUpdateMultipleFrames) {
-            onUpdateMultipleFrames(generatedFrameUpdates);
-          } else if (onUpdateFrame) {
-            generatedFrameUpdates.forEach((u) => onUpdateFrame(u.id, u));
-          }
-        }
-      }
-
-      const scriptText = pageResult.fullScript;
-      const durEst = estimateNarrationDuration(scriptText);
-
-      let updatedScene: SceneItem = {
-        ...row.scene,
-        text: scriptText,
-        duration: durEst.formatted,
-        status: 'done',
-        error: undefined,
-      };
-
-      onUpdateScene(updatedScene);
-      showToast(
-        `Narração atômica da Página ${String(row.pageNumber).padStart(2, '0')} gerada! (${row.frames.length} cenas sincronizadas)`,
-        'success'
-      );
-
-      // Automatically generate neural TTS audio for this page as well
-      try {
-        setGeneratingAudioPages((prev) => ({ ...prev, [row.pageNumber]: true }));
-        const speechRes = await generate9routerSpeech({
-          text: scriptText,
-          config: aiConfig,
-          model: aiConfig.ttsModel,
-        });
-
-        setPageAudioMap((prev) => ({
-          ...prev,
-          [row.pageNumber]: {
-            audioUrl: speechRes.audioUrl,
-            blob: speechRes.blob,
-            duration: speechRes.duration,
-            generatedAt: Date.now(),
-          },
-        }));
-
-        if (row.frames.length > 0) {
-          const framesWithSnippets = row.frames.map((frame) => {
-            const upd = generatedFrameUpdates.find((u) => u.id === frame.id);
-            return {
-              ...frame,
-              narrationSnippet: upd?.narrationSnippet || frame.narrationSnippet || getFrameNarrationText(frame, row.frames, scriptText),
-            };
-          });
-          const weighted = calculateWeightedSceneDurations(framesWithSnippets, speechRes.duration, scriptText);
-          if (weighted.length > 0) {
-            if (onUpdateMultipleFrames) {
-              onUpdateMultipleFrames(weighted);
-            } else if (onUpdateFrame) {
-              weighted.forEach((w) => onUpdateFrame(w.id, { duration: w.duration, narrationSnippet: w.narrationSnippet }));
-            }
-          }
-        }
-
-        updatedScene = {
-          ...updatedScene,
-          audioUrl: speechRes.audioUrl,
-          audioBlob: speechRes.blob,
-          audioDuration: speechRes.duration,
-          voice: aiConfig.ttsModel || updatedScene.voice,
-        };
-        onUpdateScene(updatedScene);
-      } catch (audioErr: any) {
-        console.warn('Aviso: Áudio da página não pôde ser gerado automaticamente:', audioErr);
-      } finally {
-        setGeneratingAudioPages((prev) => ({ ...prev, [row.pageNumber]: false }));
-      }
-    } catch (err: any) {
-      const errorMsg = err?.message || 'Falha ao gerar narração';
-      setSceneErrors((prev) => ({ ...prev, [sceneId]: errorMsg }));
-      showToast(errorMsg, 'error');
-    } finally {
-      setGeneratingSceneIds((prev) => ({ ...prev, [sceneId]: false }));
-    }
-  };
-
-  // Macro vision generation for all pages of the chapter
-  const handleBatchGenerateAll = async () => {
-    if (pageRows.length === 0) return;
-    if (isBatchGenerating) return;
-
-    setIsBatchGenerating(true);
-    setChapterSummary(null);
-
-    const chapterGroups: Record<string, PageRowData[]> = {};
-    for (const row of pageRows) {
-      if (!chapterGroups[row.chapterId]) {
-        chapterGroups[row.chapterId] = [];
-      }
-      chapterGroups[row.chapterId].push(row);
-    }
-
-    try {
-      const updatedScenesMap = new Map(scenes.map((s) => [s.id, s]));
-      const activeProfile =
-        NARRATION_PROFILES.find((p) => p.id === selectedProfileId) || NARRATION_PROFILES[0];
-
-      for (const [chId, chRows] of Object.entries(chapterGroups)) {
-        const chapterLabel = chRows[0]?.chapterLabel || 'Capítulo';
-        setBatchProgress({
-          stage: `Preparando ${chRows.length} página(s) de "${chapterLabel}"...`,
-          current: 0,
-          total: chRows.length,
-        });
-
-        const pagesPayload: ChapterPageItem[] = chRows.map((r) => ({
-          pageNumber: r.pageNumber,
-          rawImageUrl: r.rawPageUrl,
-          croppedFramesCount: r.frames.length,
-          croppedFramesLabels: r.frames.map((f) => f.label),
-          frames: r.frames,
-        }));
-
-        const result = await generateChapterNarrationWithVision({
-          chapterLabel,
-          pages: pagesPayload,
-          profileId: selectedProfileId,
-          config: aiConfig,
-          onProgress: (info) => {
-            setBatchProgress({
-              stage: info.stage,
-              current: info.current || 0,
-              total: info.total || chRows.length,
-            });
-          },
-        });
-
-        if (result.resumo_capitulo) {
-          setChapterSummary({
-            chapterLabel,
-            text: result.resumo_capitulo,
-          });
-        }
-
-        const chapterSnippetsMap = new Map<string, string>();
-
-        for (const pageResult of result.paginas) {
-          const targetRow = chRows.find((r) => r.pageNumber === pageResult.pagina_numero);
-          if (targetRow && (pageResult.roteiro || (pageResult.cenas && pageResult.cenas.length > 0))) {
-            // Update frame durations and transitions atomically from AI (SoM anchored)
-            if (pageResult.cenas && pageResult.cenas.length > 0 && targetRow.frames.length > 0) {
-              const frameUpdates: {
-                id: string;
-                duration?: number;
-                transition?: TransitionType;
-                narrationSnippet?: string;
-              }[] = [];
-
-              targetRow.frames.forEach((frame, idx) => {
-                const cleanFrameLabel = frame.label.toLowerCase().replace(/[\[\]]/g, '').trim();
-                const aiScene =
-                  pageResult.cenas.find((c) => {
-                    const cleanQuadroId = c.quadro_id.toLowerCase().replace(/[\[\]]/g, '').trim();
-                    return (
-                      cleanQuadroId === cleanFrameLabel ||
-                      cleanQuadroId.includes(cleanFrameLabel) ||
-                      cleanFrameLabel.includes(cleanQuadroId)
-                    );
-                  }) || pageResult.cenas[idx];
-
-                if (aiScene) {
-                  const snippetText = aiScene.roteiro_cena?.trim() || '';
-                  if (snippetText) {
-                    chapterSnippetsMap.set(frame.id, snippetText);
-                  }
-                  frameUpdates.push({
-                    id: frame.id,
-                    duration: Number(Math.max(1, Math.min(10, aiScene.duracao_segundos)).toFixed(1)),
-                    transition: aiScene.transicao,
-                    narrationSnippet: snippetText,
-                  });
-                }
-              });
-
-              if (frameUpdates.length > 0) {
-                if (onUpdateMultipleFrames) {
-                  onUpdateMultipleFrames(frameUpdates);
-                } else if (onUpdateFrame) {
-                  frameUpdates.forEach((u) => onUpdateFrame(u.id, u));
-                }
-              }
-            }
-
-            const scriptText = pageResult.roteiro;
-            const durEst = estimateNarrationDuration(scriptText);
-            const updatedScene: SceneItem = {
-              ...targetRow.scene,
-              text: scriptText,
-              duration: durEst.formatted,
-              status: 'done',
-              error: undefined,
-            };
-            updatedScenesMap.set(updatedScene.id, updatedScene);
-            onUpdateScene(updatedScene);
-          }
-        }
-
-        // Automatically synthesize neural TTS audio for all pages via API
-        setBatchProgress({
-          stage: 'Sintetizando áudio neural das páginas via API TTS (9router)...',
-          current: 0,
-          total: chRows.length,
-        });
-
-        for (let i = 0; i < chRows.length; i++) {
-          const targetRow = chRows[i];
-          const scene = updatedScenesMap.get(targetRow.scene.id) || targetRow.scene;
-          const text = scene.text?.trim();
-          if (text) {
-            setBatchProgress({
-              stage: `Gerando áudio TTS da página ${targetRow.pageNumber} (${i + 1}/${chRows.length})...`,
-              current: i + 1,
-              total: chRows.length,
-            });
-            try {
-              const speechRes = await generate9routerSpeech({
-                text,
-                config: aiConfig,
-                model: aiConfig.ttsModel,
-              });
-
-              setPageAudioMap((prev) => ({
-                ...prev,
-                [targetRow.pageNumber]: {
-                  audioUrl: speechRes.audioUrl,
-                  blob: speechRes.blob,
-                  duration: speechRes.duration,
-                  generatedAt: Date.now(),
-                },
-              }));
-
-              if (targetRow.frames.length > 0) {
-                const framesWithSnippets = targetRow.frames.map((f) => ({
-                  ...f,
-                  narrationSnippet:
-                    chapterSnippetsMap.get(f.id) ||
-                    f.narrationSnippet ||
-                    getFrameNarrationText(f, targetRow.frames, text),
-                }));
-                const weighted = calculateWeightedSceneDurations(framesWithSnippets, speechRes.duration, text);
-                if (weighted.length > 0) {
-                  if (onUpdateMultipleFrames) {
-                    onUpdateMultipleFrames(weighted);
-                  } else if (onUpdateFrame) {
-                    weighted.forEach((w) => onUpdateFrame(w.id, { duration: w.duration, narrationSnippet: w.narrationSnippet }));
-                  }
-                }
-              }
-
-              const updatedSceneWithAudio: SceneItem = {
-                ...scene,
-                audioUrl: speechRes.audioUrl,
-                audioBlob: speechRes.blob,
-                audioDuration: speechRes.duration,
-                voice: aiConfig.ttsModel || scene.voice,
-              };
-              updatedScenesMap.set(updatedSceneWithAudio.id, updatedSceneWithAudio);
-              onUpdateScene(updatedSceneWithAudio);
-            } catch (audioErr: any) {
-              console.warn(`Aviso: Áudio da página ${targetRow.pageNumber} não pôde ser gerado:`, audioErr);
-            }
-          }
-        }
-      }
-
-      if (onSetScenes) {
-        onSetScenes(Array.from(updatedScenesMap.values()));
-      }
-
-      showToast(
-        `Roteiro e áudios gerados com sucesso no perfil "${activeProfile.name}"!`,
-        'success'
-      );
-    } catch (err: any) {
-      console.error('Erro na geração macro do capítulo:', err);
-      showToast(err?.message || 'Falha ao gerar roteiro do capítulo', 'error');
-    } finally {
-      setIsBatchGenerating(false);
-    }
-  };
-
   // Copy text to clipboard
   const handleCopyText = (text: string) => {
     if (!text) return;
@@ -1976,38 +1622,6 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
               <span className="hidden lg:inline">IA & 9router</span>
             </button>
 
-            {/* Selector: Perfil da Narração */}
-            <div className="flex items-center gap-1.5 bg-card border border-border rounded-lg px-2 py-1 shadow-xs">
-              <label
-                htmlFor="narration-profile-select"
-                className="text-xs font-semibold text-muted-foreground whitespace-nowrap hidden sm:inline"
-              >
-                Perfil:
-              </label>
-              <select
-                id="narration-profile-select"
-                value={selectedProfileId}
-                onChange={(e) => {
-                  setSelectedProfileId(e.target.value);
-                  const nextConfig = { ...aiConfig, stylePreset: e.target.value };
-                  setAiConfig(nextConfig);
-                  saveAiNarrationConfig(nextConfig);
-                }}
-                className="bg-transparent text-xs font-bold text-foreground focus:outline-none cursor-pointer py-0.5"
-                title="Escolha o Perfil da Narração para o roteiro completo"
-              >
-                {NARRATION_PROFILES.map((prof) => (
-                  <option
-                    key={prof.id}
-                    value={prof.id}
-                    className="bg-popover text-popover-foreground text-xs"
-                  >
-                    {prof.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-
             {/* Selector: Voz TTS da API */}
             <div className="hidden sm:flex items-center gap-1.5 bg-card border border-border rounded-lg px-2 py-1 shadow-xs">
               <Mic className="h-3.5 w-3.5 text-primary shrink-0" />
@@ -2033,84 +1647,25 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
               </select>
             </div>
 
-            {/* Batch Generate Text + Audio Button */}
-            {pageRows.length > 0 && (
-              <button
-                onClick={handleBatchGenerateAll}
-                disabled={isBatchGenerating || isBatchGeneratingAudio}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-semibold hover:opacity-90 transition-opacity shadow disabled:opacity-50 cursor-pointer"
-                title={`Gerar roteiro com IA e sintetizar áudios neurais via API para todas as ${pageRows.length} páginas`}
-              >
-                {isBatchGenerating ? (
-                  <>
-                    <Zap className="h-3.5 w-3.5 animate-spin" />
-                    <span className="truncate max-w-[130px]">Gerando Roteiro...</span>
-                  </>
-                ) : (
-                  <>
-                    <Zap className="h-3.5 w-3.5 fill-current" />
-                    <span>⚡ Gerar Todas (Texto + Áudio)</span>
-                  </>
-                )}
-              </button>
-            )}
-
             {/* Batch Generate Only Audio TTS Button */}
             {pageRows.length > 0 && (
               <button
                 onClick={handleBatchGenerateAudioAll}
-                disabled={isBatchGenerating || isBatchGeneratingAudio}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-border bg-card hover:bg-secondary text-foreground text-xs font-semibold transition-colors shadow-2xs disabled:opacity-50 cursor-pointer"
+                disabled={isBatchGeneratingAudio}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-semibold hover:opacity-90 transition-opacity shadow disabled:opacity-50 cursor-pointer"
                 title="Sintetizar ou regenerar os áudios neurais de todas as páginas usando a API TTS"
               >
                 {isBatchGeneratingAudio ? (
                   <>
-                    <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
                     <span className="truncate max-w-[130px]">Gerando Áudios...</span>
                   </>
                 ) : (
                   <>
-                    <Mic className="h-3.5 w-3.5 text-primary" />
-                    <span>🎙️ Gerar Áudios TTS</span>
+                    <Mic className="h-3.5 w-3.5" />
+                    <span>Sintetizar Todos os Áudios (TTS)</span>
                   </>
                 )}
-              </button>
-            )}
-
-            {/* Re-align Quadros with Audio Button */}
-            {allFrames.length > 0 && scenes.some((s) => s.audioUrl || s.audioBlob || s.audioDuration) && (
-              <button
-                onClick={() => {
-                  const updates = realignAllFramesWithAudio(allFrames, scenes);
-                  if (updates.length > 0) {
-                    if (onUpdateMultipleFrames) {
-                      onUpdateMultipleFrames(updates);
-                    } else if (onUpdateFrame) {
-                      updates.forEach((u) => onUpdateFrame(u.id, u));
-                    }
-                    showToast(`${updates.length} quadros sincronizados perfeitamente com os áudios!`, 'success');
-                  } else {
-                    showToast('Nenhum quadro necessitou de ajuste temporal.', 'info');
-                  }
-                }}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 text-xs font-semibold transition-colors shadow-2xs cursor-pointer"
-                title="Ajusta o tempo de cada quadro proporcionalmente ao trecho de narração daquele quadro, casando com o áudio total"
-              >
-                <Sparkles className="h-3.5 w-3.5 text-emerald-400" />
-                <span className="hidden sm:inline">Sincronizar Quadros</span>
-              </button>
-            )}
-
-            {/* Jump to Timeline Button */}
-            {onGoToMontagem && (
-              <button
-                onClick={onGoToMontagem}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-primary/40 bg-primary/10 text-primary hover:bg-primary hover:text-primary-foreground text-xs font-semibold transition-all shadow-xs cursor-pointer ml-1"
-                title="Ir para a Timeline de Montagem Final"
-              >
-                <Film className="h-3.5 w-3.5" />
-                <span className="hidden sm:inline">Montagem</span>
-                <ArrowRight className="h-3 w-3" />
               </button>
             )}
           </div>
@@ -2186,16 +1741,16 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
                   Nenhum capítulo com recortes ainda
                 </h2>
                 <p className="text-xs text-muted-foreground mt-1.5 leading-relaxed max-w-sm mx-auto">
-                  Faça os recortes dos quadros na tela de <strong>Recortes</strong> para que as páginas apareçam aqui prontas para roteirização e pré-montagem rápida.
+                  Defina os recortes e gere o roteiro na tela de <strong>Roteiro</strong> para que as páginas apareçam aqui prontas para síntese de voz e temporização.
                 </p>
               </div>
-              {onGoToRecorte && (
+              {(onGoToRoteiro || onGoToRecorte) && (
                 <button
-                  onClick={onGoToRecorte}
+                  onClick={onGoToRoteiro || onGoToRecorte}
                   className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-primary text-primary-foreground text-xs font-semibold hover:opacity-90 transition-opacity shadow cursor-pointer"
                 >
-                  <Scissors className="h-4 w-4" />
-                  <span>Ir para a Tela de Recortes</span>
+                  <ScrollText className="h-4 w-4" />
+                  <span>Ir para a Tela de Roteiro</span>
                   <ArrowRight className="h-3.5 w-3.5" />
                 </button>
               )}
@@ -2366,20 +1921,6 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
                         )}
 
                         {/* Generate AI Script Button */}
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleGeneratePageNarration(row);
-                          }}
-                          disabled={isGenerating}
-                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-primary text-primary-foreground text-xs font-semibold hover:opacity-90 transition-opacity shadow disabled:opacity-50 cursor-pointer"
-                          title="Ler imagem bruta com IA e gerar narração para o YouTube"
-                        >
-                          <Zap className="h-3 w-3 fill-current" />
-                          <span>{hasText ? 'Regenerar' : 'Gerar IA'}</span>
-                        </button>
-
                         {/* Generate Neural TTS Audio Button */}
                         {hasText && (
                           <button
@@ -2389,22 +1930,22 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
                               handleGeneratePageAudio(row);
                             }}
                             disabled={generatingAudioPages[row.pageNumber]}
-                            className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-semibold transition-all shadow cursor-pointer ${
+                            className={`inline-flex items-center gap-1 px-3 py-1.5 rounded-md text-xs font-semibold transition-all shadow cursor-pointer ${
                               pageAudioMap[row.pageNumber] || row.scene.audioUrl
                                 ? 'bg-emerald-600/90 text-white hover:bg-emerald-600'
-                                : 'bg-secondary border border-border text-foreground hover:bg-secondary/80'
+                                : 'bg-primary text-primary-foreground hover:bg-primary/90'
                             } disabled:opacity-50`}
                             title="Gerar áudio neural da narração via API TTS (OpenAI-compatible / 9router)"
                           >
                             {generatingAudioPages[row.pageNumber] ? (
                               <>
-                                <Loader2 className="h-3 w-3 animate-spin" />
-                                <span>Áudio...</span>
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                <span>Gerando Áudio...</span>
                               </>
                             ) : (
                               <>
-                                <Mic className="h-3 w-3" />
-                                <span>{pageAudioMap[row.pageNumber] || row.scene.audioUrl ? 'Regenerar Áudio' : 'Gerar Áudio API'}</span>
+                                <Mic className="h-3.5 w-3.5" />
+                                <span>{pageAudioMap[row.pageNumber] || row.scene.audioUrl ? 'Regenerar Áudio' : 'Sintetizar Áudio (TTS)'}</span>
                               </>
                             )}
                           </button>
@@ -2479,21 +2020,21 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
-                                    handleGeneratePageNarration(row);
+                                    handleGeneratePageAudio(row);
                                   }}
-                                  className="mt-1 text-[11px] underline font-bold"
+                                  className="mt-1 text-[11px] underline font-bold cursor-pointer"
                                 >
-                                  Tentar Novamente
+                                  Tentar Novamente (Gerar Áudio)
                                 </button>
                               </div>
                             </div>
                           )}
 
                           <div className="relative flex-1 min-h-[85px]">
-                            {isGenerating && (
+                            {generatingAudioPages[row.pageNumber] && (
                               <div className="absolute inset-0 bg-card/85 backdrop-blur-xs z-10 rounded-lg border border-primary/40 flex flex-col items-center justify-center gap-1.5 text-xs font-semibold text-primary">
-                                <Zap className="h-4 w-4 animate-spin text-primary" />
-                                <p>Lendo imagem e escrevendo roteiro com IA...</p>
+                                <Loader2 className="h-4 w-4 animate-spin text-primary" />
+                                <p>Sintetizando áudio neural via TTS...</p>
                               </div>
                             )}
 
@@ -2509,40 +2050,9 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
                                 });
                               }}
                               onClick={(e) => e.stopPropagation()}
-                              placeholder={`Clique em "Gerar IA" ou digite o roteiro desta página...`}
+                              placeholder="Roteiro definido na tela de Roteiro. Você pode ajustar este texto antes de sintetizar o áudio..."
                               className="w-full h-full min-h-[85px] p-2.5 rounded-lg border border-border bg-secondary/15 hover:bg-secondary/25 focus:bg-background focus:border-primary focus:ring-1 focus:ring-primary outline-none text-xs text-foreground leading-relaxed resize-y transition-colors font-sans"
                             />
-                          </div>
-
-                          {/* Quick Profile Selection Pills */}
-                          <div className="flex flex-wrap items-center gap-1 pt-0.5">
-                            <span className="text-[10px] font-medium text-muted-foreground mr-1">
-                              Perfil:
-                            </span>
-                            {NARRATION_PROFILES.map((prof) => {
-                              const isActive = selectedProfileId === prof.id;
-                              return (
-                                <button
-                                  key={prof.id}
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setSelectedProfileId(prof.id);
-                                    const nextConfig = { ...aiConfig, stylePreset: prof.id };
-                                    setAiConfig(nextConfig);
-                                    saveAiNarrationConfig(nextConfig);
-                                  }}
-                                  className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors cursor-pointer ${
-                                    isActive
-                                      ? 'bg-primary/20 text-primary border border-primary/30 font-semibold'
-                                      : 'bg-secondary text-muted-foreground hover:text-foreground'
-                                  }`}
-                                  title={prof.description}
-                                >
-                                  {prof.label}
-                                </button>
-                              );
-                            })}
                           </div>
                         </div>
                       </div>
