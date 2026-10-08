@@ -1,5 +1,15 @@
 import { get, set, del } from 'idb-keyval';
-import { ChapterItem, FrameItem, SceneItem, StudioTab, TransitionType, CropRect } from '../types';
+import {
+  ChapterItem,
+  FrameItem,
+  SceneItem,
+  StudioTab,
+  TransitionType,
+  CropRect,
+  ProjectMetadata,
+  ChapterMetadata,
+  PageScriptState,
+} from '../types';
 import { DetectedPanel } from './panelDetection';
 
 export const STORAGE_KEY_PROJECT = 'recap_current_project';
@@ -52,6 +62,9 @@ export interface StoredProjectState {
   frames: StoredFrame[];
   scenes: StoredScene[];
   chapterPanels?: Record<string, Record<number, DetectedPanel[]>>;
+  projectMetadata?: ProjectMetadata;
+  chapterMetadata?: Record<string, ChapterMetadata>;
+  pageScripts?: Record<string, PageScriptState>;
   globalConfig?: Record<string, any>;
 }
 
@@ -64,6 +77,9 @@ export interface ProjectStateToSave {
   currentPageNumber?: number;
   currentTab?: StudioTab;
   title?: string;
+  projectMetadata?: ProjectMetadata;
+  chapterMetadata?: Record<string, ChapterMetadata>;
+  pageScripts?: Record<string, PageScriptState>;
   globalConfig?: Record<string, any>;
 }
 
@@ -76,6 +92,9 @@ export interface HydratedProjectState {
   currentPageNumber: number;
   currentTab?: StudioTab;
   title?: string;
+  projectMetadata?: ProjectMetadata;
+  chapterMetadata?: Record<string, ChapterMetadata>;
+  pageScripts?: Record<string, PageScriptState>;
   updatedAt: number;
 }
 
@@ -234,6 +253,9 @@ export async function saveProject(state: ProjectStateToSave): Promise<boolean> {
       frames: storedFrames,
       scenes: storedScenes,
       chapterPanels: state.chapterPanels || {},
+      projectMetadata: state.projectMetadata,
+      chapterMetadata: state.chapterMetadata || {},
+      pageScripts: state.pageScripts || {},
       globalConfig,
     };
 
@@ -334,6 +356,14 @@ export async function loadProject(): Promise<HydratedProjectState | null> {
       currentPageNumber: data.currentPageNumber || 1,
       currentTab: data.currentTab || 'recorte',
       title: data.title || 'Projeto Manhwa Recap',
+      projectMetadata: data.projectMetadata || {
+        workTitle: data.title || '',
+        universeLore: '',
+        glossary: {},
+        characters: [],
+      },
+      chapterMetadata: data.chapterMetadata || {},
+      pageScripts: data.pageScripts || {},
       updatedAt: data.updatedAt || Date.now(),
     };
   } catch (err) {
