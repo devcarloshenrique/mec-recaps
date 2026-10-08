@@ -161,8 +161,8 @@ export async function generateSoMAnnotatedPage({
       badgeX = canvasW - badgeWidth - 2;
     }
 
-    // Outer dark pill shadow for badge
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.9)';
+    // Outer subtle translucent pill shadow for badge (non-occluding)
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
     if (typeof (ctx as any).roundRect === 'function') {
       (ctx as any).roundRect(badgeX - 2, badgeY - 2, badgeWidth + 4, badgeHeight + 4, 6);
       ctx.fill();
@@ -170,7 +170,9 @@ export async function generateSoMAnnotatedPage({
       ctx.fillRect(badgeX - 2, badgeY - 2, badgeWidth + 4, badgeHeight + 4);
     }
 
-    // Badge solid colored background
+    // Badge semi-translucent colored background to prevent occluding dialogue bubbles or faces
+    ctx.save();
+    ctx.globalAlpha = 0.82;
     ctx.fillStyle = color.bg;
     if (typeof (ctx as any).roundRect === 'function') {
       ctx.beginPath();
@@ -179,6 +181,7 @@ export async function generateSoMAnnotatedPage({
     } else {
       ctx.fillRect(badgeX, badgeY, badgeWidth, badgeHeight);
     }
+    ctx.restore();
 
     // Badge text
     ctx.fillStyle = color.text;

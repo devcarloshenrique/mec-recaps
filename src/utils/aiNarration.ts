@@ -4,7 +4,15 @@
  * Powered by OpenAI-compatible vision endpoints (9router, local LLMs, or cloud models).
  */
 
-import { FrameItem, SceneItem, TransitionType } from '../types';
+import {
+  FrameItem,
+  SceneItem,
+  TransitionType,
+  ProjectMetadata,
+  ChapterMetadata,
+  ChapterMacroContext,
+  CharacterMetadata,
+} from '../types';
 import { generateSoMAnnotatedPage } from './somAnnotator';
 
 export function normalizeTransitionType(rawTrans: string, index: number = 0): TransitionType {
@@ -506,41 +514,173 @@ export function calculateWeightedSceneDurations(
 }
 
 /**
- * Retorna o trecho de texto específico associado a um determinado quadro.
- * Se o quadro possuir um narrationSnippet explícito, utiliza-o.
- * Caso contrário, segmenta o texto completo da página proporcionalmente por frases ou palavras.
+ * Distribui um texto narrativo completo de forma equilibrada, contínua e sequencial
+ * entre os quadros de uma página.
+ * Garante que:
+ * - O primeiro quadro sempre receba o início do texto.
+ * - O último quadro sempre receba o final do texto.
+ * - Não haja frases puladas ou repetidas em fallback fora de limites.
  */
-export function getFrameNarrationText(
-  frame: FrameItem,
-  allPageFrames: FrameItem[],
-  fullPageText: string
-): string {
-  if (frame.narrationSnippet && frame.narrationSnippet.trim()) {
-    return frame.narrationSnippet.trim();
+export function distributeTextToFrames(fullText: string, frames: FrameItem[]): string[] {
+  if (!fullText || !fullText.trim() || !frames || frames.length === 0) {
+    return (frames || []).map(() => '');
   }
-  if (!fullPageText || !fullPageText.trim()) return '';
 
-  const sentences = fullPageText
+  const cleanText = fullText.trim();
+  const count = frames.length;
+  if (count === 1) return [cleanText];
+
+  // 1. Tentar particionar por frases completas (. ! ? …)
+  const sentences = cleanText
     .split(/(?<=[.!?…])\s+/)
     .map((s) => s.trim())
     .filter(Boolean);
 
-  if (sentences.length === 0) return fullPageText.trim();
-
-  const frameIdx = allPageFrames.findIndex((f) => f.id === frame.id);
-  if (frameIdx < 0) return fullPageText.trim();
-
-  if (sentences.length === allPageFrames.length) {
-    return sentences[frameIdx];
+  if (sentences.length >= count) {
+    return frames.map((_, idx) => {
+      const start = Math.floor((idx * sentences.length) / count);
+      const end = Math.floor(((idx + 1) * sentences.length) / count);
+      const slice = sentences.slice(start, Math.max(start + 1, end));
+      return slice.join(' ');
+    });
   }
 
-  const sentencesPerFrame = Math.max(
-    1,
-    Math.round(sentences.length / Math.max(1, allPageFrames.length))
+  // 2. Se há menos frases que quadros, tentar particionar por orações (vírgulas, ponto-e-vírgula, travessões, quebras de linha)
+  const clauses = cleanText
+    .split(/(?<=[,;:\-–—\n])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (clauses.length >= count) {
+    return frames.map((_, idx) => {
+      const start = Math.floor((idx * clauses.length) / count);
+      const end = Math.floor(((idx + 1) * clauses.length) / count);
+      const slice = clauses.slice(start, Math.max(start + 1, end));
+      return slice.join(' ');
+    });
+  }
+
+  // 3. Particionar por palavras mantendo a coerência sequencial exata
+  const words = cleanText.split(/\s+/).filter(Boolean);
+  if (words.length <= count) {
+    return frames.map((_, idx) => words[idx] || '');
+  }
+
+  return frames.map((_, idx) => {
+    const start = Math.floor((idx * words.length) / count);
+    const end = Math.floor(((idx + 1) * words.length) / count);
+    const slice = words.slice(start, Math.max(start + 1, end));
+    return slice.join(' ');
+  });
+}
+
+/**
+ * Associa uma cena retornada pela IA (com quadro_id flexível) ao quadro correspondente.
+ * Extrai o número do painel/quadro ignorando indicadores de página "(Pág. X)"
+ * para evitar falsos positivos quando o número da página coincide com outros quadros.
+ */
+export function matchAiSceneToFrame<T extends { quadro_id: string }>(
+  frame: FrameItem,
+  frameIdx: number,
+  cenas: T[],
+  usedIndices?: Set<number>
+): T | undefined {
+  if (!cenas || cenas.length === 0) return undefined;
+
+  const extractPanelNum = (label: string): number | null => {
+    if (!label) return null;
+    const withoutPage = label.replace(/\(p[aá]g\.?\s*\d+\)/gi, '').trim();
+    const qMatch = withoutPage.match(/(?:quadro|painel|cena|frame|zona|box)\s*(\d+)/i);
+    if (qMatch) return parseInt(qMatch[1], 10);
+    const nMatch = withoutPage.match(/(\d+)/);
+    if (nMatch) return parseInt(nMatch[1], 10);
+    return null;
+  };
+
+  const frameNum = extractPanelNum(frame.label);
+
+  // 1. Tenta correspondência exata por número do quadro (ex: Quadro 01 -> 1)
+  if (frameNum !== null) {
+    const idx = cenas.findIndex((c, i) => {
+      if (usedIndices && usedIndices.has(i)) return false;
+      const cNum = extractPanelNum(c.quadro_id);
+      return cNum === frameNum;
+    });
+    if (idx !== -1) {
+      if (usedIndices) usedIndices.add(idx);
+      return cenas[idx];
+    }
+  }
+
+  // 2. Tenta correspondência por string normalizada exata (sem startsWith para evitar colisão de "quadro")
+  const cleanLabel = frame.label
+    .replace(/\(p[aá]g\.?\s*\d+\)/gi, '')
+    .replace(/[\[\]]/g, '')
+    .trim()
+    .toLowerCase();
+
+  const byLabelIdx = cenas.findIndex((c, i) => {
+    if (usedIndices && usedIndices.has(i)) return false;
+    const cleanQ = c.quadro_id
+      .replace(/\(p[aá]g\.?\s*\d+\)/gi, '')
+      .replace(/[\[\]]/g, '')
+      .trim()
+      .toLowerCase();
+    return cleanQ === cleanLabel;
+  });
+  if (byLabelIdx !== -1) {
+    if (usedIndices) usedIndices.add(byLabelIdx);
+    return cenas[byLabelIdx];
+  }
+
+  // 3. Fallback posicional não-utilizado
+  if (usedIndices) {
+    if (cenas[frameIdx] && !usedIndices.has(frameIdx)) {
+      usedIndices.add(frameIdx);
+      return cenas[frameIdx];
+    }
+    const freeIdx = cenas.findIndex((_, i) => !usedIndices.has(i));
+    if (freeIdx !== -1) {
+      usedIndices.add(freeIdx);
+      return cenas[freeIdx];
+    }
+  }
+
+  return cenas[frameIdx];
+}
+
+/**
+ * Retorna o trecho de texto específico associado a um determinado quadro.
+ * Se o quadro possuir um narrationSnippet explícito (e não for solicitado recálculo forçado), utiliza-o.
+ * Caso contrário, segmenta o texto completo da página proporcionalmente garantindo que:
+ * - O primeiro quadro sempre receba o início do texto.
+ * - Quadros de páginas diferentes nunca recebam índices cumulativos do capítulo inteiro.
+ */
+export function getFrameNarrationText(
+  frame: FrameItem,
+  allPageFrames: FrameItem[],
+  fullPageText: string,
+  options?: { forceRecalculate?: boolean }
+): string {
+  if (!options?.forceRecalculate && frame.narrationSnippet && frame.narrationSnippet.trim()) {
+    return frame.narrationSnippet.trim();
+  }
+  if (!fullPageText || !fullPageText.trim()) return '';
+
+  const targetFrames =
+    frame.pageNumber !== undefined && allPageFrames.some((f) => f.pageNumber !== frame.pageNumber)
+      ? allPageFrames.filter((f) => f.pageNumber === frame.pageNumber)
+      : allPageFrames;
+
+  const sortedFrames = [...targetFrames].sort((a, b) =>
+    a.label.localeCompare(b.label, undefined, { numeric: true, sensitivity: 'base' })
   );
-  const start = frameIdx * sentencesPerFrame;
-  const slice = sentences.slice(start, start + sentencesPerFrame);
-  return slice.join(' ') || sentences[sentences.length - 1] || fullPageText.trim();
+
+  const frameIdx = sortedFrames.findIndex((f) => f.id === frame.id);
+  if (frameIdx < 0) return fullPageText.trim();
+
+  const distributed = distributeTextToFrames(fullPageText, sortedFrames);
+  return distributed[frameIdx] || fullPageText.trim();
 }
 
 /**
@@ -844,7 +984,7 @@ export async function testAiConnection(config: AiNarrationConfig): Promise<TestA
 /**
  * Extracts and decodes text from either Server-Sent Events (SSE) stream or standard JSON
  */
-function decodeSseOrJson(rawText: string): string {
+export function decodeSseOrJson(rawText: string): string {
   const trimmed = rawText.trim();
 
   // If response has SSE data lines
@@ -890,22 +1030,94 @@ function decodeSseOrJson(rawText: string): string {
 }
 
 /**
+ * Trunca suavemente o texto da narração se exceder a contagem máxima de palavras
+ * para garantir que o tempo de fala NUNCA ultrapasse o teto de 10 segundos.
+ */
+export function clampFrameWords(text: string, maxWords: number = 24): string {
+  if (!text) return '';
+  const words = text.trim().split(/\s+/).filter(Boolean);
+  if (words.length <= maxWords) return text.trim();
+
+  const slice = words.slice(0, maxWords).join(' ');
+  const lastPunct = Math.max(
+    slice.lastIndexOf('.'),
+    slice.lastIndexOf('!'),
+    slice.lastIndexOf('?'),
+    slice.lastIndexOf('…')
+  );
+
+  if (lastPunct > slice.length * 0.6) {
+    return slice.slice(0, lastPunct + 1).trim();
+  }
+
+  return `${slice}...`;
+}
+
+/**
  * Builds the exact Backend System Prompt for Chapter-wide Recap Generation (Atomic per-scene granularity)
  */
-export function buildChapterNarrationSystemPrompt(profileId: string = 'sarcastico'): string {
+export function buildChapterNarrationSystemPrompt(
+  profileId: string = 'sarcastico',
+  customTonePrompt?: string,
+  projectMetadata?: ProjectMetadata,
+  chapterMetadata?: ChapterMetadata
+): string {
   const profile = NARRATION_PROFILES.find((p) => p.id === profileId) || NARRATION_PROFILES[0];
+  const activeTone = customTonePrompt?.trim() || profile.systemDescription;
 
-  return `Você é um Roteirista Profissional de Canais de Recap de Manhwa no YouTube (especialista em retenção e storytelling falado).
+  let charactersBlock = '';
+  if (projectMetadata?.characters && projectMetadata.characters.length > 0) {
+    const list = projectMetadata.characters.map((c) => {
+      const aliases = c.aliases?.length ? ` (alcunhas: ${c.aliases.join(', ')})` : '';
+      const desc = c.description ? ` - ${c.description}` : '';
+      return `• ${c.name} [Papel: ${c.role}]${aliases}${desc}`;
+    });
+    charactersBlock = `\nPERSONAGENS IDENTIFICADOS DA OBRA:\n${list.join('\n')}\nUtilize sempre os nomes reais dos personagens acima ao invés de termos genéricos como "o rapaz" ou "o guerreiro".\n`;
+  }
+
+  let glossaryBlock = '';
+  if (projectMetadata?.glossary && Object.keys(projectMetadata.glossary).length > 0) {
+    const terms = Object.entries(projectMetadata.glossary)
+      .map(([term, desc]) => `• ${term}: ${desc}`)
+      .join('\n');
+    glossaryBlock = `\nGLOSSÁRIO E SISTEMA DE PODER DA OBRA:\n${terms}\n`;
+  }
+
+  const workTitleBlock = projectMetadata?.workTitle ? ` da obra "${projectMetadata.workTitle}"` : '';
+  const synopsisBlock = chapterMetadata?.synopsis
+    ? `\nCONTEXTO DO ARCO/CAPÍTULO ATUAL: ${chapterMetadata.synopsis}\n`
+    : '';
+
+  let macroBlock = '';
+  if (chapterMetadata?.macroContext) {
+    const { synopsis, characterDynamics, criticalRules } = chapterMetadata.macroContext;
+    const rulesList = (criticalRules || []).map((r) => `  • ${r}`).join('\n');
+    macroBlock = `
+╔═══════════════════════════════════════════════════════════════════════════════════════╗
+║ BÍBLIA FÁTICA DO CAPÍTULO (VERDADES INEGOCIÁVEIS DA HISTÓRIA - SIGA RIGOROSAMENTE)    ║
+╠═══════════════════════════════════════════════════════════════════════════════════════╣
+║ 1. ENREDO DO CAPÍTULO:                                                                ║
+║    ${synopsis || chapterMetadata?.synopsis || 'Conforme a narrativa visual.'}
+║                                                                                       ║
+║ 2. VERDADEIRA NATUREZA E FORÇA DOS PERSONAGENS / ESQUADRÃO:                           ║
+║    ${characterDynamics || 'Veteranos experientes/conforme contexto fático.'}
+║                                                                                       ║
+║ 3. REGRAS OBRIGATÓRIAS ANTI-ALUCINAÇÃO (NUNCA PRESUMA O CONTRÁRIO):                   ║
+${rulesList || '  • Mantenha fidelidade absoluta aos papéis e à força real dos personagens.'}
+╚═══════════════════════════════════════════════════════════════════════════════════════╝
+`;
+  }
+
+  return `Você é um Roteirista Profissional de Canais de Recap de Manhwa no YouTube (especialista em retenção e storytelling falado)${workTitleBlock}.
 
 OBJETIVO:
 Criar uma narrativa contínua, ágil e envolvente para acompanhar a sequência de quadros recortados. 
 
 PERFIL ATIVO DO NARRADOR: ${profile.name}
-- Cúmplice & Sarcástico: Debochado, fala com o espectador, tira sarro da arrogância dos vilões e celebra o contra-ataque do prota.
-- Cronista Épico: Dramático, cinematográfico, usa pausas e vocabulário solene, focado no peso dramático de cada golpe.
-- Analista Tático: Foco na frieza do prota, dedução das fraquezas do oponente e explicação rápida das regras de poder/sistema.
-- Dinâmico de Retenção: Frases curtas, ritmo frenético, inserindo ganchos contínuos ("Mas o pior ainda estava por vir...").
+${activeTone}
 
+${workTitleBlock ? `OBRA: ${projectMetadata?.workTitle}` : ''}
+${macroBlock || synopsisBlock}${charactersBlock}${glossaryBlock}
 ANCORAGEM VISUAL OBRIGATÓRIA (PIPELINE SET-OF-MARK / SoM):
 1. MOLDURAS DEMARCADAS NA IMAGEM:
    - As páginas contêm anotações visuais no padrão Set-of-Mark (SoM): molduras retangulares coloridas de alto contraste com etiquetas visíveis (ex: "[Quadro 01]", "[Quadro 02]", etc.) desenhadas diretamente sobre os painéis da página.
@@ -928,13 +1140,25 @@ ANCORAGEM VISUAL OBRIGATÓRIA (PIPELINE SET-OF-MARK / SoM):
    - Use linguagem falada natural do YouTube, com atitude, gírias leves e cumplicidade com o protagonista.
    - NUNCA transcreva balões de fala palavra por palavra. Resuma as intenções com a voz do narrador.
 
-5. RITMO E EXTENSÃO CALIBRADA (5.0s A 10.0s POR CENA):
-   - Duração por cena ("duracao_segundos"): OBRIGATORIAMENTE entre 5.0 e 10.0 segundos, ajustada conforme o peso e a intensidade de cada cena.
-   - Cada quadro recortado ("roteiro_cena") deve conter entre 12 e 25 palavras, proporcionando tempo suficiente para o narrador contextualizar, transmitir o impacto emocional e criar ganchos naturais sem pressa.
-   - Fidelidade Temporal Rigorosa: A fala deve descrever com clareza e ritmo natural EXATAMENTE a ação e emoção do quadro ATUAL, sem antecipar o quadro posterior e sem arrastar resquícios do quadro anterior.
+5. RITMO E CONTAGEM ESTRITA DE PALAVRAS (LIMITE OBRIGATÓRIO DE 5.0s A 10.0s POR CENA):
+   - CONTAGEM DE PALAVRAS OBRIGATÓRIA: Cada quadro recortado ("roteiro_cena") DEVE conter ESTRITAMENTE entre 12 e 22 palavras faladas (máximo absoluto de 24 palavras).
+   - É TERMINANTEMENTE PROIBIDO ultrapassar 25 palavras por quadro sob hipótese alguma.
+   - Em velocidade natural de fala (2.5 palavras por segundo), 12 a 22 palavras cravam a duração com precisão entre 5.0 e 9.0 segundos.
+   - Duração por cena ("duracao_segundos"): OBRIGATORIAMENTE entre 5.0 e 9.5 segundos (JAMAIS ultrapasse 10.0 segundos).
+   - Fidelidade Temporal Rigorosa: A narração deve descrever com clareza e ritmo natural EXATAMENTE a ação e emoção do quadro ATUAL, sem antecipar o quadro posterior e sem arrastar resquícios do quadro anterior.
 
 6. TRANSIÇÕES PERMITIDAS:
    - Escolha para cada cena: "zoom_in", "zoom_out", "pan_down", "pan_up", "fade", "corte_seco". Varie sem repetir consecutivamente.
+
+7. PROIBIDO JULGAR PELA APARÊNCIA OU INVENTAR FRAQUEZA (ANTI-ALUCINAÇÃO):
+   - NUNCA presuma que personagens, aliados ou esquadrões são "novatos", "fracos", "preguiçosos" ou "covardes" apenas por estarem sentados, rindo, descontraídos ou em poses casuais.
+   - Em webtoons/manhwas militares e de fantasia, guerreiros veteranos e insanos frequentemente agem com desdém ou humor negro diante da morte. Trate essa postura como frieza calejada e experiência brutal, NUNCA como desleixo amador.
+   - Respeite ESTRITAMENTE a BÍBLIA FÁTICA DO CAPÍTULO acima.
+
+8. REGRA ABSOLUTA DE NÃO-REPETIÇÃO POR QUADRO:
+   - Cada quadro recortado da página DEVE conter uma fala narrada 100% ÚNICA e progressiva.
+   - É TERMINANTEMENTE PROIBIDO repetir a mesma frase, fala ou diálogo em mais de um quadro da mesma página.
+   - Se a página contém 4 quadros demarcados, você DEVE retornar 4 cenas com textos narrativos diferentes que avançam a história sequencialmente.
 
 FORMATO DE RESPOSTA OBRIGATÓRIO (JSON):
 {
@@ -983,6 +1207,9 @@ export interface ChapterNarrationResult {
     cenas: AiSceneResultItem[];
     roteiro: string;
   }[];
+  macroContext?: ChapterMacroContext;
+  suggestedWorkTitle?: string;
+  detectedCharacters?: CharacterMetadata[];
 }
 
 export interface PageNarrationResult {
@@ -1238,11 +1465,19 @@ export async function generatePageNarrationWithVision(params: {
   previousPageNarration?: string;
   config?: AiNarrationConfig;
   stylePresetId?: string;
+  customSystemPrompt?: string;
+  projectMetadata?: ProjectMetadata;
+  chapterMetadata?: ChapterMetadata;
 }): Promise<PageNarrationResult> {
   const config = params.config || loadAiNarrationConfig();
   const profileId = params.stylePresetId || config.stylePreset || 'sarcastico';
   const profile = NARRATION_PROFILES.find((p) => p.id === profileId) || NARRATION_PROFILES[0];
-  const systemPrompt = buildChapterNarrationSystemPrompt(profile.id);
+  const systemPrompt = buildChapterNarrationSystemPrompt(
+    profile.id,
+    params.customSystemPrompt,
+    params.projectMetadata,
+    params.chapterMetadata
+  );
 
   let base64Image = '';
   try {
@@ -1250,11 +1485,12 @@ export async function generatePageNarrationWithVision(params: {
       base64Image = await generateSoMAnnotatedPage({
         rawImageUrl: params.rawImageUrl,
         frames: params.frames,
-        maxWidth: 1200,
-        maxHeight: 2000,
+        maxWidth: 1050,
+        maxHeight: 1800,
+        quality: 0.76,
       });
     } else {
-      base64Image = await prepareImageForAi(params.rawImageUrl, 1200, 2000);
+      base64Image = await prepareImageForAi(params.rawImageUrl, 1050, 1800);
     }
   } catch (err: any) {
     throw new Error(`Falha ao processar a imagem da página para a IA: ${err?.message || err}`);
@@ -1286,9 +1522,11 @@ REGRAS DE ANCORAGEM VISUAL E RETENÇÃO (SoM):
 3. FLUXO CONTÍNUO (SEM FRASES PICOTADAS):
    - As falas não podem parecer ilhas soltas. Use conectivos ("E mesmo assim...", "Só que dessa vez...", "Enquanto isso...", "Do nada...").
    - Lidas juntas, as falas de todos os quadros desta página DEVEM soar como uma história única e fluida para o YouTube.
-4. RITMO E EXTENSÃO CALIBRADA (5.0s A 10.0s POR CENA):
-   - Duração por cena ("duracao_segundos"): OBRIGATORIAMENTE entre 5.0 e 10.0 segundos, ajustada conforme a intensidade dramática da cena.
-   - Cada quadro recortado ("roteiro_cena"): entre 12 e 25 palavras, proporcionando tempo suficiente para o narrador contextualizar, transmitir o impacto e criar ganchos naturais sem pressa.
+4. RITMO E CONTAGEM ESTRITA DE PALAVRAS (LIMITE DE 5.0s A 10.0s POR CENA):
+   - CONTAGEM DE PALAVRAS OBRIGATÓRIA: Cada quadro recortado ("roteiro_cena") DEVE conter ESTRITAMENTE entre 12 e 22 palavras faladas (máximo absoluto de 24 palavras).
+   - É TERMINANTEMENTE PROIBIDO ultrapassar 25 palavras por quadro sob hipótese alguma.
+   - Em ritmo de fala de 2.5 palavras/segundo, 12 a 22 palavras cravam a duração entre 5.0s e 9.0s.
+   - Duração por cena ("duracao_segundos"): OBRIGATORIAMENTE entre 5.0 e 9.5 segundos.
    - Fidelidade Temporal Rigorosa: A narração deve descrever estritamente o acontecimento do quadro ATUAL, sem antecipar o próximo e sem arrastar resquícios do anterior.
 5. Transições permitidas: "zoom_in", "zoom_out", "pan_down", "fade", "corte_seco". Evite repetir a mesma transição consecutivamente.
 
@@ -1302,7 +1540,7 @@ Retorne no formato JSON:
           .map(
             (lbl, idx) => `{
           "quadro_id": "${lbl}",
-          "roteiro_cena": "Frase de 12 a 25 palavras com storytelling vívido e conectivos naturais para este momento...",
+          "roteiro_cena": "Frase de 12 a 22 palavras com storytelling vívido e conectivos naturais para este momento...",
           "duracao_segundos": 6.8,
           "transicao": "${idx % 2 === 0 ? 'zoom_in' : 'zoom_out'}"
         }`
@@ -1395,21 +1633,21 @@ Retorne no formato JSON:
             {
               quadro_id: 'Quadro 01',
               roteiro_cena: String(p.roteiro).trim(),
-              duracao_segundos: 6.0,
+              duracao_segundos: 6.5,
               transicao: 'zoom_in',
             },
           ];
         }
 
         const cenas: AiSceneResultItem[] = rawCenas.map((c: any, cIdx: number) => {
-          const rawDur = parseFloat(c.duracao_segundos || c.duracao || c.duration || 6.0);
-          const script = String(c.roteiro_cena || c.roteiro || c.text || '').trim();
+          const rawDur = parseFloat(c.duracao_segundos || c.duracao || c.duration || 6.5);
+          const rawScript = String(c.roteiro_cena || c.roteiro || c.text || '').trim();
+          const script = clampFrameWords(rawScript, 24);
           const speechMin = calculateRequiredSpeechDuration(script);
-          // Ensure duration accommodates speech while respecting calibrated limits (5.0s to 10.0s)
-          const calculated = !isNaN(rawDur) && rawDur >= 5.0 && rawDur <= 10.0
+          const calculated = !isNaN(rawDur) && rawDur >= 5.0 && rawDur <= 9.5
             ? Math.max(rawDur, speechMin)
-            : Math.max(5.0, Math.min(10.0, speechMin));
-          const dur = Math.min(10.0, Math.max(5.0, Math.round(calculated * 10) / 10));
+            : Math.max(5.0, Math.min(9.5, speechMin));
+          const dur = Math.min(9.5, Math.max(5.0, Math.round(calculated * 10) / 10));
           return {
             quadro_id: String(c.quadro_id || c.label || `Quadro ${String(cIdx + 1).padStart(2, '0')}`).trim(),
             roteiro_cena: script,
@@ -1430,6 +1668,533 @@ Retorne no formato JSON:
   } catch {}
 
   return { fullScript: clean, cenas: [] };
+}
+
+export interface AnalyzeMacroContextParams {
+  chapterLabel: string;
+  pages: ChapterPageItem[];
+  projectMetadata?: ProjectMetadata;
+  chapterMetadata?: ChapterMetadata;
+  config?: AiNarrationConfig;
+  onProgress?: (info: { stage: string; current?: number; total?: number }) => void;
+}
+
+export interface ChapterMacroContextResult {
+  synopsis: string;
+  characterDynamics: string;
+  criticalRules: string[];
+  suggestedWorkTitle?: string;
+  detectedCharacters?: CharacterMetadata[];
+}
+
+/**
+ * Fase Macro (Scanner Global do Capítulo):
+ * Analisa uma amostragem estratégica de páginas do capítulo para extrair a
+ * "Bíblia Fática do Capítulo". Evita que blocos isolados alucinem que personagens
+ * calejados/insanos são "novatos preguiçosos".
+ */
+export async function analyzeChapterMacroContext(
+  params: AnalyzeMacroContextParams
+): Promise<ChapterMacroContextResult> {
+  const config = params.config || loadAiNarrationConfig();
+  const validPages = params.pages.filter((p) => p.rawImageUrl);
+  if (validPages.length === 0) {
+    throw new Error('Nenhuma página com imagem disponível para análise macro do capítulo.');
+  }
+
+  params.onProgress?.({
+    stage: 'Selecionando e otimizando amostras visuais do capítulo...',
+    current: 1,
+    total: 3,
+  });
+
+  // Seleciona de 4 a 6 páginas distribuídas ao longo do capítulo (início, meio, ápice e fim)
+  const totalP = validPages.length;
+  let sampleIndices: number[] = [];
+  if (totalP <= 5) {
+    sampleIndices = validPages.map((_, i) => i);
+  } else {
+    sampleIndices = [
+      0,
+      1,
+      Math.floor(totalP * 0.35),
+      Math.floor(totalP * 0.65),
+      totalP - 1,
+    ];
+    sampleIndices = Array.from(new Set(sampleIndices)).sort((a, b) => a - b);
+  }
+
+  const sampledPages = sampleIndices.map((i) => validPages[i]);
+
+  // Gera thumbnails leves em paralelo (maxWidth 720, maxHeight 1150, qualidade 0.68 para envio ultrarrápido)
+  const preparedImages = await Promise.all(
+    sampledPages.map(async (page) => {
+      try {
+        const b64 = await prepareImageForAi(page.rawImageUrl, 720, 1150);
+        return { pageNumber: page.pageNumber, b64 };
+      } catch (err) {
+        console.warn(`Aviso ao otimizar página ${page.pageNumber} para macro scan:`, err);
+        return null;
+      }
+    })
+  );
+
+  const validSampled = preparedImages.filter((p): p is { pageNumber: number; b64: string } => p !== null);
+  if (validSampled.length === 0) {
+    throw new Error('Falha ao processar imagens para a análise macro do capítulo.');
+  }
+
+  params.onProgress?.({
+    stage: 'Analisando arco do capítulo e verdade dos personagens com IA...',
+    current: 2,
+    total: 3,
+  });
+
+  let knownCharactersPrompt = '';
+  if (params.projectMetadata?.characters && params.projectMetadata.characters.length > 0) {
+    const list = params.projectMetadata.characters
+      .map((c) => `• ${c.name} (${c.role}): ${c.description || ''}`)
+      .join('\n');
+    knownCharactersPrompt = `\nPersonagens já conhecidos:\n${list}\n`;
+  }
+
+  const workTitle = params.projectMetadata?.workTitle ? ` da obra "${params.projectMetadata.workTitle}"` : '';
+
+  const systemPrompt = `Você é um Diretor Narrativo e Supervisor Sênior de Roteiros para canais de Recap de Manhwa no YouTube${workTitle}.
+Sua missão é extrair a BÍBLIA FÁTICA do capítulo ${params.chapterLabel}.
+
+OBJETIVO CRÍTICO (ANTI-ALUCINAÇÃO):
+O roteirista posterior receberá recortes de 2 em 2 páginas. Se ele não souber quem são os personagens de verdade, ele cometerá erros grosseiros — como julgar guerreiros veteranos suicidas e insanos como 'novatos preguiçosos' só porque estavam sentados, sujos ou zombando no início da batalha.
+Você DEVE enxergar a história macro e estabelecer as verdades inegociáveis.
+
+${knownCharactersPrompt}
+
+DIRETRIZES DA ANÁLISE:
+1. IDENTIDADE E FORÇA REAL:
+   - Quem são os personagens e esquadrões em cena?
+   - Qual a verdadeira postura psicológica e poder de combate deles?
+   - Se eles agem com deboche ou calmaria em meio ao perigo, identifique que se trata da frieza de guerreiros que não temem a morte (e NÃO desleixo amador).
+2. ARCO COMPLETO DO CAPÍTULO:
+   - Qual a situação de abertura, o desenrolar das ações e o clímax/desfecho deste capítulo?
+3. REGRAS OBRIGATÓRIAS ANTI-ALUCINAÇÃO:
+   - Crie 3 a 5 regras enfáticas para guiar o narrador.
+
+Retorne ESTRITAMENTE em formato JSON:
+{
+  "synopsis": "Resumo de 3 a 5 frases do enredo macro do capítulo",
+  "characterDynamics": "Explicação clara e detalhada sobre quem são os personagens em cena, sua real força/experiência e relacionamento",
+  "criticalRules": [
+    "Regra 1: O esquadrão em cena é composto por veteranos assassinos insanos e muito fortes; NUNCA os descreva como amadores ou preguiçosos.",
+    "Regra 2: ...",
+    "Regra 3: ..."
+  ],
+  "suggestedWorkTitle": "Nome provável da obra se visível na arte ou logotipo",
+  "detectedCharacters": [
+    {
+      "name": "Nome provável",
+      "role": "protagonist",
+      "description": "Breve descrição fática da índole e poder"
+    }
+  ]
+}`;
+
+  const userContent: any[] = [
+    {
+      type: 'text',
+      text: `Aqui estão ${validSampled.length} páginas estratégicas do capítulo ${params.chapterLabel} (Páginas: ${validSampled.map((p) => p.pageNumber).join(', ')}). Analise a visão macro e retorne a Bíblia Fática em JSON:`,
+    },
+  ];
+
+  for (const s of validSampled) {
+    userContent.push({
+      type: 'text',
+      text: `--- Página ${s.pageNumber} ---`,
+    });
+    userContent.push({
+      type: 'image_url',
+      image_url: { url: s.b64 },
+    });
+  }
+
+  const base = (config.baseURL || DEFAULT_AI_CONFIG.baseURL).replace(/\/+$/, '');
+  const endpoint = base.endsWith('/v1') ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
+
+  const payload = {
+    model: config.model || DEFAULT_AI_CONFIG.model,
+    stream: false,
+    response_format: { type: 'json_object' },
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userContent },
+    ],
+    temperature: 0.4,
+    max_tokens: 2200,
+  };
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json, text/event-stream, */*',
+  };
+  const apiKey = (config.apiKey ?? DEFAULT_AI_CONFIG.apiKey).trim();
+  if (apiKey) {
+    headers['Authorization'] = `Bearer ${apiKey}`;
+  }
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    throw new Error(`Erro na API durante análise macro do capítulo (${response.status}): ${errText.slice(0, 250)}`);
+  }
+
+  const rawRes = await response.text();
+  const decoded = decodeSseOrJson(rawRes);
+
+  let cleanJson = decoded.trim();
+  if (cleanJson.startsWith('```')) {
+    cleanJson = cleanJson.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
+  }
+  const firstBrace = cleanJson.indexOf('{');
+  const lastBrace = cleanJson.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace !== -1) {
+    cleanJson = cleanJson.slice(firstBrace, lastBrace + 1);
+  }
+
+  let parsed: any = {};
+  try {
+    parsed = JSON.parse(cleanJson);
+  } catch (err: any) {
+    console.warn('Aviso: Falha ao fazer parse estrito do JSON da análise macro:', err);
+    parsed = {
+      synopsis: decoded.slice(0, 500),
+      characterDynamics: 'Conforme arte e descrições.',
+      criticalRules: ['Respeite o tom sério e a força dos personagens em cena.'],
+    };
+  }
+
+  params.onProgress?.({
+    stage: 'Bíblia fática do capítulo consolidada!',
+    current: 3,
+    total: 3,
+  });
+
+  return {
+    synopsis: String(parsed.synopsis || params.chapterMetadata?.synopsis || '').trim(),
+    characterDynamics: String(parsed.characterDynamics || '').trim(),
+    criticalRules: Array.isArray(parsed.criticalRules)
+      ? parsed.criticalRules.map((r: any) => String(r).trim()).filter(Boolean)
+      : [],
+    suggestedWorkTitle: parsed.suggestedWorkTitle ? String(parsed.suggestedWorkTitle).trim() : undefined,
+    detectedCharacters: Array.isArray(parsed.detectedCharacters)
+      ? parsed.detectedCharacters.map((c: any) => ({
+          id: `char_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          name: String(c.name || 'Personagem'),
+          aliases: [],
+          role: (['protagonist', 'ally', 'antagonist', 'neutral'].includes(c.role) ? c.role : 'ally') as any,
+          description: String(c.description || ''),
+        }))
+      : undefined,
+  };
+}
+
+/**
+ * Geração multimodal robusta e rápida em mini-blocos (chunking de 2 a 3 páginas).
+ * Envia as imagens com Set-of-Mark e gera os roteiros diretamente vendo a arte,
+ * guiada pela Bíblia Macro do Capítulo para eliminar alucinações e com paralelização.
+ */
+export async function generateChapterNarrationInMiniBatches(params: {
+  chapterLabel: string;
+  pages: ChapterPageItem[];
+  profileId: string;
+  customSystemPrompt?: string;
+  projectMetadata?: ProjectMetadata;
+  chapterMetadata?: ChapterMetadata;
+  config?: AiNarrationConfig;
+  batchSize?: number;
+  concurrency?: number;
+  onProgress?: (info: { stage: string; current?: number; total?: number }) => void;
+  onMacroContextReady?: (macro: ChapterMacroContext, detectedChars?: CharacterMetadata[], suggestedTitle?: string) => void;
+}): Promise<ChapterNarrationResult> {
+  const config = params.config || loadAiNarrationConfig();
+  const validPages = params.pages.filter((p) => p.croppedFramesCount > 0 && p.rawImageUrl);
+  if (validPages.length === 0) {
+    throw new Error('Nenhuma página com quadros recortados e imagem disponível encontrada.');
+  }
+
+  let activeChapterMetadata = { ...(params.chapterMetadata || { chapterId: 'current' }) };
+  let detectedCharacters: CharacterMetadata[] | undefined;
+  let suggestedWorkTitle: string | undefined;
+
+  // FASE 1: Se a Bíblia Macro ainda não existe, gera automaticamente para impedir alucinações
+  if (!activeChapterMetadata.macroContext) {
+    params.onProgress?.({
+      stage: 'Fase 1: Extraindo Bíblia Fática e verdade dos personagens...',
+      current: 0,
+      total: 100,
+    });
+
+    try {
+      const macroRes = await analyzeChapterMacroContext({
+        chapterLabel: params.chapterLabel,
+        pages: validPages,
+        projectMetadata: params.projectMetadata,
+        chapterMetadata: activeChapterMetadata,
+        config,
+        onProgress: (p) => params.onProgress?.({ stage: p.stage }),
+      });
+
+      const newMacro: ChapterMacroContext = {
+        synopsis: macroRes.synopsis,
+        characterDynamics: macroRes.characterDynamics,
+        criticalRules: macroRes.criticalRules,
+        suggestedWorkTitle: macroRes.suggestedWorkTitle,
+        analyzedAt: Date.now(),
+      };
+
+      activeChapterMetadata = {
+        ...activeChapterMetadata,
+        synopsis: macroRes.synopsis || activeChapterMetadata.synopsis,
+        macroContext: newMacro,
+      };
+
+      detectedCharacters = macroRes.detectedCharacters;
+      suggestedWorkTitle = macroRes.suggestedWorkTitle;
+      params.onMacroContextReady?.(newMacro, detectedCharacters, suggestedWorkTitle);
+    } catch (err: any) {
+      console.warn('Aviso: Análise macro falhou ou foi ignorada, prosseguindo com dados existentes:', err);
+    }
+  }
+
+  // FASE 2: Chunking em mini-blocos (2 páginas por padrão)
+  const batchSize = Math.max(1, Math.min(3, params.batchSize || 2));
+  const chunks: ChapterPageItem[][] = [];
+  for (let i = 0; i < validPages.length; i += batchSize) {
+    chunks.push(validPages.slice(i, i + batchSize));
+  }
+
+  const concurrency = Math.max(1, Math.min(3, params.concurrency ?? 2));
+  const chunkResults: (ChapterNarrationResult['paginas'] | null)[] = new Array(chunks.length).fill(null);
+  let chapterSummary = activeChapterMetadata.macroContext?.synopsis || activeChapterMetadata.synopsis || '';
+  let completedChunks = 0;
+
+  // Processa blocos com concorrência para cortar o tempo de geração pela metade
+  for (let i = 0; i < chunks.length; i += concurrency) {
+    const batchGroup = chunks.slice(i, i + concurrency);
+
+    await Promise.all(
+      batchGroup.map(async (chunk, relIdx) => {
+        const chunkIdx = i + relIdx;
+        const pageNums = chunk.map((p) => p.pageNumber).join(', ');
+
+        params.onProgress?.({
+          stage: `Gerando narração multimodal (Págs ${pageNums} - Bloco ${chunkIdx + 1}/${chunks.length})...`,
+          current: completedChunks + 1,
+          total: chunks.length,
+        });
+
+        // 1. Prepara imagens SoM daquele chunk em paralelo com tamanho otimizado
+        const userContent: any[] = [];
+        const chunkPhase =
+          chunkIdx === 0
+            ? 'Início do capítulo / Estabelecimento da atmosfera'
+            : chunkIdx === chunks.length - 1
+            ? 'Desfecho e clímax/gancho do capítulo'
+            : 'Desenvolvimento e escalada da ação';
+
+        const promptHeader = `Capítulo: ${params.chapterLabel}
+Mini-bloco a narrar: Páginas ${pageNums} (Bloco ${chunkIdx + 1} de ${chunks.length}).
+Fase da narrativa: ${chunkPhase}.
+Analise os quadros demarcados com Set-of-Mark nas páginas abaixo e retorne o JSON com as cenas narradas:`;
+
+        userContent.push({ type: 'text', text: promptHeader });
+
+        const preparedPages = await Promise.all(
+          chunk.map(async (page) => {
+            let b64 = '';
+            try {
+              if (page.frames && page.frames.length > 0) {
+                b64 = await generateSoMAnnotatedPage({
+                  rawImageUrl: page.rawImageUrl,
+                  frames: page.frames,
+                  maxWidth: 960,
+                  maxHeight: 1600,
+                  quality: 0.72,
+                });
+              } else {
+                b64 = await prepareImageForAi(page.rawImageUrl, 960, 1600);
+              }
+            } catch (err: any) {
+              b64 = await prepareImageForAi(page.rawImageUrl, 960, 1600);
+            }
+            return { page, b64 };
+          })
+        );
+
+        for (const { page, b64 } of preparedPages) {
+          const labelsList = (
+            page.croppedFramesLabels && page.croppedFramesLabels.length > 0
+              ? page.croppedFramesLabels
+              : ['Quadro 01']
+          ).join(', ');
+
+          userContent.push({
+            type: 'text',
+            text: `--- PÁGINA ${page.pageNumber} (${page.croppedFramesCount} quadros: [${labelsList}]) ---`,
+          });
+          userContent.push({
+            type: 'image_url',
+            image_url: { url: b64 },
+          });
+        }
+
+        const systemPrompt = buildChapterNarrationSystemPrompt(
+          params.profileId,
+          params.customSystemPrompt,
+          params.projectMetadata,
+          activeChapterMetadata
+        );
+
+        const base = (config.baseURL || DEFAULT_AI_CONFIG.baseURL).replace(/\/+$/, '');
+        const endpoint = base.endsWith('/v1') ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
+
+        const payload = {
+          model: config.model || DEFAULT_AI_CONFIG.model,
+          stream: false,
+          response_format: { type: 'json_object' },
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userContent },
+          ],
+          temperature: config.temperature ?? 0.72,
+          max_tokens: 3000,
+        };
+
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream, */*',
+        };
+        const apiKey = (config.apiKey ?? DEFAULT_AI_CONFIG.apiKey).trim();
+        if (apiKey) {
+          headers['Authorization'] = `Bearer ${apiKey}`;
+        }
+
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(payload),
+        });
+
+        if (!response.ok) {
+          const errText = await response.text().catch(() => '');
+          throw new Error(`Erro na API ao gerar bloco de páginas ${pageNums} (${response.status}): ${errText.slice(0, 250)}`);
+        }
+
+        const rawRes = await response.text();
+        const decoded = decodeSseOrJson(rawRes);
+
+        let cleanJson = decoded.trim();
+        if (cleanJson.startsWith('```')) {
+          cleanJson = cleanJson.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
+        }
+        const firstBrace = cleanJson.indexOf('{');
+        const lastBrace = cleanJson.lastIndexOf('}');
+        if (firstBrace !== -1 && lastBrace !== -1) {
+          cleanJson = cleanJson.slice(firstBrace, lastBrace + 1);
+        }
+
+        const chunkPaginas: ChapterNarrationResult['paginas'] = [];
+        try {
+          const parsed = JSON.parse(cleanJson);
+          if (parsed.resumo_capitulo && !chapterSummary) {
+            chapterSummary = parsed.resumo_capitulo;
+          }
+
+          const chunkPages = Array.isArray(parsed.paginas) ? parsed.paginas : [];
+
+          chunk.forEach((pageItem) => {
+            const found = chunkPages.find((p: any) => Number(p.pagina_numero || p.pagina) === pageItem.pageNumber);
+            let rawCenas = found && Array.isArray(found.cenas) ? found.cenas : [];
+
+            if (rawCenas.length === 0 && found?.roteiro) {
+              rawCenas = [{ quadro_id: 'Quadro 01', roteiro_cena: found.roteiro, duracao_segundos: 6.5 }];
+            }
+
+            const usedIndices = new Set<number>();
+            const pageFrames = pageItem.frames || [];
+            const cenas: AiSceneResultItem[] = pageFrames.map((frame, cIdx) => {
+              const matched: any = matchAiSceneToFrame(frame, cIdx, rawCenas, usedIndices);
+              const rawScript = String(matched?.roteiro_cena || matched?.roteiro || matched?.text || '').trim();
+
+              const clampedScript = clampFrameWords(rawScript, 24);
+              const rawDur = parseFloat(matched?.duracao_segundos || 6.5);
+              const speechMin = calculateRequiredSpeechDuration(clampedScript);
+              const dur = Math.min(9.5, Math.max(5.0, !isNaN(rawDur) ? Math.min(rawDur, 9.5) : speechMin));
+
+              return {
+                quadro_id: frame.label || `Quadro ${cIdx + 1}`,
+                roteiro_cena: clampedScript,
+                duracao_segundos: Number(dur.toFixed(1)),
+                transicao: normalizeTransitionType(matched?.transicao || matched?.transition, cIdx),
+              };
+            });
+
+            // DEDUP: Garante que nenhuma página fique com falas repetidas entre quadros
+            const scriptsList = cenas.map((c) => c.roteiro_cena.trim());
+            const uniqueScripts = new Set(scriptsList.filter(Boolean));
+            const hasDuplicateText = scriptsList.length > 1 && uniqueScripts.size < scriptsList.length;
+
+            if (hasDuplicateText || (rawCenas.length < pageFrames.length && pageFrames.length > 1)) {
+              const pageFullText = (
+                found?.roteiro ||
+                rawCenas.map((r: any) => r.roteiro_cena || r.roteiro || '').join(' ') ||
+                scriptsList.join(' ')
+              ).trim();
+              if (pageFullText) {
+                const distributed = distributeTextToFrames(pageFullText, pageFrames);
+                cenas.forEach((c, idx) => {
+                  if (distributed[idx]) {
+                    c.roteiro_cena = clampFrameWords(distributed[idx], 24);
+                  }
+                });
+              }
+            }
+
+            const combined = cenas.map((c) => c.roteiro_cena).filter(Boolean).join(' ');
+            chunkPaginas.push({
+              pagina_numero: pageItem.pageNumber,
+              cenas,
+              roteiro: combined,
+            });
+          });
+        } catch (err: any) {
+          throw new Error(`Falha ao decodificar JSON do bloco de páginas ${pageNums}: ${err.message}`);
+        }
+
+        chunkResults[chunkIdx] = chunkPaginas;
+        completedChunks++;
+      })
+    );
+  }
+
+  // Monta todas as páginas preservando a ordem original
+  const allPaginas: ChapterNarrationResult['paginas'] = [];
+  chunkResults.forEach((cPages) => {
+    if (cPages) {
+      allPaginas.push(...cPages);
+    }
+  });
+
+  return {
+    resumo_capitulo: chapterSummary,
+    paginas: allPaginas,
+    macroContext: activeChapterMetadata.macroContext,
+    suggestedWorkTitle,
+    detectedCharacters,
+  };
 }
 
 export function generateScriptSuggestion(presetId: string, currentText?: string): string {
