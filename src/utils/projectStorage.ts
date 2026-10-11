@@ -11,8 +11,43 @@ import {
   PageScriptState,
 } from '../types';
 import { DetectedPanel } from './panelDetection';
+import { deleteChapterThumbnails } from './thumbnailCache';
 
 export const STORAGE_KEY_PROJECT = 'recap_current_project';
+const STORAGE_KEY_CHAPTER_MEDIA_PREFIX = 'recap_chapter_media_';
+
+// Set of chapter IDs whose media Blobs have already been saved to the isolated media store
+const persistedMediaChapters = new Set<string>();
+
+export async function saveChapterMediaBlobs(chapterId: string, blobs: Blob[]): Promise<void> {
+  if (!chapterId || blobs.length === 0) return;
+  try {
+    await set(`${STORAGE_KEY_CHAPTER_MEDIA_PREFIX}${chapterId}`, blobs);
+    persistedMediaChapters.add(chapterId);
+  } catch (err) {
+    console.error(`Erro ao salvar mídias do capítulo ${chapterId}:`, err);
+  }
+}
+
+export async function getChapterMediaBlobs(chapterId: string): Promise<Blob[] | undefined> {
+  if (!chapterId) return undefined;
+  try {
+    return await get<Blob[]>(`${STORAGE_KEY_CHAPTER_MEDIA_PREFIX}${chapterId}`);
+  } catch (err) {
+    console.error(`Erro ao carregar mídias do capítulo ${chapterId}:`, err);
+    return undefined;
+  }
+}
+
+export async function deleteChapterMediaBlobs(chapterId: string): Promise<void> {
+  if (!chapterId) return;
+  try {
+    await del(`${STORAGE_KEY_CHAPTER_MEDIA_PREFIX}${chapterId}`);
+    persistedMediaChapters.delete(chapterId);
+  } catch (err) {
+    console.error(`Erro ao excluir mídias do capítulo ${chapterId}:`, err);
+  }
+}
 
 export interface StoredChapter {
   id: string;
@@ -108,6 +143,15 @@ export function registerCreatedUrl(url: string): string {
   return url;
 }
 
+export function revokeCreatedUrl(url?: string): void {
+  if (url && url.startsWith('blob:')) {
+    try {
+      URL.revokeObjectURL(url);
+    } catch {}
+    activeCreatedUrls.delete(url);
+  }
+}
+
 export function revokeAllCreatedUrls(): void {
   activeCreatedUrls.forEach((url) => {
     try {
@@ -125,7 +169,22 @@ async function toNativeBlob(source: string | Blob | File): Promise<Blob> {
     return source;
   }
   if (typeof source === 'string') {
-    // Fetch works transparently on data: URLs, blob: URLs, and local relative paths
+    if (source.startsWith('data:')) {
+      const commaIdx = source.indexOf(',');
+      if (commaIdx !== -1) {
+        const mimeMatch = source.substring(0, commaIdx).match(/:(.*?);/);
+        const mime = mimeMatch ? mimeMatch[1] : 'image/jpeg';
+        const b64 = source.substring(commaIdx + 1);
+        const binary = atob(b64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        return new Blob([bytes], { type: mime });
+      }
+    }
+
+    // Fetch works transparently on blob: URLs and local relative paths
     const response = await fetch(source);
     if (!response.ok) {
       throw new Error(`Falha ao converter recurso para Blob: ${source.substring(0, 30)}...`);
@@ -151,18 +210,15 @@ export async function saveProject(state: ProjectStateToSave): Promise<boolean> {
       globalConfig = {},
     } = state;
 
-    // 1. Process Chapters: convert page images into native Blobs
+    // 1. Process Chapters: Save heavy pageBlobs ONCE to isolated store, keep project JSON light (< 50 KB)
     const storedChapters: StoredChapter[] = [];
     for (const ch of chapters) {
-      const pageBlobs: Blob[] = [];
+      let pageBlobs: Blob[] = ch.pageBlobs || [];
 
-      // Check if pageBlobs already attached
-      if (ch.pageBlobs && ch.pageBlobs.length > 0) {
-        pageBlobs.push(...ch.pageBlobs);
-      } else if (ch.files && ch.files.length > 0) {
-        // Files are already Blobs
-        pageBlobs.push(...ch.files);
-      } else if (ch.imageUrls && ch.imageUrls.length > 0) {
+      if (pageBlobs.length === 0 && ch.files && ch.files.length > 0) {
+        pageBlobs = [...ch.files];
+        ch.pageBlobs = pageBlobs;
+      } else if (pageBlobs.length === 0 && ch.imageUrls && ch.imageUrls.length > 0) {
         for (const url of ch.imageUrls) {
           try {
             const blob = await toNativeBlob(url);
@@ -171,6 +227,12 @@ export async function saveProject(state: ProjectStateToSave): Promise<boolean> {
             console.warn(`Aviso ao converter imagem da página para Blob (${ch.label}):`, err);
           }
         }
+        ch.pageBlobs = pageBlobs;
+      }
+
+      // Save to isolated media store ONCE
+      if (pageBlobs.length > 0 && !persistedMediaChapters.has(ch.id)) {
+        await saveChapterMediaBlobs(ch.id, pageBlobs);
       }
 
       storedChapters.push({
@@ -178,7 +240,6 @@ export async function saveProject(state: ProjectStateToSave): Promise<boolean> {
         label: ch.label,
         pages: pageBlobs.length > 0 ? pageBlobs.length : ch.pages,
         done: ch.done || 0,
-        pageBlobs,
       });
     }
 
@@ -196,6 +257,7 @@ export async function saveProject(state: ProjectStateToSave): Promise<boolean> {
       }
 
       if (cropBlob) {
+        f.blob = cropBlob;
         storedFrames.push({
           id: f.id,
           label: f.label,
@@ -301,10 +363,27 @@ export async function loadProject(): Promise<HydratedProjectState | null> {
       hydratedFrames.push(frame);
     }
 
-    // 2. Rehydrate Chapters: generate URLs for raw manhwa pages
+    // 2. Rehydrate Chapters: load Blobs from isolated media store
     const hydratedChapters: ChapterItem[] = [];
+    let needsMigration = false;
+
     for (const sc of data.chapters || []) {
-      const imageUrls = (sc.pageBlobs || []).map((blob) => {
+      let pageBlobs: Blob[] | undefined = sc.pageBlobs;
+
+      // Check if this was a legacy project with embedded pageBlobs
+      if (pageBlobs && pageBlobs.length > 0) {
+        // Automatically migrate to isolated store!
+        await saveChapterMediaBlobs(sc.id, pageBlobs);
+        needsMigration = true;
+      } else {
+        // Load from isolated store
+        pageBlobs = await getChapterMediaBlobs(sc.id);
+        if (pageBlobs && pageBlobs.length > 0) {
+          persistedMediaChapters.add(sc.id);
+        }
+      }
+
+      const imageUrls = (pageBlobs || []).map((blob) => {
         return registerCreatedUrl(URL.createObjectURL(blob));
       });
 
@@ -314,8 +393,29 @@ export async function loadProject(): Promise<HydratedProjectState | null> {
         pages: sc.pages || imageUrls.length,
         done: sc.done || 0,
         imageUrls,
-        pageBlobs: sc.pageBlobs,
+        pageBlobs: pageBlobs || [],
       });
+    }
+
+    // If legacy bloated data was found, clean it up immediately in IndexedDB
+    if (needsMigration) {
+      setTimeout(() => {
+        saveProject({
+          chapters: hydratedChapters,
+          frames: hydratedFrames,
+          scenes: hydratedScenes,
+          currentChapterId: data.currentChapterId || '',
+          currentPageNumber: data.currentPageNumber || 1,
+          currentTab: data.currentTab || 'recorte',
+          title: data.title || 'Projeto Manhwa Recap',
+          chapterPanels: data.chapterPanels || {},
+          projectMetadata: data.projectMetadata,
+          chapterMetadata: data.chapterMetadata,
+          pageScripts: data.pageScripts,
+        }).then(() => {
+          console.log('[IndexedDB] Migração concluída: Payload de projeto purificado para < 50KB!');
+        });
+      }, 500);
     }
 
     // 3. Rehydrate Scenes: link frames and regenerate audioUrl
@@ -377,7 +477,15 @@ export async function loadProject(): Promise<HydratedProjectState | null> {
  */
 export async function clearProject(): Promise<void> {
   try {
+    const data = await get<StoredProjectState>(STORAGE_KEY_PROJECT);
+    if (data?.chapters) {
+      for (const ch of data.chapters) {
+        await deleteChapterMediaBlobs(ch.id);
+        await deleteChapterThumbnails(ch.id);
+      }
+    }
     await del(STORAGE_KEY_PROJECT);
+    persistedMediaChapters.clear();
     revokeAllCreatedUrls();
   } catch (err) {
     console.error('Erro ao limpar projeto no IndexedDB:', err);
