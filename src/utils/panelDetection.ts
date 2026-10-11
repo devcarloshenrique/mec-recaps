@@ -179,13 +179,72 @@ export function getImageDataFromElement(img: HTMLImageElement): ImageData {
 }
 
 /**
+ * Asynchronously converts canvas to native Blob with fallback.
+ */
+export function canvasToBlob(canvas: HTMLCanvasElement, quality = 0.88): Promise<Blob> {
+  return new Promise((resolve) => {
+    canvas.toBlob(
+      (blob) => {
+        if (blob) {
+          resolve(blob);
+        } else {
+          try {
+            const dataUrl = canvas.toDataURL('image/jpeg', quality);
+            fetch(dataUrl)
+              .then((res) => res.blob())
+              .then(resolve)
+              .catch(() => resolve(new Blob([])));
+          } catch {
+            resolve(new Blob([]));
+          }
+        }
+      },
+      'image/jpeg',
+      quality
+    );
+  });
+}
+
+/**
+ * Extracts a panel region from an HTMLImageElement directly to a native Blob and Object URL.
+ * Prevents allocating multi-megabyte base64 strings in the JavaScript V8 heap.
+ */
+export async function extractPanelToBlobAndUrl(
+  img: HTMLImageElement,
+  panel: { x: number; y: number; width: number; height: number },
+  quality = 0.88
+): Promise<{ blob: Blob; url: string }> {
+  const natW = img.naturalWidth || img.width || 704;
+  const natH = img.naturalHeight || img.height || 1408;
+
+  const clampX = Math.max(0, Math.min(natW - 10, Math.round(panel.x)));
+  const clampY = Math.max(0, Math.min(natH - 10, Math.round(panel.y)));
+  const clampW = Math.max(10, Math.min(natW - clampX, Math.round(panel.width)));
+  const clampH = Math.max(10, Math.min(natH - clampY, Math.round(panel.height)));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = clampW;
+  canvas.height = clampH;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    throw new Error('Could not get 2d context for panel extraction');
+  }
+
+  ctx.drawImage(img, clampX, clampY, clampW, clampH, 0, 0, clampW, clampH);
+
+  const blob = await canvasToBlob(canvas, quality);
+  const url = URL.createObjectURL(blob);
+  return { blob, url };
+}
+
+/**
  * Extracts a panel region from an HTMLImageElement to a JPEG data URL.
  * Safely clamps panel bounding box coordinates to the source image bounds.
  */
 export function extractPanelToDataUrl(
   img: HTMLImageElement,
   panel: { x: number; y: number; width: number; height: number },
-  quality = 0.94
+  quality = 0.88
 ): string {
   const natW = img.naturalWidth || img.width || 704;
   const natH = img.naturalHeight || img.height || 1408;
@@ -1222,23 +1281,55 @@ export async function detectPanels(
     img = imgSource;
   }
 
-  const imageData = getImageDataFromElement(img);
+  const natW = img.naturalWidth || img.width || 704;
+  const natH = img.naturalHeight || img.height || 1408;
+
+  // High-performance CV downscaling for vertical Manhwa/Webtoon pages (> 3000px height)
+  // Reduces pixel processing count from ~10.5M to ~600K (17x reduction), eliminating UI thread freezing.
+  const maxDim = 3000;
+  let scale = 1.0;
+  if (natH > maxDim) {
+    scale = maxDim / natH;
+  }
+
+  let imageData: ImageData;
+  if (scale < 0.95) {
+    const targetW = Math.max(120, Math.round(natW * scale));
+    const targetH = Math.max(120, Math.round(natH * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = targetW;
+    canvas.height = targetH;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) throw new Error('Could not get 2d context for image downscaling');
+    ctx.drawImage(img, 0, 0, targetW, targetH);
+    imageData = ctx.getImageData(0, 0, targetW, targetH);
+  } else {
+    imageData = getImageDataFromElement(img);
+  }
+
+  const scaledOptions: DetectionOptions = {
+    ...options,
+    minPanelHeight: options.minPanelHeight ? Math.round(options.minPanelHeight * scale) : undefined,
+    minPanelWidth: options.minPanelWidth ? Math.round(options.minPanelWidth * scale) : undefined,
+    padding: options.padding ? Math.round(options.padding * scale) : undefined,
+  };
+
   const algo = options.algorithm ?? 'hybrid';
   let panels: DetectedPanel[];
 
   switch (algo) {
     case 'profile':
-      panels = detectPanelsProfileProjection(imageData, options);
+      panels = detectPanelsProfileProjection(imageData, scaledOptions);
       break;
     case 'morphology':
-      panels = detectPanelsMorphology(imageData, options);
+      panels = detectPanelsMorphology(imageData, scaledOptions);
       break;
     case 'sahi':
-      panels = detectPanelsSAHI(imageData, options);
+      panels = detectPanelsSAHI(imageData, scaledOptions);
       break;
     case 'hybrid':
     default:
-      panels = detectPanelsHybrid(imageData, options);
+      panels = detectPanelsHybrid(imageData, scaledOptions);
       break;
   }
 
@@ -1248,18 +1339,36 @@ export async function detectPanels(
     const { filteredPanels } = filter_text_and_speech_bubbles(imageData, panels, {
       enabled: true,
       textThreshold: options.textFilterThreshold ?? 0.55,
-      minGlyphArea: options.minGlyphArea ?? 12,
-      maxGlyphArea: options.maxGlyphArea ?? 450,
+      minGlyphArea: options.minGlyphArea ? Math.round(options.minGlyphArea * scale * scale) : 8,
+      maxGlyphArea: options.maxGlyphArea ? Math.round(options.maxGlyphArea * scale * scale) : 350,
     });
     panels = filteredPanels;
+  }
+
+  // Scale detected bounding boxes back to true intrinsic image coordinates
+  if (scale < 0.95) {
+    const invScale = 1.0 / scale;
+    panels = panels.map((p) => {
+      const rx = Math.round(p.x * invScale);
+      const ry = Math.round(p.y * invScale);
+      const rw = Math.round(p.width * invScale);
+      const rh = Math.round(p.height * invScale);
+      return {
+        ...p,
+        x: Math.max(0, Math.min(natW - 10, rx)),
+        y: Math.max(0, Math.min(natH - 10, ry)),
+        width: Math.max(10, Math.min(natW - rx, rw)),
+        height: Math.max(10, Math.min(natH - ry, rh)),
+      };
+    });
   }
 
   // Decorate each panel with true intrinsic page dimensions and sequential label
   return panels.map((p, idx) => ({
     ...p,
     label: `Quadro ${String(idx + 1).padStart(2, '0')}`,
-    pageWidth: imageData.width,
-    pageHeight: imageData.height,
+    pageWidth: natW,
+    pageHeight: natH,
   }));
 }
 
