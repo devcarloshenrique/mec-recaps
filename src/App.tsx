@@ -20,7 +20,12 @@ import {
   saveProject,
   loadProject,
   clearProject,
+  registerCreatedUrl,
+  revokeCreatedUrl,
+  revokeAllCreatedUrls,
+  deleteChapterMediaBlobs,
 } from './utils/projectStorage';
+import { deleteChapterThumbnails } from './utils/thumbnailCache';
 import {
   FolderUp,
   Wand2,
@@ -132,6 +137,14 @@ export default function App() {
     let isMounted = true;
     async function initStorage() {
       try {
+        if (typeof navigator !== 'undefined' && navigator.storage && navigator.storage.persist) {
+          navigator.storage.persist().then((persisted) => {
+            if (persisted) {
+              console.log('[IndexedDB] Armazenamento persistente garantido pelo navegador.');
+            }
+          }).catch(() => {});
+        }
+
         const stored = await loadProject();
         if (!isMounted) return;
 
@@ -184,7 +197,7 @@ export default function App() {
     };
   }, []);
 
-  // 2. Debounced Auto-Save to IndexedDB whenever project state changes
+  // 2. Debounced Auto-Save to IndexedDB whenever project state changes (2500ms)
   useEffect(() => {
     if (!isProjectLoaded || isHydrating) return;
 
@@ -219,7 +232,7 @@ export default function App() {
         console.error('Erro no auto-save IndexedDB:', err);
         setSaveStatus('error');
       }
-    }, 1000);
+    }, 2500);
 
     return () => clearTimeout(timer);
   }, [chapters, frames, scenes, chapterPanels, currentChapterId, currentPageNumber, currentTab, projectMetadata, chapterMetadata, pageScripts, isProjectLoaded, isHydrating]);
@@ -367,9 +380,19 @@ export default function App() {
 
   // Delete chapter
   const handleDeleteChapter = (chapterId: string): boolean => {
+    deleteChapterMediaBlobs(chapterId);
+    deleteChapterThumbnails(chapterId);
+    const chapterToRemove = chapters.find((c) => c.id === chapterId);
+    if (chapterToRemove?.imageUrls) {
+      chapterToRemove.imageUrls.forEach(revokeCreatedUrl);
+    }
+    const framesToRemove = frames.filter((f) => f.chapterId === chapterId);
+    framesToRemove.forEach((f) => revokeCreatedUrl(f.src));
+
     const remaining = chapters.filter((c) => c.id !== chapterId);
     setChapters(remaining);
     setFrames((prev) => prev.filter((f) => f.chapterId !== chapterId));
+    setScenes((prev) => prev.filter((s) => s.chapterId !== chapterId));
 
     if (currentChapterId === chapterId) {
       if (remaining.length > 0) {
@@ -386,10 +409,22 @@ export default function App() {
 
   // Bulk delete chapters
   const handleDeleteChapters = (ids: string[]) => {
+    ids.forEach((id) => {
+      deleteChapterMediaBlobs(id);
+      deleteChapterThumbnails(id);
+    });
     const idSet = new Set(ids);
+    chapters.filter((c) => idSet.has(c.id)).forEach((ch) => {
+      ch.imageUrls?.forEach(revokeCreatedUrl);
+    });
+    frames.filter((f) => f.chapterId && idSet.has(f.chapterId)).forEach((f) => {
+      revokeCreatedUrl(f.src);
+    });
+
     const remaining = chapters.filter((c) => !idSet.has(c.id));
     setChapters(remaining);
     setFrames((prev) => prev.filter((f) => !f.chapterId || !idSet.has(f.chapterId)));
+    setScenes((prev) => prev.filter((s) => !s.chapterId || !idSet.has(s.chapterId)));
 
     if (idSet.has(currentChapterId)) {
       if (remaining.length > 0) {
@@ -405,6 +440,7 @@ export default function App() {
 
   // Clear all chapters and start fresh
   const handleClearAllChapters = async () => {
+    revokeAllCreatedUrls();
     setChapters([]);
     setFrames([]);
     setScenes([]);
@@ -445,43 +481,99 @@ export default function App() {
     });
   };
 
-  // Add frame from Recorte
-  const handleAddFrame = (newFrame: FrameItem) => {
-    setFrames((prev) => [...prev, newFrame]);
+  // Batch add frames (High-performance 1-dispatch update for automatic and multi-panel crops)
+  const handleAddFramesBatch = (newFrames: FrameItem[]) => {
+    if (newFrames.length === 0) return;
 
-    // Update chapter done count
-    setChapters((prev) =>
-      prev.map((c) => (c.id === currentChapterId ? { ...c, done: Math.min(c.pages, c.done + 1) } : c))
-    );
-
-    // Also associate to first scene if available
-    setScenes((prev) => {
-      if (prev.length === 0) {
-        return [
-          {
-            id: `s_${Date.now()}`,
-            title: 'Cena 01 — Nova Cena',
-            frames: [newFrame],
-            voice: 'Rafael (grave)',
-            duration: '0:05',
-            text: 'O confronto recém-iniciado revelava os primeiros sinais do despertar das sombras.',
-          },
-        ];
+    // Register blob URLs to track memory lifecycle
+    newFrames.forEach((f) => {
+      if (f.src && f.src.startsWith('blob:')) {
+        registerCreatedUrl(f.src);
       }
-      return [
-        {
-          ...prev[0],
-          frames: [newFrame, ...prev[0].frames],
-        },
-        ...prev.slice(1),
-      ];
     });
 
-    showToast(`Quadro recortado e adicionado à timeline!`);
+    setFrames((prev) => [...prev, ...newFrames]);
+
+    // Aggregate counts by chapter in a single pass
+    const countsByChapter = new Map<string, number>();
+    newFrames.forEach((f) => {
+      const chId = f.chapterId || currentChapterId;
+      if (chId) {
+        countsByChapter.set(chId, (countsByChapter.get(chId) || 0) + 1);
+      }
+    });
+
+    setChapters((prev) =>
+      prev.map((c) => {
+        const added = countsByChapter.get(c.id);
+        return added ? { ...c, done: Math.min(c.pages, c.done + added) } : c;
+      })
+    );
+
+    // Map frames into their respective page scenes (normalized, non-duplicating)
+    setScenes((prev) => {
+      const updatedScenes = [...prev];
+
+      const framesByPage = new Map<string, FrameItem[]>();
+      newFrames.forEach((f) => {
+        const key = `${f.chapterId || currentChapterId || 'default'}_${f.pageNumber || 1}`;
+        if (!framesByPage.has(key)) framesByPage.set(key, []);
+        framesByPage.get(key)!.push(f);
+      });
+
+      framesByPage.forEach((pageFrames) => {
+        const sample = pageFrames[0];
+        const chId = sample.chapterId || currentChapterId;
+        const pNum = sample.pageNumber || 1;
+        const sceneId = `scene_${chId}_p${pNum}`;
+
+        const existingIdx = updatedScenes.findIndex(
+          (s) => (s.chapterId === chId && s.pageNumber === pNum) || s.id === sceneId
+        );
+
+        if (existingIdx >= 0) {
+          const existing = updatedScenes[existingIdx];
+          const existingFrameIds = new Set(existing.frames.map((f) => f.id));
+          const toAdd = pageFrames.filter((f) => !existingFrameIds.has(f.id));
+          if (toAdd.length > 0) {
+            updatedScenes[existingIdx] = {
+              ...existing,
+              frames: [...existing.frames, ...toAdd],
+            };
+          }
+        } else {
+          const ch = chapters.find((c) => c.id === chId);
+          updatedScenes.push({
+            id: sceneId,
+            title: `${ch?.label || 'Capítulo'} · Página ${String(pNum).padStart(2, '0')}`,
+            chapterId: chId,
+            pageNumber: pNum,
+            frames: pageFrames,
+            voice: 'Rafael (grave)',
+            duration: `${Math.round(pageFrames.reduce((acc, f) => acc + (f.duration || 5), 0))}s`,
+            text: '',
+          });
+        }
+      });
+
+      return updatedScenes;
+    });
+
+    showToast(`${newFrames.length} quadro(s) adicionado(s) à timeline!`);
+  };
+
+  // Add single frame from Recorte (delegates to batch update)
+  const handleAddFrame = (newFrame: FrameItem) => {
+    handleAddFramesBatch([newFrame]);
   };
 
   // Remove frame
   const handleRemoveFrame = (id: string) => {
+    const frameToRemove = frames.find((f) => f.id === id);
+    if (frameToRemove?.src) {
+      revokeCreatedUrl(frameToRemove.src);
+    }
+
     setFrames((prev) => prev.filter((f) => f.id !== id));
     setScenes((prev) =>
       prev.map((s) => ({
@@ -780,6 +872,7 @@ export default function App() {
           chapterPanels={chapterPanels}
           onUpdateChapterPanels={setChapterPanels}
           onAddFrame={handleAddFrame}
+          onAddFramesBatch={handleAddFramesBatch}
           onRemoveFrame={handleRemoveFrame}
           onUpdateFrame={handleUpdateFrame}
           onUploadFolder={handleUploadFolder}
@@ -831,21 +924,23 @@ export default function App() {
       </div>
 
       <div className={currentTab === 'montagem' ? 'flex flex-1 flex-col' : 'hidden'}>
-        <MontagemView
-          chapters={chapters}
-          frames={frames}
-          scenes={scenes}
-          onExportRecap={(fmt) => {
-            if (fmt) setExportModalFormat(fmt);
-            setIsExportModalOpen(true);
-          }}
-          onUpdateFrameDuration={handleUpdateFrameDuration}
-          onUpdateMultipleFrames={handleUpdateMultipleFrames}
-          onReorderFrames={handleReorderFrames}
-          onRemoveFrame={handleRemoveFrame}
-          onGoToRecorte={() => setCurrentTab('recorte')}
-          onGoToNarracao={() => setCurrentTab('narracao')}
-        />
+        {currentTab === 'montagem' && (
+          <MontagemView
+            chapters={chapters}
+            frames={frames}
+            scenes={scenes}
+            onExportRecap={(fmt) => {
+              if (fmt) setExportModalFormat(fmt);
+              setIsExportModalOpen(true);
+            }}
+            onUpdateFrameDuration={handleUpdateFrameDuration}
+            onUpdateMultipleFrames={handleUpdateMultipleFrames}
+            onReorderFrames={handleReorderFrames}
+            onRemoveFrame={handleRemoveFrame}
+            onGoToRecorte={() => setCurrentTab('recorte')}
+            onGoToNarracao={() => setCurrentTab('narracao')}
+          />
+        )}
       </div>
 
       {/* Floating Toast Notification */}
