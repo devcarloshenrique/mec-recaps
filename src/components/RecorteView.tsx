@@ -47,12 +47,19 @@ import {
   DetectionAlgorithm,
   DetectedPanel,
   extractPanelToDataUrl,
+  extractPanelToBlobAndUrl,
+  canvasToBlob,
   getClosestAspectRatio,
   loadImage,
   ALGORITHM_INFO,
   filter_text_and_speech_bubbles,
   evaluate_crop_patch,
 } from '../utils/panelDetection';
+import { registerCreatedUrl } from '../utils/projectStorage';
+import {
+  getChapterThumbnails,
+  generateChapterThumbnailsSequentially,
+} from '../utils/thumbnailCache';
 
 interface RecorteViewProps {
   chapters: ChapterItem[];
@@ -62,6 +69,7 @@ interface RecorteViewProps {
   onSelectPageNumber: (page: number) => void;
   frames: FrameItem[];
   onAddFrame: (frame: FrameItem) => void;
+  onAddFramesBatch?: (frames: FrameItem[]) => void;
   onRemoveFrame: (id: string) => void;
   onUpdateFrame?: (id: string, partial: Partial<FrameItem>) => void;
   onUploadFolder: (files: FileList | File[]) => void;
@@ -110,6 +118,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
   onSelectPageNumber,
   frames,
   onAddFrame,
+  onAddFramesBatch,
   onRemoveFrame,
   onUpdateFrame,
   onUploadFolder,
@@ -271,6 +280,43 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
   };
 
   const currentImageUrl = getPageUrl(currentPageNumber);
+
+  // Progressive hydration of low-res proxy thumbnails (80x128px, ~2.5KB each)
+  const [chapterThumbnails, setChapterThumbnails] = useState<Record<number, string>>({});
+
+  useEffect(() => {
+    let isCancelled = false;
+
+    if (!currentChapterId || !currentChapter.imageUrls || currentChapter.imageUrls.length === 0) {
+      setChapterThumbnails({});
+      return;
+    }
+
+    // 1. Check if already cached in memory or IndexedDB
+    getChapterThumbnails(currentChapterId).then((cached) => {
+      if (isCancelled) return;
+      if (cached && Object.keys(cached).length > 0) {
+        setChapterThumbnails(cached);
+      }
+    });
+
+    // 2. Run sequential background generation for missing pages (yields 12ms per page)
+    generateChapterThumbnailsSequentially(
+      currentChapterId,
+      currentChapter.imageUrls,
+      (pageNum, thumbUrl) => {
+        if (isCancelled) return;
+        setChapterThumbnails((prev) => ({
+          ...prev,
+          [pageNum]: thumbUrl,
+        }));
+      }
+    );
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [currentChapterId, currentChapter.imageUrls]);
 
   // Stats for current chapter panel selections
   const totalChapterPanels = Object.values(currentChapterPanels).reduce(
@@ -701,7 +747,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
   };
 
   // Crop a single specified panel
-  const handleCropSinglePanel = (panel: DetectedPanel) => {
+  const handleCropSinglePanel = async (panel: DetectedPanel) => {
     const img = imageRef.current;
     if (!img) return;
 
@@ -732,7 +778,9 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
         ctx.drawImage(img, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
       }
 
-      const dataUrl = canvas.toDataURL('image/jpeg', 0.94);
+      const blob = await canvasToBlob(canvas, 0.88);
+      const url = registerCreatedUrl(URL.createObjectURL(blob));
+
       playShutterSound();
       setIsCropFlashing(true);
       setTimeout(() => setIsCropFlashing(false), 300);
@@ -741,7 +789,8 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       const newFrame: FrameItem = {
         id: `q_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
         label: `${panel.label} (Pág. ${currentPageNumber})`,
-        src: dataUrl,
+        src: url,
+        blob,
         ratio: getClosestAspectRatio(cropW, cropH),
         duration: 5.0,
         chapterId: currentChapterId,
@@ -750,7 +799,11 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
         cropRect: { x: cropX, y: cropY, width: cropW, height: cropH },
       };
 
-      onAddFrame(newFrame);
+      if (onAddFramesBatch) {
+        onAddFramesBatch([newFrame]);
+      } else {
+        onAddFrame(newFrame);
+      }
       showToast(`✂️ ${panel.label} recortado!`);
     } catch (err) {
       console.error('Erro ao recortar painel:', err);
@@ -833,39 +886,49 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       return;
     }
 
-    let count = 0;
     playShutterSound();
     setIsCropFlashing(true);
     setTimeout(() => setIsCropFlashing(false), 300);
 
+    const newFrames: FrameItem[] = [];
+
     for (let i = 0; i < panelsToCrop.length; i++) {
       const p = panelsToCrop[i];
-      const dataUrl = extractPanelToDataUrl(img, p);
-      if (!dataUrl) continue;
-
-      const closestRatio = getClosestAspectRatio(p.width, p.height);
-      const frameNumber = frames.length + count + 1;
-      const newFrame: FrameItem = {
-        id: `q_auto_${Date.now()}_${i}_${Math.random().toString(36).substring(2, 5)}`,
-        label: p.label ? `${p.label} (Pág. ${currentPageNumber})` : `Quadro ${String(frameNumber).padStart(2, '0')}`,
-        src: dataUrl,
-        ratio: closestRatio,
-        duration: 5.0,
-        chapterId: currentChapterId,
-        pageNumber: currentPageNumber,
-        panelId: p.id,
-        cropRect: { x: Math.round(p.x), y: Math.round(p.y), width: Math.round(p.width), height: Math.round(p.height) },
-      };
-
-      onAddFrame(newFrame);
-      count++;
+      try {
+        const { blob, url } = await extractPanelToBlobAndUrl(img, p, 0.88);
+        const closestRatio = getClosestAspectRatio(p.width, p.height);
+        const frameNumber = frames.length + newFrames.length + 1;
+        const newFrame: FrameItem = {
+          id: `q_auto_${Date.now()}_${i}_${Math.random().toString(36).substring(2, 5)}`,
+          label: p.label ? `${p.label} (Pág. ${currentPageNumber})` : `Quadro ${String(frameNumber).padStart(2, '0')}`,
+          src: registerCreatedUrl(url),
+          blob,
+          ratio: closestRatio,
+          duration: 5.0,
+          chapterId: currentChapterId,
+          pageNumber: currentPageNumber,
+          panelId: p.id,
+          cropRect: { x: Math.round(p.x), y: Math.round(p.y), width: Math.round(p.width), height: Math.round(p.height) },
+        };
+        newFrames.push(newFrame);
+      } catch (err) {
+        console.error('Erro ao recortar painel:', err);
+      }
     }
 
-    const skipped = panels.length - count;
+    if (newFrames.length > 0) {
+      if (onAddFramesBatch) {
+        onAddFramesBatch(newFrames);
+      } else {
+        newFrames.forEach((f) => onAddFrame(f));
+      }
+    }
+
+    const skipped = panels.length - newFrames.length;
     if (skipped > 0) {
-      showToast(`🎉 ${count} novo(s) quadro(s) recortado(s)! (${skipped} já existia(m) nesta página)`);
+      showToast(`🎉 ${newFrames.length} novo(s) quadro(s) recortado(s)! (${skipped} já existia(m) nesta página)`);
     } else {
-      showToast(`🎉 ${count} quadros recortados com sucesso para a timeline!`);
+      showToast(`🎉 ${newFrames.length} quadros recortados com sucesso para a timeline!`);
     }
   };
 
@@ -986,6 +1049,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
     const total = currentChapter.pages;
     let totalCut = 0;
     const newPanelsByPage: Record<number, DetectedPanel[]> = {};
+    const allNewFrames: FrameItem[] = [];
 
     setBatchProgress({ mode: 'crop', current: 1, total, count: 0 });
 
@@ -1050,27 +1114,38 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
             });
             if (alreadyExists) continue;
 
-            const dataUrl = extractPanelToDataUrl(img, p);
-            if (!dataUrl) continue;
-
-            const closestRatio = getClosestAspectRatio(p.width, p.height);
-            totalCut++;
-            const newFrame: FrameItem = {
-              id: `q_batch_${Date.now()}_p${pNum}_${i}_${Math.random().toString(36).substring(2, 5)}`,
-              label: p.label ? `${p.label} (Pág. ${pNum})` : `Quadro ${String(frames.length + totalCut).padStart(2, '0')}`,
-              src: dataUrl,
-              ratio: closestRatio,
-              duration: 5.0,
-              chapterId: currentChapterId,
-              pageNumber: pNum,
-              panelId: p.id,
-              cropRect: { x: Math.round(p.x), y: Math.round(p.y), width: Math.round(p.width), height: Math.round(p.height) },
-            };
-            onAddFrame(newFrame);
+            try {
+              const { blob, url: panelUrl } = await extractPanelToBlobAndUrl(img, p, 0.88);
+              const closestRatio = getClosestAspectRatio(p.width, p.height);
+              totalCut++;
+              const newFrame: FrameItem = {
+                id: `q_batch_${Date.now()}_p${pNum}_${i}_${Math.random().toString(36).substring(2, 5)}`,
+                label: p.label ? `${p.label} (Pág. ${pNum})` : `Quadro ${String(frames.length + totalCut).padStart(2, '0')}`,
+                src: registerCreatedUrl(panelUrl),
+                blob,
+                ratio: closestRatio,
+                duration: 5.0,
+                chapterId: currentChapterId,
+                pageNumber: pNum,
+                panelId: p.id,
+                cropRect: { x: Math.round(p.x), y: Math.round(p.y), width: Math.round(p.width), height: Math.round(p.height) },
+              };
+              allNewFrames.push(newFrame);
+            } catch (err) {
+              console.error(`Erro ao extrair painel da página ${pNum}:`, err);
+            }
           }
         }
       } catch (err) {
         console.error(`Erro ao recortar página ${pNum}:`, err);
+      }
+    }
+
+    if (allNewFrames.length > 0) {
+      if (onAddFramesBatch) {
+        onAddFramesBatch(allNewFrames);
+      } else {
+        allNewFrames.forEach((f) => onAddFrame(f));
       }
     }
 
@@ -1269,7 +1344,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
   };
 
   // Execute real Crop: extract canvas blob and add to frames
-  const handleExecuteCrop = () => {
+  const handleExecuteCrop = async () => {
     const img = imageRef.current;
     if (!img) return;
 
@@ -1307,7 +1382,8 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
         ctx.drawImage(img, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
       }
 
-      const dataUrl = canvas.toDataURL('image/jpeg', 0.94);
+      const blob = await canvasToBlob(canvas, 0.88);
+      const url = registerCreatedUrl(URL.createObjectURL(blob));
 
       // Play camera shutter sound
       playShutterSound();
@@ -1322,7 +1398,8 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       const newFrame: FrameItem = {
         id: `q_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
         label,
-        src: dataUrl,
+        src: url,
+        blob,
         ratio: selectedRatio === 'Livre' ? closestRatio : selectedRatio,
         duration: 5.0,
         chapterId: currentChapterId,
@@ -1331,7 +1408,11 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
         cropRect: { x: cropX, y: cropY, width: cropW, height: cropH },
       };
 
-      onAddFrame(newFrame);
+      if (onAddFramesBatch) {
+        onAddFramesBatch([newFrame]);
+      } else {
+        onAddFrame(newFrame);
+      }
       showToast(`${newFrame.label} recortado! (${cropW}×${cropH}px)`);
     } catch (err) {
       console.error('Erro ao recortar quadro:', err);
@@ -2653,6 +2734,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
                 (f) => (!f.chapterId || f.chapterId === currentChapterId) && f.pageNumber === pageNum
               );
               const pagePanelsCount = (currentChapterPanels[pageNum] || []).length;
+              const thumbUrl = chapterThumbnails[pageNum];
 
               return (
                 <button
@@ -2665,14 +2747,17 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
                   }`}
                   title={`Página ${pageNum}${pagePanelsCount > 0 ? ` · ${pagePanelsCount} quadros detectados` : ''}${hasFrames ? ' · Quadros na timeline' : ''}`}
                 >
-                  <img
-                    src={getPageUrl(pageNum)}
-                    alt={`Página ${pageNum}`}
-                    loading="lazy"
-                    width={704}
-                    height={1408}
-                    className="h-full w-full object-cover"
-                  />
+                  {thumbUrl ? (
+                    <img
+                      src={thumbUrl}
+                      alt={`Página ${pageNum}`}
+                      className="h-full w-full object-cover"
+                    />
+                  ) : (
+                    <div className="h-full w-full bg-muted/20 flex flex-col items-center justify-center animate-pulse">
+                      <span className="text-[10px] font-mono font-medium text-muted-foreground/60">{pageNum}</span>
+                    </div>
+                  )}
                   {pagePanelsCount > 0 && (
                     <span
                       className="absolute top-0.5 right-0.5 bg-amber-500 text-black text-[8px] font-bold px-1 rounded shadow"
