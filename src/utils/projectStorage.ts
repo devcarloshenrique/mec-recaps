@@ -54,7 +54,7 @@ export interface StoredChapter {
   label: string;
   pages: number;
   done: number;
-  pageBlobs: Blob[];
+  pageBlobs?: Blob[];
 }
 
 export interface StoredFrame {
