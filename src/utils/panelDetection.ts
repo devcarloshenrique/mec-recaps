@@ -31,6 +31,7 @@ export interface DetectionOptions {
   textFilterThreshold?: number; // Score threshold above which patch is discarded (default: 0.55)
   minGlyphArea?: number;        // Minimum area for glyph component in CCL (default: 12 px²)
   maxGlyphArea?: number;        // Maximum area for glyph component in CCL (default: 450 px²)
+  fullWidthPanels?: boolean;    // Expand panels to 100% page width (ideal for Webtoon/Manhwa, default: true for vertical pages)
 }
 
 export interface DetectedPanel {
@@ -1364,8 +1365,11 @@ export async function detectPanels(
   }
 
   // Decorate each panel with true intrinsic page dimensions and sequential label
+  const expandToFullWidth = options.fullWidthPanels ?? (natH / natW >= 1.2);
   return panels.map((p, idx) => ({
     ...p,
+    x: expandToFullWidth ? 0 : p.x,
+    width: expandToFullWidth ? natW : p.width,
     label: `Quadro ${String(idx + 1).padStart(2, '0')}`,
     pageWidth: natW,
     pageHeight: natH,
