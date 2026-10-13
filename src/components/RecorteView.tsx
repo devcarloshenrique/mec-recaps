@@ -34,6 +34,7 @@ import {
   Layers,
   Loader2,
   SlidersHorizontal,
+  MoreVertical,
   Cpu,
   Zap,
   Boxes,
@@ -159,6 +160,17 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
   const [isChaptersDrawerOpen, setIsChaptersDrawerOpen] = useState<boolean>(false);
   const [inspectorTab, setInspectorTab] = useState<'manual' | 'auto'>('manual');
 
+  // Floating Properties Panel States (Photoshop / Figma HUD style - Only opens when user activates)
+  const [isPropertiesOpen, setIsPropertiesOpen] = useState<boolean>(false);
+  const [isPropertiesCollapsed, setIsPropertiesCollapsed] = useState<boolean>(false);
+
+  // Photoshop-Style Context Menu for Layers / Panels
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    item: any;
+  } | null>(null);
+
   // Automatic Panel Detection State (Fase 1: Projeção de Perfil, Morfologia, SAHI, Híbrido)
   // Store detected panel selections per chapter and page: { [chapterId]: { [pageNumber]: DetectedPanel[] } }
   // When lifted to parent, preserves detections across tab switches and page reloads
@@ -169,6 +181,21 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
   useEffect(() => {
     chapterPanelsRef.current = chapterPanels;
   }, [chapterPanels]);
+
+  // Close context menu on global click or Escape
+  useEffect(() => {
+    if (!contextMenu) return;
+    const handleGlobalClick = () => setContextMenu(null);
+    const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setContextMenu(null);
+    };
+    window.addEventListener('click', handleGlobalClick);
+    window.addEventListener('keydown', handleGlobalKeyDown);
+    return () => {
+      window.removeEventListener('click', handleGlobalClick);
+      window.removeEventListener('keydown', handleGlobalKeyDown);
+    };
+  }, [contextMenu]);
 
   const currentChapterPanels = chapterPanels[currentChapterId] || {};
   const detectedPanels = currentChapterPanels[currentPageNumber] || [];
@@ -1486,10 +1513,23 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
     const handleKeyDown = (e: KeyboardEvent) => {
       if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement).tagName)) return;
 
-      // Auto detect shortcut (Ctrl + Shift + A or W)
-      if (((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a' && e.shiftKey) || e.key === 'w' || e.key === 'W') {
+      // Auto detect page shortcut: D (or Shift+D or Ctrl+Shift+A)
+      if (
+        ((e.key === 'd' || e.key === 'D') && !e.ctrlKey && !e.metaKey) ||
+        ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a' && e.shiftKey)
+      ) {
         e.preventDefault();
         handleRunAutoDetection();
+        return;
+      }
+
+      // Crop entire page shortcut: Shift+Enter or X
+      if (
+        ((e.key === 'x' || e.key === 'X') && !e.ctrlKey && !e.metaKey) ||
+        (e.key === 'Enter' && e.shiftKey)
+      ) {
+        e.preventDefault();
+        handleCropPagePanels();
         return;
       }
 
@@ -1529,6 +1569,12 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
         setZoomLevel(100);
         setPanOffset({ x: 0, y: 0 });
         showToast('Zoom 100% (Pixels Reais)');
+      } else if (e.key === '+' || e.key === '=') {
+        e.preventDefault();
+        setZoomLevel((z) => Math.min(240, z + 10));
+      } else if (e.key === '-' || e.key === '_') {
+        e.preventDefault();
+        setZoomLevel((z) => Math.max(5, z - 10));
       } else if (e.key === 'ArrowLeft') {
         onSelectPageNumber(Math.max(1, currentPageNumber - 1));
       } else if (e.key === 'ArrowRight') {
@@ -1545,11 +1591,23 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
         } else {
           handleExecuteCrop();
         }
+      } else if (e.key === 'p' || e.key === 'P') {
+        if (!e.ctrlKey && !e.metaKey) {
+          e.preventDefault();
+          setIsPropertiesOpen((prev) => {
+            const next = !prev;
+            showToast(next ? '🎛️ Painel de propriedades aberto (P)' : 'Painel de propriedades ocultado (P)');
+            return next;
+          });
+          if (isPropertiesCollapsed) setIsPropertiesCollapsed(false);
+        }
       } else if (e.key === 'Escape') {
         if (dragMode) {
           setDragMode(null);
           drawingBoxRef.current = null;
           setDrawingBox(null);
+        } else if (isPropertiesOpen && !isPropertiesCollapsed) {
+          setIsPropertiesCollapsed(true);
         }
       } else if (e.key === '1' && !e.ctrlKey && !e.metaKey) {
         applyRatio('16:9');
@@ -2448,116 +2506,6 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       {/* MAIN WORKSPACE CANVAS: CLEAN FRAMELESS ISLAND VIEWPORT   */}
       {/* ======================================================== */}
       <div className="flex min-w-0 flex-1 flex-col lg:h-[calc(100vh-61px)] bg-[#121319] relative overflow-hidden">
-        {/* Top Floating Control Bar (Modeled after modern studio UI in image_02d6ff.png) */}
-        <div className="absolute top-4 left-4 right-4 z-20 flex items-center justify-between pointer-events-none select-none">
-          {/* Left: Chapter Selector Pill */}
-          <div className="pointer-events-auto flex items-center gap-2">
-            <button
-              onClick={() => setIsChaptersDrawerOpen(true)}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-[#181922]/90 backdrop-blur-xl border border-white/10 hover:border-white/25 text-xs font-semibold text-white shadow-xl transition-all cursor-pointer"
-              title="Abrir gaveta de capítulos"
-            >
-              <FolderUp className="h-3.5 w-3.5 text-primary" />
-              <span className="truncate max-w-[130px] font-display">{currentChapter.label}</span>
-              <span className="text-[10px] text-muted-foreground font-mono">({currentChapter.pages} pág)</span>
-              <ChevronDown className="h-3 w-3 text-muted-foreground" />
-            </button>
-          </div>
-
-          {/* Center: Slide / Page Navigation Pill (Directly inspired by image_02d6ff.png) */}
-          <div className="pointer-events-auto flex items-center gap-1 px-3 py-1.5 rounded-full bg-[#181922]/90 backdrop-blur-xl border border-white/10 shadow-xl text-xs font-semibold text-white">
-            <button
-              onClick={() => onSelectPageNumber(Math.max(1, currentPageNumber - 1))}
-              disabled={currentPageNumber <= 1}
-              className="p-1 rounded-full hover:bg-white/10 disabled:opacity-30 cursor-pointer transition-colors"
-              title="Página anterior (Seta Esquerda)"
-            >
-              <ChevronLeft className="h-4 w-4" />
-            </button>
-            <span className="font-mono text-xs px-2 font-bold">
-              Página {currentPageNumber} <span className="text-muted-foreground font-normal">/ {currentChapter.pages}</span>
-            </span>
-            <button
-              onClick={() => onSelectPageNumber(Math.min(currentChapter.pages, currentPageNumber + 1))}
-              disabled={currentPageNumber >= currentChapter.pages}
-              className="p-1 rounded-full hover:bg-white/10 disabled:opacity-30 cursor-pointer transition-colors"
-              title="Próxima página (Seta Direita)"
-            >
-              <ChevronRight className="h-4 w-4" />
-            </button>
-          </div>
-
-          {/* Right: Zoom & Quick Tools Pills */}
-          <div className="pointer-events-auto flex items-center gap-1.5">
-            {/* Zoom Controls Pill */}
-            <div className="flex items-center gap-1 px-2.5 py-1 rounded-full bg-[#181922]/90 backdrop-blur-xl border border-white/10 shadow-xl text-xs font-mono text-white">
-              <button
-                onClick={() => setZoomLevel((z) => Math.max(5, z - 10))}
-                className="p-1 rounded-full hover:bg-white/10 text-muted-foreground hover:text-white transition-colors cursor-pointer"
-                title="Diminuir zoom (-)"
-              >
-                <Minus className="h-3.5 w-3.5" />
-              </button>
-              <span className="w-8 text-center font-semibold text-[11px] text-white/90">{zoomLevel}%</span>
-              <button
-                onClick={() => setZoomLevel((z) => Math.min(220, z + 10))}
-                className="p-1 rounded-full hover:bg-white/10 text-muted-foreground hover:text-white transition-colors cursor-pointer"
-                title="Aumentar zoom (+)"
-              >
-                <Plus className="h-3.5 w-3.5" />
-              </button>
-              <div className="h-3 w-[1px] bg-white/15 mx-0.5" />
-              <button
-                onClick={handleFitToScreen}
-                className="p-1 rounded-full hover:bg-white/10 text-muted-foreground hover:text-primary transition-colors cursor-pointer"
-                title="Ajustar à tela"
-              >
-                <Maximize2 className="h-3 w-3" />
-              </button>
-            </div>
-
-            <button
-              onClick={() => {
-                setIsFullWidthMode((prev) => {
-                  const next = !prev;
-                  showToast(next ? '↔️ Largura Total ATIVADA (100% Manhwa)' : '🔓 Modo Largura Livre');
-                  return next;
-                });
-              }}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-semibold transition-all shadow-xl cursor-pointer ${
-                isFullWidthMode
-                  ? 'bg-primary/20 border-primary text-primary'
-                  : 'bg-[#181922]/90 border-white/10 text-muted-foreground hover:text-white'
-              }`}
-              title="Fixar seleções em 100% da largura da imagem (ideal para Manhwa/Webtoon) - Atalho: W"
-            >
-              <ArrowRightLeft className="h-3.5 w-3.5" />
-              <span className="text-[11px] font-mono">100% Largura</span>
-            </button>
-
-            <button
-              onClick={() => setShowGrid((prev) => !prev)}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-semibold transition-all shadow-xl cursor-pointer ${
-                showGrid
-                  ? 'bg-primary/20 border-primary text-primary'
-                  : 'bg-[#181922]/90 border-white/10 text-muted-foreground hover:text-white'
-              }`}
-              title="Grade dos Terços (G)"
-            >
-              <Grid className="h-3.5 w-3.5" />
-              <span className="text-[11px] font-mono">Grade</span>
-            </button>
-
-            <button
-              onClick={() => setIsShortcutsModalOpen(true)}
-              className="p-2 rounded-full bg-[#181922]/90 border border-white/10 text-muted-foreground hover:text-white shadow-xl transition-all cursor-pointer"
-              title="Atalhos de Teclado"
-            >
-              <Keyboard className="h-3.5 w-3.5" />
-            </button>
-          </div>
-        </div>
-
         {/* Floating Left Tools Island (Directly modeled after vertical toolbar in image_02d6ff.png) */}
         <div className="absolute left-4 top-1/2 -translate-y-1/2 z-20 flex flex-col items-center gap-1 p-1.5 rounded-2xl bg-[#181922]/92 backdrop-blur-2xl border border-white/10 shadow-2xl shadow-black/60 select-none">
           <button
@@ -2597,52 +2545,116 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
             <Hand className="h-4 w-4" />
           </button>
 
-          <button
-            onClick={() => setActiveTool('zoom')}
-            className={`p-2 rounded-xl transition-all cursor-pointer ${
-              activeTool === 'zoom'
-                ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
-                : 'text-muted-foreground hover:text-white hover:bg-white/5'
-            }`}
-            title="Zoom (Z)"
-          >
-            <ZoomIn className="h-4 w-4" />
-          </button>
-
           <div className="h-[1px] w-4 bg-white/10 my-0.5" />
 
-          <button
-            onClick={handleRotate}
-            className="p-2 rounded-xl text-muted-foreground hover:text-white hover:bg-white/5 transition-all cursor-pointer"
-            title="Girar Orientação 90° (R)"
-          >
-            <RotateCw className="h-4 w-4" />
-          </button>
-
-          <button
-            onClick={handleCenterCrop}
-            className="p-2 rounded-xl text-muted-foreground hover:text-white hover:bg-white/5 transition-all cursor-pointer"
-            title="Centralizar Enquadramento (Shift+C)"
-          >
-            <Crosshair className="h-4 w-4" />
-          </button>
-
+          {/* 100% Largura Tool */}
           <button
             onClick={() => {
               setIsFullWidthMode((prev) => {
                 const next = !prev;
-                showToast(next ? '↔️ Largura Total ATIVADA (100%)' : '🔓 Modo Largura Livre');
+                showToast(next ? '↔️ Largura Total ATIVADA (100% Manhwa)' : '🔓 Modo Largura Livre');
                 return next;
               });
             }}
             className={`p-2 rounded-xl transition-all cursor-pointer ${
               isFullWidthMode
-                ? 'bg-primary/20 text-primary border border-primary/30 shadow-sm'
+                ? 'bg-primary/20 text-primary border border-primary/30'
                 : 'text-muted-foreground hover:text-white hover:bg-white/5'
             }`}
-            title={isFullWidthMode ? 'Largura Total ativa (100% da imagem). Clique para livre.' : 'Ativar Largura Total (100% da imagem)'}
+            title="Fixar seleções em 100% da largura da imagem (W)"
           >
             <ArrowRightLeft className="h-4 w-4" />
+          </button>
+
+          {/* Grade Tool */}
+          <button
+            onClick={() => setShowGrid((prev) => !prev)}
+            className={`p-2 rounded-xl transition-all cursor-pointer ${
+              showGrid
+                ? 'bg-primary/20 text-primary border border-primary/30'
+                : 'text-muted-foreground hover:text-white hover:bg-white/5'
+            }`}
+            title="Grade dos Terços (G)"
+          >
+            <Grid className="h-4 w-4" />
+          </button>
+
+          {/* Painel Flutuante de Propriedades */}
+          <button
+            onClick={() => {
+              setIsPropertiesOpen((prev) => {
+                const next = !prev;
+                showToast(next ? '🎛️ Painel de propriedades aberto (P)' : 'Painel de propriedades ocultado (P)');
+                return next;
+              });
+              if (isPropertiesCollapsed) setIsPropertiesCollapsed(false);
+            }}
+            className={`p-2 rounded-xl transition-all cursor-pointer ${
+              isPropertiesOpen
+                ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 shadow-sm'
+                : 'text-muted-foreground hover:text-white hover:bg-white/5'
+            }`}
+            title="Painel Flutuante de Propriedades (P)"
+          >
+            <SlidersHorizontal className="h-4 w-4" />
+          </button>
+
+          <div className="h-[1px] w-4 bg-white/10 my-0.5" />
+
+          {/* Atalhos de Teclado */}
+          <button
+            onClick={() => setIsShortcutsModalOpen(true)}
+            className="p-2 rounded-xl text-muted-foreground hover:text-white hover:bg-white/5 transition-colors cursor-pointer"
+            title="Atalhos de Teclado (?)"
+          >
+            <Keyboard className="h-4 w-4" />
+          </button>
+        </div>
+
+        {/* Balão Flutuante de Zoom & Ajuste de Tela (Inferior Direito, acima da timeline) */}
+        <div
+          className={`absolute right-4 z-30 pointer-events-auto flex items-center gap-1.5 px-3 py-1.5 rounded-2xl bg-[#13141c]/95 backdrop-blur-2xl border border-white/10 shadow-2xl shadow-black/80 text-xs font-mono text-white select-none transition-all ${
+            currentChapter && currentChapter.pages > 0 ? 'bottom-[88px]' : 'bottom-4'
+          }`}
+        >
+          <button
+            onClick={() => setZoomLevel((z) => Math.max(5, z - 10))}
+            className="p-1 rounded-lg hover:bg-white/10 text-muted-foreground hover:text-white transition-colors cursor-pointer"
+            title="Diminuir zoom (-)"
+          >
+            <Minus className="h-3.5 w-3.5" />
+          </button>
+
+          <button
+            onClick={() => {
+              setZoomLevel(100);
+              showToast('Zoom 100%');
+            }}
+            className="px-1.5 py-0.5 rounded hover:bg-white/10 transition-colors cursor-pointer"
+            title="Clique para redefinir para 100% (Ctrl+1)"
+          >
+            <span className="font-semibold text-[11px] text-white/90">
+              {zoomLevel}%
+            </span>
+          </button>
+
+          <button
+            onClick={() => setZoomLevel((z) => Math.min(240, z + 10))}
+            className="p-1 rounded-lg hover:bg-white/10 text-muted-foreground hover:text-white transition-colors cursor-pointer"
+            title="Aumentar zoom (+)"
+          >
+            <Plus className="h-3.5 w-3.5" />
+          </button>
+
+          <div className="h-3.5 w-[1px] bg-white/15 mx-0.5" />
+
+          <button
+            onClick={handleFitToScreen}
+            className="flex items-center gap-1 px-2 py-0.5 rounded-lg hover:bg-white/10 text-muted-foreground hover:text-primary transition-colors cursor-pointer font-sans"
+            title="Ajustar à tela (Ctrl + 0)"
+          >
+            <Maximize2 className="h-3.5 w-3.5 text-primary" />
+            <span className="text-[11px] font-medium text-white/80">Ajustar</span>
           </button>
         </div>
 
@@ -2863,6 +2875,18 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
                                 type="button"
                                 onClick={(e) => {
                                   e.stopPropagation();
+                                  setIsPropertiesOpen(true);
+                                  setIsPropertiesCollapsed(false);
+                                }}
+                                className="p-0.5 rounded hover:bg-white/10 text-muted-foreground hover:text-cyan-400 transition-colors cursor-pointer"
+                                title="Propriedades e Proporção (P)"
+                              >
+                                <SlidersHorizontal className="h-3 w-3 stroke-[2.5]" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
                                   handleCropSinglePanel({
                                     id: dp.id,
                                     frameId: matchingFrameForDp?.id,
@@ -3020,35 +3044,381 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
                     </div>
                   );
                 })()}
-
-                {/* Clean, Non-Intrusive Floating Indicator if 0 zones on this page */}
-                {detectedPanels.length === 0 && !drawingBox && (
-                  <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 pointer-events-auto flex items-center gap-2.5 rounded-full bg-[#181a20]/95 border border-border/80 px-4 py-1.5 shadow-2xl backdrop-blur animate-fade-in text-xs text-foreground select-none">
-                    <Crop className="h-3.5 w-3.5 text-primary shrink-0" />
-                    <span className="text-muted-foreground text-[11px]">Nenhuma seleção nesta página</span>
-                    <div className="h-3 w-[1px] bg-border/60 mx-1" />
-                    <button
-                      type="button"
-                      onClick={() => handleRunAutoDetection()}
-                      className="inline-flex items-center gap-1 font-semibold text-primary hover:underline cursor-pointer text-xs"
-                    >
-                      <Sparkles className="h-3.5 w-3.5" />
-                      <span>Detectar (D)</span>
-                    </button>
-                    <span className="text-muted-foreground/40">·</span>
-                    <button
-                      type="button"
-                      onClick={handleAddManualCropZone}
-                      className="inline-flex items-center gap-1 font-semibold text-foreground hover:text-primary cursor-pointer text-xs"
-                    >
-                      <Plus className="h-3.5 w-3.5" />
-                      <span>Adicionar Zona</span>
-                    </button>
-                  </div>
-                )}
               </div>
             )}
           </div>
+
+          {/* ======================================================== */}
+          {/* FLOATING PROPERTIES HUD PANEL (Photoshop / Figma Style)   */}
+          {/* ======================================================== */}
+          {isPropertiesOpen && isPropertiesCollapsed && (
+            <div className="absolute top-16 right-4 z-30 pointer-events-auto select-none flex items-center gap-2 px-3 py-1.5 rounded-full bg-[#13141c]/95 backdrop-blur-2xl border border-white/10 shadow-2xl text-xs font-mono text-white animate-fade-in">
+              <div className="flex items-center gap-1.5">
+                <SlidersHorizontal className="h-3.5 w-3.5 text-primary" />
+                <span className="font-bold text-white text-[11px] tracking-wider uppercase font-sans">Propriedades</span>
+              </div>
+              <span className="text-[10px] text-primary font-bold bg-primary/10 px-1.5 py-0.2 rounded border border-primary/20">
+                {selectedRatio}
+              </span>
+              <span className="text-[10px] text-muted-foreground">
+                {Math.round(cropBox.width)}×{Math.round(cropBox.height)}px
+              </span>
+              <div className="h-3 w-[1px] bg-white/15 mx-0.5" />
+              <button
+                type="button"
+                onClick={() => setIsPropertiesCollapsed(false)}
+                className="p-1 rounded-full hover:bg-white/10 text-muted-foreground hover:text-white transition-colors cursor-pointer"
+                title="Expandir painel de propriedades"
+              >
+                <Plus className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsPropertiesOpen(false)}
+                className="p-1 rounded-full hover:bg-white/10 text-muted-foreground hover:text-red-400 transition-colors cursor-pointer"
+                title="Fechar painel (P)"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
+
+          {isPropertiesOpen && !isPropertiesCollapsed && (
+            <div className="absolute top-16 right-4 z-30 pointer-events-auto select-none w-[285px] rounded-2xl bg-[#13141c]/95 backdrop-blur-2xl border border-white/10 shadow-2xl p-3.5 text-white flex flex-col gap-3 animate-fade-in">
+              {/* Header */}
+              <div className="flex items-center justify-between pb-1 border-b border-white/10">
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <SlidersHorizontal className="h-3.5 w-3.5 text-primary shrink-0" />
+                  <span className="text-xs font-bold uppercase tracking-wider text-white truncate font-sans">
+                    Propriedades
+                  </span>
+                  {selectedPanelId && (
+                    <span className="text-[9px] font-mono px-1.5 py-0.2 rounded bg-primary/15 text-primary border border-primary/30 truncate max-w-[90px]">
+                      {detectedPanels.find((p) => p.id === selectedPanelId)?.label || 'Quadro'}
+                    </span>
+                  )}
+                </div>
+                <div className="flex items-center gap-0.5 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setIsPropertiesCollapsed(true)}
+                    className="p-1 rounded-md text-muted-foreground hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+                    title="Minimizar para barra compacta"
+                  >
+                    <Minus className="h-3.5 w-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsPropertiesOpen(false)}
+                    className="p-1 rounded-md text-muted-foreground hover:text-red-400 hover:bg-white/10 transition-colors cursor-pointer"
+                    title="Fechar painel de propriedades (P)"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Proporção Section */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-[10px] uppercase font-bold text-muted-foreground font-mono">
+                  <span>Proporção</span>
+                  <span className="text-[9px] text-primary font-bold">{selectedRatio}</span>
+                </div>
+                <div className="grid grid-cols-5 gap-1 p-0.5 rounded-xl bg-black/40 border border-white/5">
+                  {RATIOS.map((ratio) => (
+                    <button
+                      key={ratio}
+                      type="button"
+                      onClick={() => applyRatio(ratio)}
+                      className={`rounded-lg py-1 text-[10.5px] font-bold transition-all cursor-pointer ${
+                        ratio === selectedRatio
+                          ? 'bg-primary text-primary-foreground shadow-sm'
+                          : 'text-muted-foreground hover:text-white hover:bg-white/5'
+                      }`}
+                    >
+                      {ratio}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Dimensões Section */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-[10px] uppercase font-bold text-muted-foreground font-mono">
+                  <span>Dimensões</span>
+                  <span className="text-[9px] text-muted-foreground/70 font-mono">
+                    {Math.round(cropBox.width)} × {Math.round(cropBox.height)} px
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  {/* Largura (W) */}
+                  <div className="flex items-center bg-black/40 border border-white/10 rounded-xl px-2 py-1 focus-within:border-primary/80 focus-within:ring-1 focus-within:ring-primary/20 transition-all">
+                    <span className="text-[10px] font-mono font-bold text-muted-foreground mr-1.5 shrink-0">W</span>
+                    <input
+                      type="number"
+                      min={40}
+                      max={naturalDimensions.width}
+                      value={Math.round(cropBox.width)}
+                      onChange={(e) => {
+                        const val = Math.max(40, Math.min(naturalDimensions.width, Number(e.target.value)));
+                        const r = getRatioValue();
+                        const newH = r ? Math.round(val / r) : cropBox.height;
+                        setCropBox((prev) => {
+                          const next = { ...prev, width: val, height: newH };
+                          if (selectedPanelId) syncPanelCoords(selectedPanelId, next);
+                          return next;
+                        });
+                      }}
+                      className="w-full bg-transparent text-xs font-mono text-white outline-none"
+                    />
+                    <div className="flex flex-col ml-1 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const val = Math.min(naturalDimensions.width, Math.round(cropBox.width + 10));
+                          const r = getRatioValue();
+                          const newH = r ? Math.round(val / r) : cropBox.height;
+                          setCropBox((prev) => {
+                            const next = { ...prev, width: val, height: newH };
+                            if (selectedPanelId) syncPanelCoords(selectedPanelId, next);
+                            return next;
+                          });
+                        }}
+                        className="text-[9px] text-muted-foreground hover:text-white leading-none px-0.5 cursor-pointer"
+                        title="+10px"
+                      >
+                        ▲
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const val = Math.max(40, Math.round(cropBox.width - 10));
+                          const r = getRatioValue();
+                          const newH = r ? Math.round(val / r) : cropBox.height;
+                          setCropBox((prev) => {
+                            const next = { ...prev, width: val, height: newH };
+                            if (selectedPanelId) syncPanelCoords(selectedPanelId, next);
+                            return next;
+                          });
+                        }}
+                        className="text-[9px] text-muted-foreground hover:text-white leading-none px-0.5 cursor-pointer"
+                        title="-10px"
+                      >
+                        ▼
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Altura (H) */}
+                  <div className="flex items-center bg-black/40 border border-white/10 rounded-xl px-2 py-1 focus-within:border-primary/80 focus-within:ring-1 focus-within:ring-primary/20 transition-all">
+                    <span className="text-[10px] font-mono font-bold text-muted-foreground mr-1.5 shrink-0">H</span>
+                    <input
+                      type="number"
+                      min={40}
+                      max={naturalDimensions.height}
+                      value={Math.round(cropBox.height)}
+                      onChange={(e) => {
+                        const val = Math.max(40, Math.min(naturalDimensions.height, Number(e.target.value)));
+                        const r = getRatioValue();
+                        const newW = r ? Math.round(val * r) : cropBox.width;
+                        setCropBox((prev) => {
+                          const next = {
+                            ...prev,
+                            height: val,
+                            width: Math.min(naturalDimensions.width, newW),
+                          };
+                          if (selectedPanelId) syncPanelCoords(selectedPanelId, next);
+                          return next;
+                        });
+                      }}
+                      className="w-full bg-transparent text-xs font-mono text-white outline-none"
+                    />
+                    <div className="flex flex-col ml-1 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const val = Math.min(naturalDimensions.height, Math.round(cropBox.height + 10));
+                          const r = getRatioValue();
+                          const newW = r ? Math.round(val * r) : cropBox.width;
+                          setCropBox((prev) => {
+                            const next = {
+                              ...prev,
+                              height: val,
+                              width: Math.min(naturalDimensions.width, newW),
+                            };
+                            if (selectedPanelId) syncPanelCoords(selectedPanelId, next);
+                            return next;
+                          });
+                        }}
+                        className="text-[9px] text-muted-foreground hover:text-white leading-none px-0.5 cursor-pointer"
+                        title="+10px"
+                      >
+                        ▲
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const val = Math.max(40, Math.round(cropBox.height - 10));
+                          const r = getRatioValue();
+                          const newW = r ? Math.round(val * r) : cropBox.width;
+                          setCropBox((prev) => {
+                            const next = {
+                              ...prev,
+                              height: val,
+                              width: Math.min(naturalDimensions.width, newW),
+                            };
+                            if (selectedPanelId) syncPanelCoords(selectedPanelId, next);
+                            return next;
+                          });
+                        }}
+                        className="text-[9px] text-muted-foreground hover:text-white leading-none px-0.5 cursor-pointer"
+                        title="-10px"
+                      >
+                        ▼
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Posição Section */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-[10px] uppercase font-bold text-muted-foreground font-mono">
+                  <span>Posição</span>
+                  <span className="text-[9px] text-muted-foreground/70 font-mono">
+                    X:{Math.round(cropBox.x)} Y:{Math.round(cropBox.y)}
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  {/* Posição X */}
+                  <div className="flex items-center bg-black/40 border border-white/10 rounded-xl px-2 py-1 focus-within:border-primary/80 focus-within:ring-1 focus-within:ring-primary/20 transition-all">
+                    <span className="text-[10px] font-mono font-bold text-muted-foreground mr-1.5 shrink-0">X</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={Math.max(0, naturalDimensions.width - cropBox.width)}
+                      value={Math.round(cropBox.x)}
+                      onChange={(e) => {
+                        const val = Math.max(0, Math.min(naturalDimensions.width - cropBox.width, Number(e.target.value)));
+                        setCropBox((prev) => {
+                          const next = { ...prev, x: val };
+                          if (selectedPanelId) syncPanelCoords(selectedPanelId, next);
+                          return next;
+                        });
+                      }}
+                      className="w-full bg-transparent text-xs font-mono text-white outline-none"
+                    />
+                    <div className="flex flex-col ml-1 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const val = Math.min(naturalDimensions.width - cropBox.width, Math.round(cropBox.x + 10));
+                          setCropBox((prev) => {
+                            const next = { ...prev, x: val };
+                            if (selectedPanelId) syncPanelCoords(selectedPanelId, next);
+                            return next;
+                          });
+                        }}
+                        className="text-[9px] text-muted-foreground hover:text-white leading-none px-0.5 cursor-pointer"
+                        title="+10px"
+                      >
+                        ▲
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const val = Math.max(0, Math.round(cropBox.x - 10));
+                          setCropBox((prev) => {
+                            const next = { ...prev, x: val };
+                            if (selectedPanelId) syncPanelCoords(selectedPanelId, next);
+                            return next;
+                          });
+                        }}
+                        className="text-[9px] text-muted-foreground hover:text-white leading-none px-0.5 cursor-pointer"
+                        title="-10px"
+                      >
+                        ▼
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Posição Y */}
+                  <div className="flex items-center bg-black/40 border border-white/10 rounded-xl px-2 py-1 focus-within:border-primary/80 focus-within:ring-1 focus-within:ring-primary/20 transition-all">
+                    <span className="text-[10px] font-mono font-bold text-muted-foreground mr-1.5 shrink-0">Y</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={Math.max(0, naturalDimensions.height - cropBox.height)}
+                      value={Math.round(cropBox.y)}
+                      onChange={(e) => {
+                        const val = Math.max(0, Math.min(naturalDimensions.height - cropBox.height, Number(e.target.value)));
+                        setCropBox((prev) => {
+                          const next = { ...prev, y: val };
+                          if (selectedPanelId) syncPanelCoords(selectedPanelId, next);
+                          return next;
+                        });
+                      }}
+                      className="w-full bg-transparent text-xs font-mono text-white outline-none"
+                    />
+                    <div className="flex flex-col ml-1 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const val = Math.min(naturalDimensions.height - cropBox.height, Math.round(cropBox.y + 10));
+                          setCropBox((prev) => {
+                            const next = { ...prev, y: val };
+                            if (selectedPanelId) syncPanelCoords(selectedPanelId, next);
+                            return next;
+                          });
+                        }}
+                        className="text-[9px] text-muted-foreground hover:text-white leading-none px-0.5 cursor-pointer"
+                        title="+10px"
+                      >
+                        ▲
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const val = Math.max(0, Math.round(cropBox.y - 10));
+                          setCropBox((prev) => {
+                            const next = { ...prev, y: val };
+                            if (selectedPanelId) syncPanelCoords(selectedPanelId, next);
+                            return next;
+                          });
+                        }}
+                        className="text-[9px] text-muted-foreground hover:text-white leading-none px-0.5 cursor-pointer"
+                        title="-10px"
+                      >
+                        ▼
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Ações Rápidas */}
+              <div className="grid grid-cols-2 gap-1.5 pt-0.5">
+                <button
+                  type="button"
+                  onClick={() => handleFitPanelToFullWidth()}
+                  className="flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-lg bg-white/5 border border-white/10 hover:border-primary/50 text-[10.5px] font-semibold text-muted-foreground hover:text-white transition-all cursor-pointer shadow-xs"
+                  title="Ajustar para 100% da largura (W)"
+                >
+                  <ArrowRightLeft className="h-3 w-3 text-primary" />
+                  <span>100% Largura (W)</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleCenterCrop}
+                  className="flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-lg bg-white/5 border border-white/10 hover:border-primary/50 text-[10.5px] font-semibold text-muted-foreground hover:text-white transition-all cursor-pointer shadow-xs"
+                  title="Centralizar na tela (Shift+C)"
+                >
+                  <Crosshair className="h-3 w-3 text-primary" />
+                  <span>Centralizar</span>
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* ======================================================== */}
           {/* DOCKED MINIMAL TIMELINE FOOTER (100% Filmstrip)         */}
@@ -3122,37 +3492,84 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       {/* ======================================================== */}
       <div className="w-full lg:w-[320px] shrink-0 border-t border-border bg-[#161720] lg:h-[calc(100vh-61px)] lg:border-t-0 lg:border-l border-white/10 flex flex-col justify-between overflow-y-auto z-10">
         <div>
-          <div className="border-b border-white/10 px-4 py-3 flex items-center justify-between">
-            <p className="font-display text-[11px] font-bold tracking-widest text-white uppercase">
-              {inspectorTab === 'manual' ? 'Enquadramento' : 'Auto-Detecção'}
-            </p>
-            <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-white/[0.05] border border-white/10 text-primary font-bold shadow-xs">
-              {Math.round(cropBox.width)}×{Math.round(cropBox.height)} px
-            </span>
+          {/* Top Header: Capítulo & Navegação de Páginas (Estilo Photoshop / Figma) */}
+          <div className="border-b border-white/10 px-3.5 py-2 flex items-center justify-between bg-[#14151e]">
+            {/* Seletor de Capítulo (abre gaveta de capítulos) */}
+            <button
+              onClick={() => setIsChaptersDrawerOpen(true)}
+              className="flex items-center gap-1.5 px-2 py-1 rounded-lg hover:bg-white/5 text-xs font-semibold text-white transition-colors cursor-pointer min-w-0"
+              title="Abrir gaveta de capítulos"
+            >
+              <FolderUp className="h-3.5 w-3.5 text-primary shrink-0" />
+              <span className="truncate max-w-[110px] font-display text-[11px]">{currentChapter.label}</span>
+              <ChevronDown className="h-3 w-3 text-muted-foreground shrink-0" />
+            </button>
+
+            {/* Navegação de Página Compacta */}
+            <div className="flex items-center gap-1 bg-black/40 border border-white/10 rounded-lg px-1.5 py-0.5 text-xs font-mono">
+              <button
+                onClick={() => onSelectPageNumber(Math.max(1, currentPageNumber - 1))}
+                disabled={currentPageNumber <= 1}
+                className="p-1 rounded hover:bg-white/10 disabled:opacity-30 cursor-pointer text-muted-foreground hover:text-white transition-colors"
+                title="Página anterior (Seta Esquerda)"
+              >
+                <ChevronLeft className="h-3.5 w-3.5" />
+              </button>
+              <span className="px-1 font-bold text-[11px] text-white">
+                {currentPageNumber} <span className="text-muted-foreground font-normal">/ {Math.max(1, currentChapter.pages)}</span>
+              </span>
+              <button
+                onClick={() => onSelectPageNumber(Math.min(currentChapter.pages, currentPageNumber + 1))}
+                disabled={currentPageNumber >= currentChapter.pages}
+                className="p-1 rounded hover:bg-white/10 disabled:opacity-30 cursor-pointer text-muted-foreground hover:text-white transition-colors"
+                title="Próxima página (Seta Direita)"
+              >
+                <ChevronRight className="h-3.5 w-3.5" />
+              </button>
+            </div>
           </div>
 
-          {/* Segmented Switch Pills (Modeled after image_02d6ff.png top inspector tabs) */}
-          <div className="p-2 border-b border-white/10 bg-black/20">
-            <div className="grid grid-cols-2 p-1 rounded-xl bg-card border border-white/10">
+          {/* Photoshop Style Docked Tab Strip (from image_b7e5a9.png) */}
+          <div className="h-8 border-b border-white/10 bg-[#14151e] flex items-stretch text-[11px] select-none">
+            {/* Aba 1: Quadros (Layers) */}
+            <button
+              onClick={() => setInspectorTab('manual')}
+              className={`px-3.5 flex items-center gap-1.5 font-medium border-r border-white/10 transition-colors cursor-pointer ${
+                inspectorTab === 'manual'
+                  ? 'bg-[#222432] text-white font-semibold'
+                  : 'text-muted-foreground hover:text-white hover:bg-white/[0.04]'
+              }`}
+            >
+              <span>Quadros</span>
+              <span className="text-[10px] font-mono text-muted-foreground/80 px-1 py-0.2 rounded bg-black/30">
+                {unifiedItems.length}
+              </span>
+            </button>
+
+            {/* Aba 2: Auto-Detecção */}
+            <button
+              onClick={() => setInspectorTab('auto')}
+              className={`px-3.5 flex items-center gap-1.5 font-medium border-r border-white/10 transition-colors cursor-pointer ${
+                inspectorTab === 'auto'
+                  ? 'bg-[#222432] text-white font-semibold'
+                  : 'text-muted-foreground hover:text-white hover:bg-white/[0.04]'
+              }`}
+            >
+              <Sparkles className="h-3 w-3 text-primary" />
+              <span>Auto-Detecção</span>
+            </button>
+
+            {/* Right side info: Crop Dimension & Quick Fit (Photoshop status) */}
+            <div className="flex-1 flex items-center justify-end gap-1.5 px-2 bg-[#14151e]">
+              <span className="text-[10px] font-mono text-muted-foreground font-medium">
+                {Math.round(cropBox.width)}×{Math.round(cropBox.height)} px
+              </span>
               <button
-                onClick={() => setInspectorTab('manual')}
-                className={`py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                  inspectorTab === 'manual'
-                    ? 'bg-primary text-primary-foreground shadow-md'
-                    : 'text-muted-foreground hover:text-white'
-                }`}
+                onClick={handleFitToScreen}
+                className="p-1 rounded hover:bg-white/10 text-muted-foreground hover:text-primary transition-colors cursor-pointer"
+                title="Ajustar à tela (Ctrl + 0)"
               >
-                Manual
-              </button>
-              <button
-                onClick={() => setInspectorTab('auto')}
-                className={`py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                  inspectorTab === 'auto'
-                    ? 'bg-primary text-primary-foreground shadow-md'
-                    : 'text-muted-foreground hover:text-white'
-                }`}
-              >
-                Auto-Detecção
+                <Maximize2 className="h-3 w-3" />
               </button>
             </div>
           </div>
@@ -3295,23 +3712,23 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
                       onClick={() => handleRunAutoDetection()}
                       disabled={isDetecting || chapters.length === 0}
                       className="flex-1 py-2 px-2 rounded-xl bg-card hover:bg-white/[0.06] text-white text-xs font-semibold transition-all flex items-center justify-center gap-1.5 border border-white/10 disabled:opacity-40 cursor-pointer"
-                      title="Detectar quadros apenas na página atual"
+                      title="Detectar quadros apenas na página atual (Atalho: D)"
                     >
                       {isDetecting ? (
                         <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
                       ) : (
                         <Sparkles className="h-3.5 w-3.5 text-primary" />
                       )}
-                      <span>Detectar Página</span>
+                      <span>Detectar Página (D)</span>
                     </button>
                     <button
                       onClick={handleCropPagePanels}
                       disabled={isDetecting || chapters.length === 0}
                       className="flex-1 py-2 px-2 rounded-xl bg-card hover:bg-white/[0.06] text-white text-xs font-semibold transition-all flex items-center justify-center gap-1.5 disabled:opacity-40 border border-white/10 cursor-pointer"
-                      title="Recorta os quadros selecionados desta página para a timeline"
+                      title="Recorta os quadros selecionados desta página para a timeline (Atalho: Shift+Enter ou X)"
                     >
                       <Crop className="h-3.5 w-3.5 text-primary" />
-                      <span>Recortar Página</span>
+                      <span>Recortar Página (Shift+Enter)</span>
                     </button>
                   </div>
 
@@ -3346,380 +3763,193 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
 
             {/* Manual Framing Controls - Shown in Manual Tab */}
             {inspectorTab === 'manual' && (
-              <>
+              <div className="flex-1 min-h-0 flex flex-col space-y-2">
+                {/* Unified Container: Quadros da Página (Zonas + Recortes integrados num único item) */}
+                <div className="rounded-xl border border-white/10 bg-card/60 p-2.5 space-y-2 backdrop-blur-md shadow-md shadow-black/20 flex-1 flex flex-col min-h-0">
+                  {/* Header: Title + Recortar Todas + Nova Zona + Limpar */}
+                  <div className="flex items-center justify-between pb-0.5">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <Crop className="h-3.5 w-3.5 text-primary shrink-0" />
+                      <span className="text-xs font-bold text-white uppercase tracking-wider truncate">
+                        Quadros da Página ({unifiedItems.length})
+                      </span>
+                    </div>
 
-          {/* Proporção Selector */}
-          <div>
-            <p className="mb-2 text-[11px] font-bold text-muted-foreground uppercase tracking-wider flex items-center justify-between">
-              <span>Proporção</span>
-              <span className="text-[10px] text-muted-foreground/60 font-mono">1 a 4</span>
-            </p>
-            <div className="grid grid-cols-5 gap-1">
-              {RATIOS.map((ratio) => (
-                <button
-                  key={ratio}
-                  onClick={() => applyRatio(ratio)}
-                  className={`rounded-lg border py-1.5 text-xs font-bold transition-all ${
-                    ratio === selectedRatio
-                      ? 'border-primary bg-primary/15 text-primary shadow-sm'
-                      : 'border-white/5 bg-card/60 text-muted-foreground hover:bg-white/[0.04] hover:text-white'
-                  }`}
-                >
-                  {ratio}
-                </button>
-              ))}
-            </div>
-          </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => handleRunAutoDetection()}
+                        disabled={isDetecting || chapters.length === 0}
+                        className="px-1.5 py-0.5 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 text-muted-foreground hover:text-white text-[10px] font-bold transition-colors flex items-center gap-1 cursor-pointer disabled:opacity-40"
+                        title="Detectar quadros desta página automaticamente (Atalho: D)"
+                      >
+                        <Sparkles className="h-3 w-3 text-primary" />
+                        <span>Detectar (D)</span>
+                      </button>
 
-          {/* Manual Dimension Inputs (Width, Height, X, Y) */}
-          <div className="space-y-2 pt-2 border-t border-white/10">
-            <div className="grid grid-cols-2 gap-2">
-              <div>
-                <label className="block text-[10px] uppercase font-bold text-muted-foreground mb-1 font-mono tracking-wider">Largura (W)</label>
-                <input
-                  type="number"
-                  min={40}
-                  max={naturalDimensions.width}
-                  value={Math.round(cropBox.width)}
-                  onChange={(e) => {
-                    const val = Math.max(40, Math.min(naturalDimensions.width, Number(e.target.value)));
-                    const r = getRatioValue();
-                    const newH = r ? Math.round(val / r) : cropBox.height;
-                    setCropBox((prev) => {
-                      const next = { ...prev, width: val, height: newH };
-                      if (selectedPanelId) syncPanelCoords(selectedPanelId, next);
-                      return next;
-                    });
-                  }}
-                  className="w-full bg-card/80 border border-white/10 rounded-lg px-2.5 py-1.5 text-xs font-mono text-white outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/25 shadow-xs"
-                />
-              </div>
+                      {detectedPanels.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={handleCropPagePanels}
+                          disabled={isDetecting || chapters.length === 0}
+                          className="px-1.5 py-0.5 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 hover:bg-emerald-500/25 text-[10px] font-bold transition-colors flex items-center gap-1 cursor-pointer"
+                          title="Recortar todos os quadros da página (Atalho: Shift+Enter ou X)"
+                        >
+                          <Check className="h-3 w-3 stroke-[2.5]" />
+                          <span>Recortar ({detectedPanels.length})</span>
+                        </button>
+                      )}
 
-              <div>
-                <label className="block text-[10px] uppercase font-bold text-muted-foreground mb-1 font-mono tracking-wider">Altura (H)</label>
-                <input
-                  type="number"
-                  min={40}
-                  max={naturalDimensions.height}
-                  value={Math.round(cropBox.height)}
-                  onChange={(e) => {
-                    const val = Math.max(40, Math.min(naturalDimensions.height, Number(e.target.value)));
-                    const r = getRatioValue();
-                    const newW = r ? Math.round(val * r) : cropBox.width;
-                    setCropBox((prev) => {
-                      const next = {
-                        ...prev,
-                        height: val,
-                        width: Math.min(naturalDimensions.width, newW),
-                      };
-                      if (selectedPanelId) syncPanelCoords(selectedPanelId, next);
-                      return next;
-                    });
-                  }}
-                  className="w-full bg-card/80 border border-white/10 rounded-lg px-2.5 py-1.5 text-xs font-mono text-white outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/25 shadow-xs"
-                />
-              </div>
-            </div>
+                      <button
+                        type="button"
+                        onClick={handleAddManualCropZone}
+                        className="px-2 py-0.5 rounded-lg bg-primary/20 text-primary hover:bg-primary/30 text-[10px] font-bold transition-colors flex items-center gap-1 cursor-pointer"
+                        title="Criar nova zona de corte (+)"
+                      >
+                        <Plus className="h-3 w-3" />
+                        <span>Nova Zona</span>
+                      </button>
+                      {unifiedItems.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            handleClearAllPanels();
+                            pageFrames.forEach((f) => onRemoveFrame(f.id));
+                            showToast('🗑️ Quadros e zonas desta página foram limpos');
+                          }}
+                          className="p-1 rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors cursor-pointer"
+                          title="Remover todos os quadros e zonas desta página"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
 
-            <div className="grid grid-cols-2 gap-2">
-              <div>
-                <label className="block text-[10px] uppercase font-bold text-muted-foreground mb-1 font-mono tracking-wider">Posição X</label>
-                <input
-                  type="number"
-                  min={0}
-                  max={Math.max(0, naturalDimensions.width - cropBox.width)}
-                  value={Math.round(cropBox.x)}
-                  onChange={(e) => {
-                    const val = Math.max(0, Math.min(naturalDimensions.width - cropBox.width, Number(e.target.value)));
-                    setCropBox((prev) => {
-                      const next = { ...prev, x: val };
-                      if (selectedPanelId) syncPanelCoords(selectedPanelId, next);
-                      return next;
-                    });
-                  }}
-                  className="w-full bg-card/80 border border-white/10 rounded-lg px-2.5 py-1.5 text-xs font-mono text-white outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/25 shadow-xs"
-                />
-              </div>
+                  {/* Unified Cards List - Max height expanded to see more items */}
+                  <div className="max-h-[calc(100vh-230px)] min-h-[320px] overflow-y-auto pr-1 space-y-1.5">
+                    {unifiedItems.length === 0 ? (
+                      <div className="p-4 text-center rounded-lg border border-dashed border-white/10 text-[11px] text-muted-foreground bg-card/30">
+                        Nenhum quadro nesta página ainda. Arraste com <strong className="text-white">Corte (C)</strong> ou clique em <strong className="text-white">+ Nova Zona</strong>.
+                      </div>
+                    ) : (
+                      unifiedItems.map((item) => {
+                        const isCurr = item.panelId ? item.panelId === selectedPanelId : false;
+                        const cleanLabel = item.label.replace(/\s*\(Pág\.\s*\d+\)/i, '').trim();
 
-              <div>
-                <label className="block text-[10px] uppercase font-bold text-muted-foreground mb-1 font-mono tracking-wider">Posição Y</label>
-                <input
-                  type="number"
-                  min={0}
-                  max={Math.max(0, naturalDimensions.height - cropBox.height)}
-                  value={Math.round(cropBox.y)}
-                  onChange={(e) => {
-                    const val = Math.max(0, Math.min(naturalDimensions.height - cropBox.height, Number(e.target.value)));
-                    setCropBox((prev) => {
-                      const next = { ...prev, y: val };
-                      if (selectedPanelId) syncPanelCoords(selectedPanelId, next);
-                      return next;
-                    });
-                  }}
-                  className="w-full bg-card/80 border border-white/10 rounded-lg px-2.5 py-1.5 text-xs font-mono text-white outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/25 shadow-xs"
-                />
-              </div>
-            </div>
+                        const handleSelectThisItem = () => {
+                          const targetX = item.x || item.panel?.x || item.frame?.cropRect?.x || 0;
+                          const targetY = item.y || item.panel?.y || item.frame?.cropRect?.y || 0;
+                          const targetW = item.width || item.panel?.width || item.frame?.cropRect?.width || 620;
+                          const targetH = item.height || item.panel?.height || item.frame?.cropRect?.height || 349;
 
-            {/* Quick Full-Width Actions (100% Manhwa) */}
-            <div className="grid grid-cols-2 gap-1.5 pt-1">
-              <button
-                type="button"
-                onClick={() => handleFitPanelToFullWidth()}
-                className="flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-lg bg-card/80 border border-white/10 hover:border-primary/50 text-[11px] font-semibold text-muted-foreground hover:text-white transition-all cursor-pointer shadow-xs"
-                title="Ajustar o quadro selecionado para 100% da largura da imagem (W)"
-              >
-                <ArrowRightLeft className="h-3 w-3 text-primary" />
-                <span>100% Largura (W)</span>
-              </button>
-              <button
-                type="button"
-                onClick={handleFitAllPanelsToFullWidth}
-                className="flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-lg bg-card/80 border border-white/10 hover:border-primary/50 text-[11px] font-semibold text-muted-foreground hover:text-white transition-all cursor-pointer shadow-xs"
-                title="Ajustar todos os quadros da página para 100% da largura da imagem (Shift+W)"
-              >
-                <Maximize2 className="h-3 w-3 text-primary" />
-                <span>Todos 100%</span>
-              </button>
-            </div>
-          </div>
-
-          {/* Primary Action Buttons */}
-          <div className="space-y-1.5 pt-1">
-            <button
-              onClick={handleExecuteCrop}
-              className="flex w-full items-center justify-center gap-2 rounded-xl bg-primary hover:bg-[#ff4922] py-2.5 text-xs font-bold text-primary-foreground transition-all shadow-lg shadow-orange-500/25 active:scale-[0.98] cursor-pointer uppercase tracking-wider"
-            >
-              <Crop className="h-4 w-4 stroke-[2.5]" />
-              <span>Recortar quadro ativo (Enter)</span>
-            </button>
-
-            {detectedPanels.length > 1 && (
-              <button
-                onClick={() => {
-                  if (imageRef.current) executeCropPanelsList(imageRef.current, detectedPanels);
-                }}
-                className="flex w-full items-center justify-center gap-1.5 rounded-xl bg-card border border-white/10 py-1.5 text-xs font-bold text-white hover:bg-white/[0.06] hover:border-white/20 active:scale-[0.98] transition-all cursor-pointer shadow-sm"
-                title="Recortar todas as zonas de corte desta página (Ctrl + Enter)"
-              >
-                <Check className="h-3.5 w-3.5 text-primary stroke-[2.5]" />
-                <span>Recortar Todas as Zonas ({detectedPanels.length})</span>
-              </button>
-            )}
-          </div>
-
-          {/* Unified Container: Quadros da Página (Zonas + Recortes integrados num único item) */}
-          <div className="rounded-xl border border-white/10 bg-card/60 p-2.5 space-y-2 backdrop-blur-md shadow-md shadow-black/20">
-            {/* Header: Title + Nova Zona + Limpar */}
-            <div className="flex items-center justify-between pb-0.5">
-              <div className="flex items-center gap-1.5">
-                <Crop className="h-3.5 w-3.5 text-primary" />
-                <span className="text-xs font-bold text-white uppercase tracking-wider">
-                  Quadros da Página ({unifiedItems.length})
-                </span>
-              </div>
-
-              <div className="flex items-center gap-1 shrink-0">
-                <button
-                  type="button"
-                  onClick={handleAddManualCropZone}
-                  className="px-2 py-0.5 rounded-lg bg-primary/20 text-primary hover:bg-primary/30 text-[10px] font-bold transition-colors flex items-center gap-1 cursor-pointer"
-                  title="Criar nova zona de corte (+)"
-                >
-                  <Plus className="h-3 w-3" />
-                  <span>Nova Zona</span>
-                </button>
-                {unifiedItems.length > 0 && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      handleClearAllPanels();
-                      pageFrames.forEach((f) => onRemoveFrame(f.id));
-                      showToast('🗑️ Quadros e zonas desta página foram limpos');
-                    }}
-                    className="p-1 rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors cursor-pointer"
-                    title="Remover todos os quadros e zonas desta página"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </button>
-                )}
-              </div>
-            </div>
-
-            {/* Unified Cards List */}
-            <div className="max-h-[260px] overflow-y-auto pr-1 space-y-1.5">
-              {unifiedItems.length === 0 ? (
-                <div className="p-4 text-center rounded-lg border border-dashed border-white/10 text-[11px] text-muted-foreground bg-card/30">
-                  Nenhum quadro nesta página ainda. Arraste com <strong className="text-white">Corte (C)</strong> ou clique em <strong className="text-white">+ Nova Zona</strong>.
-                </div>
-              ) : (
-                unifiedItems.map((item) => {
-                  const isCurr = item.panelId ? item.panelId === selectedPanelId : false;
-                  const cleanLabel = item.label.replace(/\s*\(Pág\.\s*\d+\)/i, '').trim();
-
-                  return (
-                    <div
-                      key={item.id}
-                      onClick={() => {
-                        const targetX = item.x || item.panel?.x || item.frame?.cropRect?.x || 0;
-                        const targetY = item.y || item.panel?.y || item.frame?.cropRect?.y || 0;
-                        const targetW = item.width || item.panel?.width || item.frame?.cropRect?.width || 620;
-                        const targetH = item.height || item.panel?.height || item.frame?.cropRect?.height || 349;
-
-                        if (item.panelId) {
-                          setSelectedPanelId(item.panelId);
-                        }
-                        setSelectedRatio('Livre');
-                        const targetBox = {
-                          x: targetX,
-                          y: targetY,
-                          width: targetW,
-                          height: targetH,
+                          if (item.panelId) {
+                            setSelectedPanelId(item.panelId);
+                          }
+                          setSelectedRatio('Livre');
+                          const targetBox = {
+                            x: targetX,
+                            y: targetY,
+                            width: targetW,
+                            height: targetH,
+                          };
+                          setCropBox(targetBox);
+                          focusCropBox(targetBox);
                         };
-                        setCropBox(targetBox);
-                        focusCropBox(targetBox);
-                      }}
-                      className={`group rounded-xl border p-2 transition-all cursor-pointer ${
-                        isCurr
-                          ? 'bg-primary/10 border-primary shadow-sm shadow-primary/20 ring-1 ring-primary/40'
-                          : 'bg-card/70 hover:bg-white/[0.04] border-white/10 hover:border-white/20'
-                      }`}
-                    >
-                      <div className="flex items-center gap-2.5">
-                        {/* Left: Thumbnail (or draft crop box) */}
-                        {item.isCropped && item.src ? (
-                          <img
-                            key={item.src}
-                            src={item.src}
-                            alt={cleanLabel}
-                            loading="lazy"
-                            width={120}
-                            height={80}
-                            onClick={(e) => {
-                              e.stopPropagation();
+
+                        return (
+                          <div
+                            key={item.id}
+                            onClick={handleSelectThisItem}
+                            onDoubleClick={() => {
                               if (item.frame) setPreviewFrame(item.frame);
                             }}
-                            className="h-10 w-12 shrink-0 rounded-lg object-cover border border-white/10 cursor-pointer hover:opacity-90 hover:ring-2 hover:ring-primary/40 transition-all shadow-xs"
-                            title="Clique para ampliar preview"
-                          />
-                        ) : (
-                          <div
-                            className="h-10 w-12 shrink-0 rounded-lg bg-white/[0.03] border border-dashed border-white/20 flex flex-col items-center justify-center text-muted-foreground/60 shadow-xs"
-                            title="Zona demarcada pendente de recorte"
-                          >
-                            <Crop className="h-4 w-4 text-primary" />
-                            <span className="text-[7.5px] font-mono mt-0.5 opacity-60">Zona</span>
-                          </div>
-                        )}
-
-                        {/* Middle: Identification, Dimensions & Badges */}
-                        <div className="min-w-0 flex-1 flex flex-col justify-center gap-1">
-                          <div className="flex items-center gap-1.5 min-w-0">
-                            <span
-                              className={`h-2 w-2 rounded-full shrink-0 ${
-                                isCurr
-                                  ? 'bg-primary ring-2 ring-primary/40'
-                                  : item.isCropped
-                                  ? 'bg-emerald-400'
-                                  : 'bg-amber-400'
-                              }`}
-                            />
-                            <span className="truncate text-xs font-semibold text-white">{cleanLabel}</span>
-                          </div>
-
-                          <div className="flex items-center gap-1.5 text-[10px] font-mono text-muted-foreground">
-                            <span className="opacity-80">{item.width}×{item.height}</span>
-                            {item.ratio && (
-                              <span className="text-[9px] bg-white/5 border border-white/10 px-1 py-0.2 rounded text-muted-foreground">
-                                {item.ratio}
-                              </span>
-                            )}
-                            {item.isCropped ? (
-                              <span className="text-[9px] font-bold text-emerald-400 bg-emerald-500/10 px-1.5 py-0.2 rounded border border-emerald-500/20">
-                                Recortado
-                              </span>
-                            ) : (
-                              <span className="text-[9px] font-semibold text-amber-300 bg-amber-500/10 px-1.5 py-0.2 rounded border border-amber-500/20">
-                                Pendente
-                              </span>
-                            )}
-                          </div>
-                        </div>
-
-                        {/* Right: Actions Toolbar (Recortar / Download / Delete) */}
-                        <div className="flex items-center gap-0.5 shrink-0 ml-1">
-                          {/* Recortar / Re-recortar Button */}
-                          <button
-                            type="button"
-                            onClick={(e) => {
+                            onContextMenu={(e) => {
+                              e.preventDefault();
                               e.stopPropagation();
-                              if (item.panelId) {
-                                setSelectedPanelId(item.panelId);
-                              }
-                              handleCropSinglePanel({
-                                id: item.panelId || item.frameId || item.id,
-                                frameId: item.frameId || undefined,
-                                label: item.label,
-                                x: cropBox.x,
-                                y: cropBox.y,
-                                width: cropBox.width,
-                                height: cropBox.height,
+                              handleSelectThisItem();
+                              setContextMenu({
+                                x: e.clientX,
+                                y: e.clientY,
+                                item,
                               });
                             }}
-                            className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
-                              item.isCropped
-                                ? 'text-emerald-400/80 hover:bg-emerald-500/20 hover:text-emerald-300'
-                                : 'text-primary hover:bg-primary/20 hover:text-primary-foreground'
+                            className={`group flex items-center justify-between gap-2.5 px-2.5 py-1.5 rounded-lg border transition-all cursor-pointer select-none ${
+                              isCurr
+                                ? 'bg-primary/20 border-primary/50 text-white shadow-xs'
+                                : 'bg-card/40 hover:bg-white/[0.04] border-white/5 hover:border-white/10 text-muted-foreground hover:text-white'
                             }`}
-                            title={item.isCropped ? 'Recortar novamente com o enquadramento atual' : 'Recortar este quadro'}
+                            title="Clique para selecionar · Botão direito para opções"
                           >
-                            <Check className="h-3.5 w-3.5" />
-                          </button>
+                            {/* Left: Thumbnail & Name (Photoshop style) */}
+                            <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                              {/* Thumbnail (Clean, compact layer thumbnail) */}
+                              {item.isCropped && item.src ? (
+                                <div
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (item.frame) setPreviewFrame(item.frame);
+                                  }}
+                                  className="h-8 w-10 shrink-0 rounded bg-black/40 border border-white/10 overflow-hidden cursor-pointer hover:opacity-90 transition-opacity"
+                                  title="Clique para ampliar preview"
+                                >
+                                  <img
+                                    key={item.src}
+                                    src={item.src}
+                                    alt={cleanLabel}
+                                    loading="lazy"
+                                    className="h-full w-full object-cover"
+                                  />
+                                </div>
+                              ) : (
+                                <div
+                                  className="h-8 w-10 shrink-0 rounded bg-white/[0.03] border border-dashed border-white/20 flex items-center justify-center text-primary/70"
+                                  title="Zona demarcada pendente de recorte"
+                                >
+                                  <Crop className="h-3.5 w-3.5 text-primary" />
+                                </div>
+                              )}
 
-                          {/* Download Button (available when cropped) */}
-                          {item.isCropped && item.frame && (
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleDownloadSingleFrame(item.frame!);
-                              }}
-                              className="p-1.5 rounded-lg text-muted-foreground hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
-                              title="Baixar este quadro em resolução total"
-                            >
-                              <Download className="h-3.5 w-3.5" />
-                            </button>
-                          )}
+                              {/* Label only - clean typography */}
+                              <span className="truncate text-xs font-medium text-white">
+                                {cleanLabel}
+                              </span>
+                            </div>
 
-                          {/* Delete Button (removes both zone and cropped frame) */}
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              if (item.panelId) handleRemovePanel(item.panelId);
-                              if (item.frameId) onRemoveFrame(item.frameId);
-                            }}
-                            className="p-1.5 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/15 transition-colors cursor-pointer"
-                            title="Excluir quadro e zona de corte"
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })
-              )}
-            </div>
-          </div>
-              </>
+                            {/* Right: Subtle Status Indicator & Context Menu Trigger */}
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <span
+                                className={`h-1.5 w-1.5 rounded-full shrink-0 ${
+                                  item.isCropped ? 'bg-emerald-400' : 'bg-amber-400/80'
+                                }`}
+                                title={item.isCropped ? 'Recortado' : 'Pendente de recorte'}
+                              />
+
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleSelectThisItem();
+                                  setContextMenu({
+                                    x: e.clientX,
+                                    y: e.clientY,
+                                    item,
+                                  });
+                                }}
+                                className="p-1 rounded text-muted-foreground hover:text-white hover:bg-white/10 opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
+                                title="Opções (Botão direito)"
+                              >
+                                <MoreVertical className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+              </div>
             )}
-
-            {/* Total do projeto summary card */}
-            <div className="rounded-xl border border-white/10 bg-card/60 p-3 text-xs text-muted-foreground">
-              <p className="mb-1 font-semibold text-white">Total do projeto</p>
-              {frames.length} quadros recortados · {chapters.length} capítulos na fila
-            </div>
           </div>
         </div>
       </div>
@@ -3942,6 +4172,18 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
                     </kbd>
                   </div>
                   <div className="flex items-center justify-between p-1.5 rounded bg-[#20232a]">
+                    <span className="text-gray-300">Detectar Quadros Automaticamente</span>
+                    <kbd className="font-mono text-cyan-400 bg-black/60 px-2 py-0.5 rounded border border-cyan-400/30">
+                      D
+                    </kbd>
+                  </div>
+                  <div className="flex items-center justify-between p-1.5 rounded bg-[#20232a]">
+                    <span className="text-gray-300">Recortar Quadros da Página Atual</span>
+                    <kbd className="font-mono text-emerald-400 bg-black/60 px-2 py-0.5 rounded border border-emerald-400/30">
+                      Shift + Enter ou X
+                    </kbd>
+                  </div>
+                  <div className="flex items-center justify-between p-1.5 rounded bg-[#20232a]">
                     <span className="text-gray-300">Recortar Todas as Zonas da Página</span>
                     <kbd className="font-mono text-emerald-400 bg-black/60 px-2 py-0.5 rounded border border-emerald-400/30">
                       Ctrl + Enter
@@ -3969,6 +4211,12 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
                     <span className="text-gray-300">Girar Orientação 90°</span>
                     <kbd className="font-mono text-white bg-black/60 px-2 py-0.5 rounded border border-white/20">
                       R
+                    </kbd>
+                  </div>
+                  <div className="flex items-center justify-between p-1.5 rounded bg-[#20232a]">
+                    <span className="text-gray-300">Painel Flutuante de Propriedades (Photoshop HUD)</span>
+                    <kbd className="font-mono text-cyan-400 bg-black/60 px-2 py-0.5 rounded border border-cyan-400/30">
+                      P
                     </kbd>
                   </div>
                   <div className="flex items-center justify-between p-1.5 rounded bg-[#20232a]">
@@ -4746,6 +4994,148 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
               <span className="text-emerald-400 font-bold">
                 {batchProgress.count} {batchProgress.mode === 'detect' ? 'seleções identificadas' : 'quadros recortados'}
               </span>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Photoshop Style Layer Context Menu */}
+      {contextMenu && (
+        <div
+          className="fixed inset-0 z-50 pointer-events-auto select-none"
+          onClick={() => setContextMenu(null)}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setContextMenu(null);
+          }}
+        >
+          <div
+            style={{
+              top: Math.min(window.innerHeight - 260, Math.max(10, contextMenu.y)),
+              left: Math.min(window.innerWidth - 230, Math.max(10, contextMenu.x)),
+            }}
+            onClick={(e) => e.stopPropagation()}
+            className="absolute w-[215px] rounded-xl bg-[#161722]/98 backdrop-blur-2xl border border-white/10 shadow-2xl p-1 text-xs text-white animate-fade-in z-50 ring-1 ring-black/50"
+          >
+            {/* Header info */}
+            <div className="px-2.5 py-1.5 border-b border-white/10 text-[10px] font-mono font-bold text-muted-foreground flex items-center justify-between">
+              <span className="truncate text-white font-sans">{contextMenu.item.label}</span>
+              <span className="text-[9px] text-primary">
+                {contextMenu.item.width}×{contextMenu.item.height}
+              </span>
+            </div>
+
+            <div className="py-1 space-y-0.5">
+              <button
+                type="button"
+                onClick={() => {
+                  const item = contextMenu.item;
+                  setContextMenu(null);
+                  if (item.panelId) setSelectedPanelId(item.panelId);
+                  handleCropSinglePanel({
+                    id: item.panelId || item.frameId || item.id,
+                    frameId: item.frameId || undefined,
+                    label: item.label,
+                    x: cropBox.x,
+                    y: cropBox.y,
+                    width: cropBox.width,
+                    height: cropBox.height,
+                  });
+                }}
+                className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-emerald-500/20 text-emerald-400 hover:text-emerald-300 transition-colors cursor-pointer text-left"
+              >
+                <div className="flex items-center gap-2">
+                  <Check className="h-3.5 w-3.5" />
+                  <span className="text-white">{contextMenu.item.isCropped ? 'Re-recortar' : 'Recortar Quadro'}</span>
+                </div>
+                <kbd className="text-[9px] font-mono text-muted-foreground bg-black/40 px-1 py-0.2 rounded border border-white/10">Enter</kbd>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setContextMenu(null);
+                  setIsPropertiesOpen(true);
+                  setIsPropertiesCollapsed(false);
+                }}
+                className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-white/10 text-gray-200 hover:text-white transition-colors cursor-pointer text-left"
+              >
+                <div className="flex items-center gap-2">
+                  <SlidersHorizontal className="h-3.5 w-3.5 text-primary" />
+                  <span>Propriedades</span>
+                </div>
+                <kbd className="text-[9px] font-mono text-muted-foreground bg-black/40 px-1 py-0.2 rounded border border-white/10">P</kbd>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  const item = contextMenu.item;
+                  setContextMenu(null);
+                  if (item.panelId) handleFitPanelToFullWidth(item.panelId);
+                  else handleFitPanelToFullWidth();
+                }}
+                className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-white/10 text-gray-200 hover:text-white transition-colors cursor-pointer text-left"
+              >
+                <div className="flex items-center gap-2">
+                  <ArrowRightLeft className="h-3.5 w-3.5 text-cyan-400" />
+                  <span>100% Largura</span>
+                </div>
+                <kbd className="text-[9px] font-mono text-muted-foreground bg-black/40 px-1 py-0.2 rounded border border-white/10">W</kbd>
+              </button>
+
+              {contextMenu.item.isCropped && contextMenu.item.frame && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const frame = contextMenu.item.frame;
+                      setContextMenu(null);
+                      if (frame) setPreviewFrame(frame);
+                    }}
+                    className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-white/10 text-gray-200 hover:text-white transition-colors cursor-pointer text-left"
+                  >
+                    <div className="flex items-center gap-2">
+                      <Eye className="h-3.5 w-3.5 text-muted-foreground" />
+                      <span>Ampliar Preview</span>
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const frame = contextMenu.item.frame;
+                      setContextMenu(null);
+                      if (frame) handleDownloadSingleFrame(frame);
+                    }}
+                    className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-white/10 text-gray-200 hover:text-white transition-colors cursor-pointer text-left"
+                  >
+                    <div className="flex items-center gap-2">
+                      <Download className="h-3.5 w-3.5 text-muted-foreground" />
+                      <span>Baixar Imagem</span>
+                    </div>
+                  </button>
+                </>
+              )}
+
+              <div className="h-[1px] bg-white/10 my-1" />
+
+              <button
+                type="button"
+                onClick={() => {
+                  const item = contextMenu.item;
+                  setContextMenu(null);
+                  if (item.panelId) handleRemovePanel(item.panelId);
+                  if (item.frameId) onRemoveFrame(item.frameId);
+                  showToast(`🗑️ ${item.label} removido`);
+                }}
+                className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-destructive/20 text-muted-foreground hover:text-red-400 transition-colors cursor-pointer text-left"
+              >
+                <div className="flex items-center gap-2">
+                  <Trash2 className="h-3.5 w-3.5 text-red-400" />
+                  <span>Excluir Quadro</span>
+                </div>
+                <kbd className="text-[9px] font-mono text-muted-foreground bg-black/40 px-1 py-0.2 rounded border border-white/10">Del</kbd>
+              </button>
             </div>
           </div>
         </div>

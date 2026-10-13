@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { StudioShell } from './components/StudioShell';
 import { RecorteView } from './components/RecorteView';
 import { RoteiroView } from './components/RoteiroView';
@@ -180,6 +180,31 @@ export default function App() {
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
   const [isConfirmClearModalOpen, setIsConfirmClearModalOpen] = useState<boolean>(false);
+  const folderInputRef = useRef<HTMLInputElement>(null);
+
+  // Global Keyboard Shortcuts (Ctrl+S, Ctrl+O, Ctrl+E, Ctrl+N)
+  useEffect(() => {
+    const handleGlobalShortcuts = (e: KeyboardEvent) => {
+      if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement).tagName)) return;
+      if (e.ctrlKey || e.metaKey) {
+        if (e.key === 's' || e.key === 'S') {
+          e.preventDefault();
+          handleManualSave();
+        } else if (e.key === 'o' || e.key === 'O') {
+          e.preventDefault();
+          folderInputRef.current?.click();
+        } else if (e.key === 'e' || e.key === 'E') {
+          e.preventDefault();
+          setIsExportModalOpen(true);
+        } else if (e.key === 'n' || e.key === 'N') {
+          e.preventDefault();
+          setIsConfirmClearModalOpen(true);
+        }
+      }
+    };
+    window.addEventListener('keydown', handleGlobalShortcuts);
+    return () => window.removeEventListener('keydown', handleGlobalShortcuts);
+  }, []);
 
   // 1. Initial Hydration from IndexedDB on Mount
   useEffect(() => {
@@ -808,34 +833,7 @@ export default function App() {
     subtitle = chapters.length > 0 && currentChapter.id !== 'empty'
       ? `${currentChapter.label} · página ${currentPageNumber} de ${Math.max(1, currentChapter.pages)}`
       : 'Nenhum capítulo carregado — importe uma pasta para começar';
-    actionsNode = (
-      <div className="flex items-center gap-2">
-        {persistenceControlsNode}
-
-        <button
-          onClick={handleLoadDemoProject}
-          className="hidden items-center gap-1.5 rounded-lg border border-white/10 bg-card/60 px-2.5 py-1.5 text-xs font-semibold hover:bg-white/[0.06] hover:border-white/20 sm:inline-flex cursor-pointer text-muted-foreground hover:text-white transition-all shadow-sm"
-          title="Restaurar projeto de exemplo com Solo Leveling"
-        >
-          <RotateCcw className="h-3.5 w-3.5" />
-          <span>Demo</span>
-        </button>
-
-        <label className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-card/80 px-3 py-1.5 sm:py-2 text-xs sm:text-sm font-semibold text-white hover:bg-white/[0.06] hover:border-white/20 cursor-pointer transition-all shadow-sm">
-          <FolderUp className="h-4 w-4 text-cyan-400" />
-          <span className="hidden sm:inline">Importar pasta</span>
-          <input
-            type="file"
-            // @ts-expect-error webkitdirectory
-            webkitdirectory=""
-            directory=""
-            multiple
-            onChange={(e) => e.target.files && handleUploadFolder(e.target.files)}
-            className="hidden"
-          />
-        </label>
-      </div>
-    );
+    actionsNode = null;
   } else if (currentTab === 'roteiro') {
     title = '2. Roteiro e Contexto';
     subtitle = `${currentChapter.label} · página ${currentPageNumber} de ${Math.max(1, currentChapter.pages)} · Fase 1 (Visão 1x) & Fase 2 (Perfis de Roteiro)`;
@@ -903,14 +901,31 @@ export default function App() {
   const effectiveChapterId = currentChapterId || currentChapter?.id || (chapters.length > 0 ? chapters[0].id : '');
 
   return (
-    <StudioShell
-      currentTab={currentTab}
-      onTabChange={setCurrentTab}
-      title={title}
-      subtitle={subtitle}
-      actions={actionsNode}
-      onExportClick={() => setIsExportModalOpen(true)}
-    >
+    <>
+      <input
+        ref={folderInputRef}
+        type="file"
+        // @ts-expect-error webkitdirectory
+        webkitdirectory=""
+        directory=""
+        multiple
+        onChange={(e) => e.target.files && handleUploadFolder(e.target.files)}
+        className="hidden"
+      />
+      <StudioShell
+        currentTab={currentTab}
+        onTabChange={setCurrentTab}
+        title={title}
+        subtitle={subtitle}
+        actions={actionsNode}
+        onExportClick={() => setIsExportModalOpen(true)}
+        onNewProject={() => setIsConfirmClearModalOpen(true)}
+        onImportFolder={() => folderInputRef.current?.click()}
+        onLoadDemo={handleLoadDemoProject}
+        onSave={handleManualSave}
+        saveStatus={saveStatus}
+        lastSavedAt={lastSavedAt}
+      >
       <div className={currentTab === 'recorte' ? 'flex flex-1 flex-col' : 'hidden'}>
         <RecorteView
           chapters={chapters}
@@ -1071,5 +1086,6 @@ export default function App() {
         </div>
       )}
     </StudioShell>
+    </>
   );
 }
