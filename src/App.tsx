@@ -60,6 +60,8 @@ const DEMO_FRAMES: FrameItem[] = [
     duration: 4,
     chapterId: 'chap_demo_01',
     pageNumber: 1,
+    panelId: 'panel_demo_1',
+    cropRect: { x: 42, y: 70, width: 620, height: 349 },
   },
   {
     id: 'f_demo_2',
@@ -69,6 +71,8 @@ const DEMO_FRAMES: FrameItem[] = [
     duration: 5,
     chapterId: 'chap_demo_01',
     pageNumber: 1,
+    panelId: 'panel_demo_2',
+    cropRect: { x: 42, y: 470, width: 620, height: 349 },
   },
   {
     id: 'f_demo_3',
@@ -78,8 +82,53 @@ const DEMO_FRAMES: FrameItem[] = [
     duration: 4,
     chapterId: 'chap_demo_01',
     pageNumber: 1,
+    panelId: 'panel_demo_3',
+    cropRect: { x: 42, y: 870, width: 620, height: 349 },
   },
 ];
+
+const DEMO_CHAPTER_PANELS: Record<string, Record<number, DetectedPanel[]>> = {
+  chap_demo_01: {
+    1: [
+      {
+        id: 'panel_demo_1',
+        x: 42,
+        y: 70,
+        width: 620,
+        height: 349,
+        confidence: 0.98,
+        algorithm: 'profile',
+        label: 'Quadro 01',
+        pageWidth: 704,
+        pageHeight: 1408,
+      },
+      {
+        id: 'panel_demo_2',
+        x: 42,
+        y: 470,
+        width: 620,
+        height: 349,
+        confidence: 0.95,
+        algorithm: 'profile',
+        label: 'Quadro 02',
+        pageWidth: 704,
+        pageHeight: 1408,
+      },
+      {
+        id: 'panel_demo_3',
+        x: 42,
+        y: 870,
+        width: 620,
+        height: 349,
+        confidence: 0.97,
+        algorithm: 'profile',
+        label: 'Quadro 03',
+        pageWidth: 704,
+        pageHeight: 1408,
+      },
+    ],
+  },
+};
 
 const DEMO_SCENES: SceneItem[] = [
   {
@@ -463,6 +512,7 @@ export default function App() {
     setChapters(DEMO_CHAPTERS);
     setFrames(DEMO_FRAMES);
     setScenes(DEMO_SCENES);
+    setChapterPanels(DEMO_CHAPTER_PANELS);
     setCurrentChapterId(DEMO_CHAPTERS[0].id);
     setCurrentPageNumber(1);
     showToast('Projeto demo de Manhwa carregado!');
@@ -704,35 +754,35 @@ export default function App() {
     <div className="flex items-center gap-1.5 sm:gap-2">
       {/* Auto-save status badge */}
       {saveStatus === 'saving' && (
-        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-secondary/80 text-[11px] font-medium text-muted-foreground border border-border animate-pulse">
-          <RefreshCw className="h-3 w-3 animate-spin text-primary" />
+        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-card/80 text-[11px] font-medium text-cyan-400 border border-cyan-400/20 shadow-sm animate-pulse">
+          <RefreshCw className="h-3 w-3 animate-spin text-cyan-400" />
           <span className="hidden sm:inline">Salvando...</span>
         </span>
       )}
       {saveStatus === 'saved' && (
         <span
-          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-emerald-500/10 text-[11px] font-semibold text-emerald-500 border border-emerald-500/20 shadow-xs"
+          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-500/10 text-[11px] font-semibold text-emerald-400 border border-emerald-500/20 shadow-sm"
           title={`Salvo no IndexedDB às ${new Date(lastSavedAt || Date.now()).toLocaleTimeString()}`}
         >
-          <Database className="h-3 w-3 text-emerald-400" />
+          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_6px_#34d399]" />
           <span className="hidden md:inline">Salvo no IndexedDB</span>
         </span>
       )}
       {saveStatus === 'error' && (
-        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-destructive/10 text-[11px] font-semibold text-destructive border border-destructive/20 shadow-xs">
-          <AlertCircle className="h-3 w-3" />
+        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-rose-500/10 text-[11px] font-semibold text-rose-400 border border-rose-500/20 shadow-sm">
+          <AlertCircle className="h-3 w-3 text-rose-400" />
           <span className="hidden sm:inline">Erro ao Salvar</span>
         </span>
       )}
 
-      {/* Manual Save Button */}
+      {/* Manual Save Button (Outline Pro style from reference) */}
       <button
         type="button"
         onClick={handleManualSave}
-        className="inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-2.5 py-1.5 text-xs font-semibold hover:bg-secondary cursor-pointer text-foreground shadow-xs transition-colors"
+        className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-card/80 px-2.5 py-1.5 text-xs font-semibold hover:bg-white/[0.06] hover:border-white/20 cursor-pointer text-white shadow-sm transition-all"
         title="Salvar alterações no IndexedDB agora"
       >
-        <Save className="h-3.5 w-3.5 text-primary" />
+        <Save className="h-3.5 w-3.5 text-cyan-400" />
         <span className="hidden lg:inline">Salvar</span>
       </button>
 
@@ -741,7 +791,7 @@ export default function App() {
         <button
           type="button"
           onClick={() => setIsConfirmClearModalOpen(true)}
-          className="inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-2.5 py-1.5 text-xs font-semibold hover:bg-destructive/10 hover:text-destructive hover:border-destructive/30 cursor-pointer text-muted-foreground transition-colors shadow-xs"
+          className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-card/60 px-2.5 py-1.5 text-xs font-semibold hover:bg-rose-500/10 hover:text-rose-400 hover:border-rose-500/30 cursor-pointer text-muted-foreground transition-all shadow-sm"
           title="Limpar projeto atual e começar do zero no IndexedDB"
         >
           <Trash2 className="h-3.5 w-3.5" />
@@ -764,15 +814,15 @@ export default function App() {
 
         <button
           onClick={handleLoadDemoProject}
-          className="hidden items-center gap-1.5 rounded-md border border-border bg-card px-2.5 py-1.5 text-xs font-semibold hover:bg-secondary sm:inline-flex cursor-pointer text-muted-foreground hover:text-foreground"
+          className="hidden items-center gap-1.5 rounded-lg border border-white/10 bg-card/60 px-2.5 py-1.5 text-xs font-semibold hover:bg-white/[0.06] hover:border-white/20 sm:inline-flex cursor-pointer text-muted-foreground hover:text-white transition-all shadow-sm"
           title="Restaurar projeto de exemplo com Solo Leveling"
         >
           <RotateCcw className="h-3.5 w-3.5" />
           <span>Demo</span>
         </button>
 
-        <label className="inline-flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-sm font-medium text-foreground hover:bg-secondary cursor-pointer">
-          <FolderUp className="h-4 w-4 text-primary" />
+        <label className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-card/80 px-3 py-1.5 sm:py-2 text-xs sm:text-sm font-semibold text-white hover:bg-white/[0.06] hover:border-white/20 cursor-pointer transition-all shadow-sm">
+          <FolderUp className="h-4 w-4 text-cyan-400" />
           <span className="hidden sm:inline">Importar pasta</span>
           <input
             type="file"

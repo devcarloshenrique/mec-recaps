@@ -35,36 +35,50 @@
 
 :root {
   --radius: 0.5rem;
-  --background: oklch(17% 0.012 265);
-  --foreground: oklch(96% 0.004 265);
-  --card: oklch(21.5% 0.014 265);
-  --card-foreground: oklch(96% 0.004 265);
-  --popover: oklch(22.5% 0.014 265);
-  --popover-foreground: oklch(96% 0.004 265);
-  --primary: oklch(78% 0.16 62);
-  --primary-foreground: oklch(20% 0.03 60);
-  --secondary: oklch(27% 0.016 265);
-  --secondary-foreground: oklch(93% 0.006 265);
-  --muted: oklch(25% 0.014 265);
-  --muted-foreground: oklch(68% 0.016 265);
-  --accent: oklch(62% 0.15 232);
-  --accent-foreground: oklch(97% 0.004 265);
-  --destructive: oklch(62% 0.21 22);
-  --destructive-foreground: oklch(98% 0.003 265);
-  --border: oklch(31% 0.016 265);
-  --input: oklch(29% 0.016 265);
-  --ring: oklch(78% 0.16 62);
-  --surface: oklch(13% 0.01 265);
-  --track-image: oklch(62% 0.15 232);
-  --track-audio: oklch(72% 0.14 155);
-  --track-fx: oklch(78% 0.16 62);
-  --sidebar: oklch(14.5% 0.012 265);
-  --sidebar-foreground: oklch(93% 0.006 265);
-  --sidebar-primary: oklch(78% 0.16 62);
-  --sidebar-primary-foreground: oklch(20% 0.03 60);
-  --sidebar-accent: oklch(25% 0.014 265);
-  --sidebar-accent-foreground: oklch(96% 0.004 265);
-  --sidebar-border: oklch(28% 0.016 265);
+  /* Deep Obsidian / Dark Charcoal Surfaces (Reference: Modern Pro Dark / Linear / Raycast) */
+  --surface: oklch(11% 0.012 260);
+  --sidebar: oklch(13% 0.014 260);
+  --background: oklch(14.5% 0.014 260);
+  --card: oklch(17.5% 0.016 260);
+  --card-foreground: oklch(97% 0.003 260);
+  --popover: oklch(20% 0.018 260);
+  --popover-foreground: oklch(97% 0.003 260);
+  --foreground: oklch(97% 0.003 260);
+
+  /* Primary Accent: Sunset Coral / Vermilion (Matching the reference UI #FF5C39) */
+  --primary: oklch(67% 0.22 35);
+  --primary-foreground: oklch(99% 0.002 35);
+
+  /* Secondary Accent: Electric Violet / Cyan */
+  --accent: oklch(64% 0.22 285);
+  --accent-foreground: oklch(98% 0.005 285);
+  --accent-cyan: oklch(84% 0.17 195);
+  --accent-coral: #ff5c39;
+
+  --secondary: oklch(21% 0.016 260);
+  --secondary-foreground: oklch(94% 0.005 260);
+  --muted: oklch(19% 0.015 260);
+  --muted-foreground: oklch(68% 0.018 260);
+  --destructive: oklch(62% 0.22 25);
+  --destructive-foreground: oklch(98% 0.003 260);
+
+  /* Hairline Crisp Glass Borders */
+  --border: oklch(24% 0.014 260);
+  --input: oklch(19% 0.016 260);
+  --ring: oklch(67% 0.22 35);
+
+  /* Timeline & Media Tracks */
+  --track-image: oklch(64% 0.22 285);
+  --track-audio: oklch(67% 0.22 35);
+  --track-fx: oklch(76% 0.18 150);
+
+  /* Sidebar Tokens */
+  --sidebar-foreground: oklch(92% 0.006 260);
+  --sidebar-primary: oklch(67% 0.22 35);
+  --sidebar-primary-foreground: oklch(99% 0.002 35);
+  --sidebar-accent: oklch(21% 0.018 260);
+  --sidebar-accent-foreground: oklch(98% 0.003 260);
+  --sidebar-border: oklch(21.5% 0.014 260);
 
   --font-heading: 'Space Grotesk', -apple-system, BlinkMacSystemFont, sans-serif;
   --font-sans: 'Manrope', -apple-system, BlinkMacSystemFont, sans-serif;
@@ -107,5 +121,58 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--muted-foreground);
 }
+
+/* Linear / Studio Style Range Slider with Coral Fill & Crisp White Thumb */
+input[type="range"] {
+  accent-color: #ff5c39;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  height: 14px;
+  width: 14px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.2);
+  cursor: pointer;
+  transition: transform 0.1s ease, box-shadow 0.1s ease;
+}
+
+input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+  box-shadow: 0 0 10px rgba(255, 92, 57, 0.6), 0 0 0 2px #ff5c39;
+}
+
+/* Elevated Glass Cards and Modals */
+.card-pro {
+  background: var(--card);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.06), 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+}
+
+.modal-pro {
+  background: rgba(26, 28, 36, 0.95);
+  backdrop-filter: blur(24px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 24px 48px -12px rgba(0, 0, 0, 0.8), inset 0 1px 0 0 rgba(255, 255, 255, 0.08);
+}
+
+.btn-cta-neon {
+  background: linear-gradient(135deg, #00f2fe 0%, #0adbb5 100%);
+  color: #04191d;
+  font-weight: 700;
+  box-shadow: 0 0 20px -3px rgba(0, 242, 254, 0.35);
+  transition: all 0.15s ease-out;
+}
+
+.btn-cta-neon:hover {
+  box-shadow: 0 0 25px -1px rgba(0, 242, 254, 0.55);
+  filter: brightness(1.06);
+}
+
+.glow-violet {
+  box-shadow: 0 0 16px -2px rgba(124, 92, 252, 0.4);
+}
+
 
 

@@ -284,16 +284,16 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-xs p-3 sm:p-5 animate-fade-in overflow-y-auto">
-      <div className="relative w-full max-w-3xl rounded-2xl border border-border bg-card shadow-2xl overflow-hidden my-auto max-h-[92vh] flex flex-col">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md p-3 sm:p-5 animate-fade-in overflow-y-auto">
+      <div className="relative w-full max-w-3xl rounded-2xl border border-white/10 bg-[#141620]/95 backdrop-blur-2xl shadow-2xl shadow-black/80 overflow-hidden my-auto max-h-[92vh] flex flex-col ring-1 ring-white/5">
         {/* Header */}
-        <div className="flex items-center justify-between border-b border-border px-6 py-4 bg-muted/20 shrink-0">
+        <div className="flex items-center justify-between border-b border-white/10 px-6 py-4 bg-white/[0.02] shrink-0">
           <div className="flex items-center gap-3">
-            <div className="h-10 w-10 rounded-xl bg-primary/10 border border-primary/30 flex items-center justify-center text-primary shadow-xs">
+            <div className="h-10 w-10 rounded-xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center text-cyan-400 shadow-md shadow-cyan-500/10">
               <Film className="h-5 w-5" />
             </div>
             <div>
-              <h2 className="font-display text-base sm:text-lg font-bold text-foreground flex items-center gap-2">
+              <h2 className="font-display text-base sm:text-lg font-bold text-white flex items-center gap-2">
                 Central de Exportação de Vídeo & Projeto
               </h2>
               <p className="text-xs text-muted-foreground">
@@ -648,9 +648,9 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 <button
                   type="button"
                   onClick={handleStartExport}
-                  className="w-full flex items-center justify-center gap-2 rounded-xl bg-primary py-3.5 text-sm font-bold text-primary-foreground hover:opacity-90 active:scale-[0.99] transition-all cursor-pointer shadow-lg shadow-primary/20"
+                  className="w-full flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-cyan-400 via-teal-300 to-emerald-400 py-3.5 text-xs font-bold text-slate-950 hover:brightness-110 active:scale-[0.99] transition-all cursor-pointer shadow-lg shadow-cyan-500/25 uppercase tracking-tight"
                 >
-                  <Download className="h-4.5 w-4.5" />
+                  <Download className="h-4.5 w-4.5 stroke-[2.5]" />
                   <span>
                     {selectedFormat === 'shotcut'
                       ? 'Gerar e Baixar Projeto Shotcut (.mlt + ZIP)'
