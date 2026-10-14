@@ -20,6 +20,9 @@ import {
   Maximize2,
   Loader2,
   Code2,
+  ChevronLeft,
+  ChevronRight,
+  Image as ImageIcon,
 } from 'lucide-react';
 import {
   ChapterItem,
@@ -44,6 +47,10 @@ import {
   matchAiSceneToFrame,
   ChapterPageItem,
 } from '../utils/aiNarration';
+import {
+  getChapterThumbnails,
+  generateChapterThumbnailsSequentially,
+} from '../utils/thumbnailCache';
 
 interface RoteiroViewProps {
   chapters: ChapterItem[];
@@ -95,7 +102,6 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
 }) => {
   // Estado local de navegação e visualização
   const [selectedFrameId, setSelectedFrameId] = useState<string | null>(null);
-  const [leftViewMode, setLeftViewMode] = useState<'som' | 'sliced'>('som');
   const [isMetadataDrawerOpen, setIsMetadataDrawerOpen] = useState(false);
   const [isMacroAnalyzing, setIsMacroAnalyzing] = useState(false);
   const [isScriptGenerating, setIsScriptGenerating] = useState(false);
@@ -113,13 +119,9 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
   const [customPrompt, setCustomPrompt] = useState('');
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
-  // Imagem original da página atual (renderização sem memory leak)
-  const [imgNaturalSize, setImgNaturalSize] = useState<{ width: number; height: number }>({
-    width: 1,
-    height: 1,
-  });
-
-  const imgRef = useRef<HTMLImageElement | null>(null);
+  // Progressive hydration of low-res proxy thumbnails for filmstrip
+  const [chapterThumbnails, setChapterThumbnails] = useState<Record<number, string>>({});
+  const activeThumbRef = useRef<HTMLButtonElement | null>(null);
   const frameCardRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
   const showToast = (msg: string, _type?: 'success' | 'info' | 'error') => {
@@ -145,6 +147,77 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
   };
 
   const totalPages = currentChapter?.pages || 1;
+
+  // Carregamento progressivo de miniaturas para o filmstrip
+  useEffect(() => {
+    let isCancelled = false;
+
+    if (!currentChapterId || !currentChapter?.imageUrls || currentChapter.imageUrls.length === 0) {
+      setChapterThumbnails({});
+      return;
+    }
+
+    getChapterThumbnails(currentChapterId).then((cached) => {
+      if (isCancelled) return;
+      if (cached && Object.keys(cached).length > 0) {
+        setChapterThumbnails(cached);
+      }
+    });
+
+    generateChapterThumbnailsSequentially(
+      currentChapterId,
+      currentChapter.imageUrls,
+      (pageNum, thumbUrl) => {
+        if (isCancelled) return;
+        setChapterThumbnails((prev) => ({
+          ...prev,
+          [pageNum]: thumbUrl,
+        }));
+      }
+    );
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [currentChapterId, currentChapter?.imageUrls]);
+
+  // Scroll automático do filmstrip para centralizar a página ativa
+  useEffect(() => {
+    if (activeThumbRef.current) {
+      activeThumbRef.current.scrollIntoView({
+        behavior: 'smooth',
+        block: 'nearest',
+        inline: 'center',
+      });
+    }
+  }, [currentPageNumber]);
+
+  // Navegação de páginas com as setas do teclado (Esquerda / Direita) quando não estiver digitando
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const activeEl = document.activeElement;
+      if (
+        activeEl &&
+        (activeEl.tagName === 'INPUT' ||
+          activeEl.tagName === 'TEXTAREA' ||
+          activeEl.tagName === 'SELECT' ||
+          (activeEl as HTMLElement).isContentEditable)
+      ) {
+        return;
+      }
+
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        onSelectPage(Math.max(1, currentPageNumber - 1));
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        onSelectPage(Math.min(totalPages, currentPageNumber + 1));
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [currentPageNumber, totalPages, onSelectPage]);
 
   // Imagem da página atual
   const currentPageImageUrl = useMemo(() => {
@@ -187,6 +260,16 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
       (currentChapter?.id ? pageScripts[`${currentChapter?.id}_${currentPageNumber}`] : undefined) ||
       pageScripts[`default_${currentPageNumber}`];
 
+    // Helper para obter o system prompt completo e rico do perfil
+    const getRealSystemPrompt = (profileId: string) => {
+      return buildChapterNarrationSystemPrompt(
+        profileId,
+        undefined,
+        projectMetadata,
+        chapterMetadata[currentChapterId]
+      );
+    };
+
     // Constrói os 4 perfis nativos padrão
     const initialProfiles: ScriptProfile[] = NARRATION_PROFILES.map((np) => {
       const snippets: Record<string, string> = {};
@@ -200,7 +283,7 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
       return {
         id: np.id,
         name: np.name,
-        systemPromptPreset: np.description,
+        systemPromptPreset: getRealSystemPrompt(np.id),
         snippetsByFrameId: snippets,
         fullScriptText: fullText,
         createdAt: Date.now(),
@@ -210,12 +293,21 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
     if (existing) {
       // Garante que todos os 4 perfis nativos estejam presentes mesmo em projetos antigos salvos
       const existingIds = new Set(existing.profiles.map((p) => p.id));
+      const baselineSnippets: Record<string, string> = {};
+      currentPageFrames.forEach((f) => {
+        if (f.narrationSnippet) {
+          baselineSnippets[f.id] = f.narrationSnippet;
+        }
+      });
+      const baselineText =
+        currentPageScene?.text || Object.values(baselineSnippets).filter(Boolean).join(' ');
+
       const missingNative = NARRATION_PROFILES.filter((np) => !existingIds.has(np.id)).map((np) => ({
         id: np.id,
         name: np.name,
-        systemPromptPreset: np.description,
-        snippetsByFrameId: {},
-        fullScriptText: '',
+        systemPromptPreset: getRealSystemPrompt(np.id),
+        snippetsByFrameId: { ...baselineSnippets },
+        fullScriptText: baselineText,
         createdAt: Date.now(),
       }));
 
@@ -224,16 +316,20 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
           ? [...existing.profiles, ...missingNative]
           : existing.profiles;
 
-      // Hidrata snippets e fullScriptText caso os quadros tenham narrationSnippet mas o perfil esteja vazio
+      // Garante que todo perfil tenha seu prompt completo e textos preenchidos
       mergedProfiles = mergedProfiles.map((p) => {
+        const needsPromptFix = !p.systemPromptPreset || p.systemPromptPreset.length < 80;
+        const updatedPrompt = needsPromptFix ? getRealSystemPrompt(p.id) : p.systemPromptPreset;
         const updatedSnippets = { ...p.snippetsByFrameId };
-        let hasChanges = false;
+        let hasChanges = needsPromptFix;
+
         currentPageFrames.forEach((f) => {
           if (!updatedSnippets[f.id] && f.narrationSnippet) {
             updatedSnippets[f.id] = f.narrationSnippet;
             hasChanges = true;
           }
         });
+
         const combinedText =
           p.fullScriptText ||
           currentPageScene?.text ||
@@ -242,6 +338,7 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
         if (hasChanges || (!p.fullScriptText && combinedText)) {
           return {
             ...p,
+            systemPromptPreset: updatedPrompt,
             snippetsByFrameId: updatedSnippets,
             fullScriptText: combinedText,
           };
@@ -381,6 +478,11 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
         onUpdateSceneText(currentPageScene.id, newFullText);
       }
     }
+  };
+
+  const handleDistributeToFrames = () => {
+    handleFullScriptTextChange(activeProfile.fullScriptText || '');
+    showToast('✨ Texto distribuído proporcionalmente entre os quadros!');
   };
 
   // Marca um perfil como ATIVO ("⭐ Usar na Narração")
@@ -839,6 +941,85 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
     onNavigateTab('narracao');
   };
 
+  const PROFILE_ICONS: Record<string, string> = {
+    epico: '⚔️',
+    sarcastico: '😏',
+    cronista: '📜',
+    tatico: '🎯',
+    retencao: '⚡',
+  };
+
+  const handleOpenPromptModal = () => {
+    const realPrompt =
+      activeProfile.systemPromptPreset && activeProfile.systemPromptPreset.length > 80
+        ? activeProfile.systemPromptPreset
+        : buildChapterNarrationSystemPrompt(
+            activeProfile.id,
+            undefined,
+            projectMetadata,
+            chapterMetadata[currentChapterId]
+          );
+    setPromptEditText(realPrompt);
+    setIsInspectPromptOpen(true);
+  };
+
+  const pageWordCount = (activeProfile.fullScriptText || '').trim()
+    ? (activeProfile.fullScriptText || '').trim().split(/\s+/).length
+    : 0;
+  const pageEstimatedSec = (pageWordCount / 2.5).toFixed(1);
+
+  // Estados e controle de redimensionamento das barras laterais
+  const [leftSidebarWidth, setLeftSidebarWidth] = useState<number>(270);
+  const [rightSidebarWidth, setRightSidebarWidth] = useState<number>(340);
+  const isDraggingLeftRef = useRef(false);
+  const isDraggingRightRef = useRef(false);
+
+  const handleLeftResizeStart = (e: React.PointerEvent) => {
+    e.preventDefault();
+    isDraggingLeftRef.current = true;
+    const startX = e.clientX;
+    const startWidth = leftSidebarWidth;
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      if (!isDraggingLeftRef.current) return;
+      const delta = moveEvent.clientX - startX;
+      const newWidth = Math.min(450, Math.max(200, startWidth + delta));
+      setLeftSidebarWidth(newWidth);
+    };
+
+    const handlePointerUp = () => {
+      isDraggingLeftRef.current = false;
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp);
+  };
+
+  const handleRightResizeStart = (e: React.PointerEvent) => {
+    e.preventDefault();
+    isDraggingRightRef.current = true;
+    const startX = e.clientX;
+    const startWidth = rightSidebarWidth;
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      if (!isDraggingRightRef.current) return;
+      const delta = startX - moveEvent.clientX; // arrastar para a esquerda aumenta a largura da sidebar direita
+      const newWidth = Math.min(600, Math.max(240, startWidth + delta));
+      setRightSidebarWidth(newWidth);
+    };
+
+    const handlePointerUp = () => {
+      isDraggingRightRef.current = false;
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp);
+  };
+
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden bg-background select-none">
       {/* Toast Notification */}
@@ -848,336 +1029,367 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
         </div>
       )}
 
-      {/* TOP BAR / METADATA SUMMARY & WORK INFO */}
-      <div className="h-14 border-b border-border bg-card px-4 flex items-center justify-between shrink-0 gap-4">
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-              Capítulo:
-            </span>
-            <select
-              value={currentChapterId}
-              onChange={(e) => onSelectChapter(e.target.value)}
-              className="bg-secondary text-foreground text-xs font-medium px-2.5 py-1.5 rounded-md border border-border focus:outline-none focus:ring-1 focus:ring-primary cursor-pointer"
+      {/* CONTAINER PRINCIPAL TRIPLO (LAYOUT DE ESTÚDIO 3 COLUNAS) */}
+      <div className="flex-1 flex overflow-hidden bg-background">
+        {/* ======================================================== */}
+        {/* BARRA LATERAL ESQUERDA: Configurações, Perfis e IA       */}
+        {/* ======================================================== */}
+        <aside
+          style={{ width: `${leftSidebarWidth}px` }}
+          className="shrink-0 h-full border-r border-border bg-card/60 flex flex-col overflow-hidden select-none"
+        >
+          {/* Cabeçalho da Sidebar Esquerda */}
+          <div className="p-3 border-b border-border bg-card/40 flex items-center justify-between shrink-0">
+            <div className="flex items-center gap-2 min-w-0">
+              <Sparkles className="h-4 w-4 text-primary shrink-0" />
+              <span className="text-xs font-bold text-foreground truncate">
+                Roteiro & Perfis
+              </span>
+            </div>
+            <button
+              onClick={() => setIsMetadataDrawerOpen(true)}
+              className="p-1 rounded hover:bg-secondary text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+              title="Configurar Personagens & Universo da Obra"
             >
-              {chapters.map((ch) => (
-                <option key={ch.id} value={ch.id}>
-                  {ch.label} ({ch.pages} pág)
-                </option>
-              ))}
-            </select>
+              <Settings2 className="h-3.5 w-3.5" />
+            </button>
           </div>
 
-          <div className="flex items-center gap-1.5">
-            <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-              Página:
-            </span>
-            <div className="flex items-center gap-1">
-              <button
-                disabled={currentPageNumber <= 1}
-                onClick={() => onSelectPage(currentPageNumber - 1)}
-                className="p-1 rounded bg-secondary hover:bg-secondary/80 disabled:opacity-30 text-foreground cursor-pointer"
-              >
-                <ArrowLeft className="h-3.5 w-3.5" />
-              </button>
-              <span className="text-xs font-bold text-foreground px-1.5">
-                {currentPageNumber} / {totalPages}
+          {/* Corpo com Scroll da Sidebar Esquerda */}
+          <div className="flex-1 overflow-y-auto p-3 space-y-4">
+            {/* Bloco 1: Bíblia do Capítulo e Geração em Lote */}
+            <div className="space-y-1.5">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground px-1">
+                Bíblia & Enredo
               </span>
-              <button
-                disabled={currentPageNumber >= totalPages}
-                onClick={() => onSelectPage(currentPageNumber + 1)}
-                className="p-1 rounded bg-secondary hover:bg-secondary/80 disabled:opacity-30 text-foreground cursor-pointer"
-              >
-                <ArrowRight className="h-3.5 w-3.5" />
-              </button>
-            </div>
-          </div>
-
-          {/* Work Title Badge */}
-          <div className="hidden md:flex items-center gap-2 pl-3 border-l border-border">
-            <BookOpen className="h-3.5 w-3.5 text-primary" />
-            <span className="text-xs font-semibold text-foreground">
-              {projectMetadata.workTitle || 'Obra sem título'}
-            </span>
-          </div>
-
-          {/* Character Badges */}
-          <div className="hidden lg:flex items-center gap-1.5">
-            {projectMetadata.characters.slice(0, 4).map((char) => {
-              const roleColors = {
-                protagonist: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
-                antagonist: 'bg-rose-500/10 text-rose-400 border-rose-500/30',
-                ally: 'bg-sky-500/10 text-sky-400 border-sky-500/30',
-                neutral: 'bg-amber-500/10 text-amber-400 border-amber-500/30',
-              };
-              return (
-                <span
-                  key={char.id}
-                  className={`text-[10px] font-medium px-2 py-0.5 rounded-full border ${
-                    roleColors[char.role] || roleColors.neutral
+              <div className="flex flex-col gap-1.5">
+                <button
+                  onClick={handleAnalyzeChapterMacro}
+                  disabled={isMacroAnalyzing || isBatchScriptGenerating || isScriptGenerating}
+                  className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-all cursor-pointer ${
+                    chapterMetadata[currentChapterId]?.macroContext
+                      ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/20 shadow-2xs'
+                      : 'bg-secondary/70 hover:bg-secondary text-foreground border-border'
                   }`}
-                  title={`${char.name} (${char.role})`}
+                  title="Analisar Enredo Macro e Regras dos Personagens para impedir alucinações da IA"
                 >
-                  {char.name}
-                </span>
-              );
-            })}
-            {projectMetadata.characters.length > 4 && (
-              <span className="text-[10px] font-semibold text-muted-foreground">
-                +{projectMetadata.characters.length - 4}
-              </span>
-            )}
-          </div>
-        </div>
+                  <div className="flex items-center gap-2">
+                    <BookOpen className="h-3.5 w-3.5" />
+                    <span>
+                      {chapterMetadata[currentChapterId]?.macroContext ? 'Bíblia Ativa' : 'Bíblia do Capítulo'}
+                    </span>
+                  </div>
+                  {isMacroAnalyzing && <Loader2 className="h-3 w-3 animate-spin text-primary" />}
+                </button>
 
-        {/* Right Action Buttons */}
-        <div className="flex items-center gap-2">
-          <button
-            onClick={handleAnalyzeChapterMacro}
-            disabled={isMacroAnalyzing || isBatchScriptGenerating || isScriptGenerating}
-            className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-semibold border transition-colors cursor-pointer ${
-              chapterMetadata[currentChapterId]?.macroContext
-                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/20'
-                : 'bg-secondary hover:bg-secondary/80 text-foreground border-border'
-            }`}
-            title="Analisar Enredo Macro e Regras dos Personagens (Bíblia do Capítulo) para impedir alucinações da IA"
-          >
-            {isMacroAnalyzing ? (
-              <>
-                <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
-                <span>Analisando Bíblia...</span>
-              </>
-            ) : (
-              <>
-                <BookOpen className="h-3.5 w-3.5" />
-                <span>
-                  {chapterMetadata[currentChapterId]?.macroContext ? 'Bíblia Ativa' : 'Bíblia do Capítulo'}
-                </span>
-              </>
-            )}
-          </button>
-
-          <button
-            onClick={() => setIsMetadataDrawerOpen(true)}
-            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-secondary hover:bg-secondary/80 text-foreground text-xs font-medium border border-border transition-colors cursor-pointer"
-            title="Configurar nomes dos personagens, sinopse e termos do universo"
-          >
-            <Settings2 className="h-3.5 w-3.5 text-muted-foreground" />
-            <span>Personagens & Universo</span>
-          </button>
-
-          <button
-            onClick={() => {
-              setPromptEditText(
-                activeProfile.systemPromptPreset ||
-                buildChapterNarrationSystemPrompt(
-                  activeProfile.id,
-                  undefined,
-                  projectMetadata,
-                  chapterMetadata[currentChapterId]
-                )
-              );
-              setIsInspectPromptOpen(true);
-            }}
-            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-secondary hover:bg-secondary/80 text-foreground text-xs font-medium border border-border transition-colors cursor-pointer"
-            title="Visualizar e editar o prompt completo enviado à IA"
-          >
-            <Code2 className="h-3.5 w-3.5 text-sky-400" />
-            <span className="hidden sm:inline">Ver / Editar Prompt</span>
-          </button>
-
-          <button
-            onClick={() => handleBatchGenerateScript(activeProfile.id)}
-            disabled={isBatchScriptGenerating || isScriptGenerating}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-primary hover:bg-primary/90 text-primary-foreground text-xs font-semibold shadow-2xs transition-colors disabled:opacity-40 cursor-pointer"
-            title="Gerar o roteiro de todas as páginas do capítulo em mini-blocos guiados pela Bíblia Macro"
-          >
-            {isBatchScriptGenerating ? (
-              <>
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                <span>Gerando Capítulo...</span>
-              </>
-            ) : (
-              <>
-                <Sparkles className="h-3.5 w-3.5" />
-                <span>Gerar Roteiro do Capítulo</span>
-              </>
-            )}
-          </button>
-        </div>
-      </div>
-
-      {/* MAIN SPLIT SCREEN VIEW */}
-      <div className="flex-1 flex overflow-hidden">
-        {/* ======================================================== */}
-        {/* COLUNA ESQUERDA: Webtoon & Set-of-Mark Viewer (Página)   */}
-        {/* ======================================================== */}
-        <div className="w-1/2 border-r border-border flex flex-col bg-zinc-950/40 overflow-hidden">
-          {/* Header da Coluna Esquerda */}
-          <div className="h-10 px-3 border-b border-border bg-card/60 flex items-center justify-between shrink-0">
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-semibold text-foreground">Visualizador</span>
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-secondary text-muted-foreground">
-                {currentPageFrames.length} quadros
-              </span>
+                <button
+                  onClick={() => handleBatchGenerateScript(activeProfile.id)}
+                  disabled={isBatchScriptGenerating || isScriptGenerating}
+                  className="w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-primary hover:bg-primary/90 text-primary-foreground text-xs font-bold shadow-xs transition-colors disabled:opacity-40 cursor-pointer"
+                  title="Gerar o roteiro de todas as páginas do capítulo guiado pela Bíblia Macro"
+                >
+                  {isBatchScriptGenerating ? (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      <span>Gerando Capítulo...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="h-3.5 w-3.5" />
+                      <span>Gerar Roteiro do Capítulo</span>
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
 
-            <div className="flex items-center bg-secondary/60 rounded p-0.5 border border-border/60">
-              <button
-                onClick={() => setLeftViewMode('som')}
-                className={`px-2 py-0.5 rounded text-[11px] font-medium transition-colors cursor-pointer ${
-                  leftViewMode === 'som'
-                    ? 'bg-primary text-primary-foreground shadow-2xs'
-                    : 'text-muted-foreground hover:text-foreground'
-                }`}
-              >
-                Página & SoM
-              </button>
-              <button
-                onClick={() => setLeftViewMode('sliced')}
-                className={`px-2 py-0.5 rounded text-[11px] font-medium transition-colors cursor-pointer ${
-                  leftViewMode === 'sliced'
-                    ? 'bg-primary text-primary-foreground shadow-2xs'
-                    : 'text-muted-foreground hover:text-foreground'
-                }`}
-              >
-                Modo Fatiado
-              </button>
-            </div>
-          </div>
+            {/* Bloco 2: Perfis de Estilo de Narração */}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between px-1">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                  Estilo de Narração
+                </span>
+                <button
+                  onClick={() => setIsAddingCustomProfile(true)}
+                  className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors cursor-pointer"
+                  title="Criar novo perfil de narração"
+                >
+                  <Plus className="h-3 w-3" />
+                </button>
+              </div>
 
-          {/* Área de Visualização */}
-          <div className="flex-1 overflow-y-auto p-4 flex justify-center items-start">
-            {leftViewMode === 'som' ? (
-              /* MODO SET-OF-MARK: Imagem original com overlay SVG dinâmico (zero duplicate URLs) */
-              <div className="relative inline-block max-w-full shadow-2xl rounded border border-border/80 overflow-hidden bg-black">
-                {currentPageImageUrl ? (
-                  <>
-                    <img
-                      ref={imgRef}
-                      src={currentPageImageUrl}
-                      alt={`Página ${currentPageNumber}`}
-                      className="block max-w-full h-auto select-none pointer-events-none"
-                      onLoad={(e) => {
-                        const target = e.currentTarget;
-                        setImgNaturalSize({
-                          width: target.naturalWidth || 1,
-                          height: target.naturalHeight || 1,
+              <div className="space-y-1">
+                {currentPageScriptState.profiles.map((profile) => {
+                  const isActive = profile.id === activeProfile.id;
+                  const isSelectedForNarration = profile.id === currentPageScriptState.activeProfileId;
+                  const icon = PROFILE_ICONS[profile.id] || '🎙️';
+
+                  return (
+                    <button
+                      key={profile.id}
+                      onClick={() => {
+                        updateCurrentScriptState({
+                          ...currentPageScriptState,
+                          activeProfileId: profile.id,
                         });
                       }}
-                    />
-
-                    {/* Overlay SVG dinâmico sobre a imagem (renderiza as molduras e tags) */}
-                    <svg
-                      className="absolute inset-0 w-full h-full pointer-events-auto"
-                      viewBox={`0 0 ${imgNaturalSize.width} ${imgNaturalSize.height}`}
-                      preserveAspectRatio="none"
+                      className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer border ${
+                        isActive
+                          ? 'bg-primary/20 text-primary border-primary/40 shadow-xs'
+                          : 'bg-secondary/40 text-muted-foreground border-transparent hover:text-foreground hover:bg-secondary'
+                      }`}
                     >
-                      {currentPageFrames.map((frame, idx) => {
-                        if (!frame.cropRect) return null;
-                        const { x, y, width, height } = frame.cropRect;
-                        const color = SOM_PALETTE[idx % SOM_PALETTE.length];
-                        const isSelected = selectedFrameId === frame.id;
-                        const labelText = frame.label || `[Quadro ${String(idx + 1).padStart(2, '0')}]`;
+                      <div className="flex items-center gap-2 truncate">
+                        <span className="text-sm shrink-0">{icon}</span>
+                        <span className="truncate">{profile.name}</span>
+                      </div>
+                      {isSelectedForNarration && (
+                        <Star className="h-3 w-3 text-amber-400 fill-amber-400 shrink-0 ml-1" />
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
 
-                        // Posição da tag
-                        const badgeWidth = Math.max(70, labelText.length * 9);
-                        const badgeHeight = 22;
-                        const badgeX = x + 4;
-                        const badgeY = y > badgeHeight + 6 ? y - badgeHeight - 2 : y + 4;
-
-                        return (
-                          <g
-                            key={frame.id}
-                            className="cursor-pointer transition-opacity"
-                            onClick={() => setSelectedFrameId(frame.id)}
-                          >
-                            {/* Borda Externa de Contraste */}
-                            <rect
-                              x={x}
-                              y={y}
-                              width={width}
-                              height={height}
-                              fill="none"
-                              stroke="#000000"
-                              strokeWidth={isSelected ? 10 : 6}
-                            />
-                            {/* Borda Colorida SoM */}
-                            <rect
-                              x={x}
-                              y={y}
-                              width={width}
-                              height={height}
-                              fill={isSelected ? `${color.border}22` : 'none'}
-                              stroke={color.border}
-                              strokeWidth={isSelected ? 6 : 3.5}
-                            />
-
-                            {/* Badge semi-translúcido da etiqueta */}
-                            <rect
-                              x={badgeX}
-                              y={badgeY}
-                              width={badgeWidth}
-                              height={badgeHeight}
-                              rx={4}
-                              fill="rgba(0, 0, 0, 0.75)"
-                              stroke={color.border}
-                              strokeWidth={1.5}
-                            />
-                            <text
-                              x={badgeX + badgeWidth / 2}
-                              y={badgeY + 15}
-                              textAnchor="middle"
-                              fill="#FFFFFF"
-                              fontSize="12"
-                              fontWeight="bold"
-                              fontFamily="sans-serif"
-                            >
-                              {labelText}
-                            </text>
-                          </g>
-                        );
-                      })}
-                    </svg>
-                  </>
-                ) : (
-                  <div className="p-12 text-center text-muted-foreground text-xs">
-                    Nenhuma imagem carregada para a página {currentPageNumber}.
+              {/* Popover / Form para Adicionar Novo Perfil */}
+              {isAddingCustomProfile && (
+                <div className="p-2.5 bg-secondary/80 border border-border rounded-lg flex flex-col gap-2 animate-in fade-in">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold text-foreground">Novo Perfil</span>
+                    <button
+                      onClick={() => setIsAddingCustomProfile(false)}
+                      className="text-muted-foreground hover:text-foreground"
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
                   </div>
-                )}
+                  <input
+                    type="text"
+                    placeholder="Nome do Perfil..."
+                    value={newProfileName}
+                    onChange={(e) => setNewProfileName(e.target.value)}
+                    className="w-full bg-background text-foreground text-xs px-2 py-1.5 rounded border border-border focus:outline-none focus:ring-1 focus:ring-primary"
+                  />
+                  <button
+                    onClick={handleAddCustomProfile}
+                    className="w-full py-1 rounded bg-primary text-primary-foreground text-xs font-semibold cursor-pointer"
+                  >
+                    Criar
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Bloco 3: Configurações do Perfil Ativo */}
+            <div className="space-y-2 p-2.5 rounded-lg bg-secondary/30 border border-border/50 text-xs">
+              <div>
+                <span className="font-bold text-foreground">{activeProfile.name}</span>
+                <p className="text-[11px] text-muted-foreground mt-0.5 leading-relaxed">
+                  {NARRATION_PROFILES.find((np) => np.id === activeProfile.id)?.description || 'Estilo de narração personalizado.'}
+                </p>
+              </div>
+
+              <div className="flex flex-col gap-1.5 pt-1">
+                <button
+                  onClick={handleOpenPromptModal}
+                  className="w-full flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-md bg-secondary hover:bg-secondary/80 text-foreground text-xs font-medium border border-border transition-colors cursor-pointer"
+                  title="Visualizar e editar as instruções completas enviadas à IA para este perfil"
+                >
+                  <Code2 className="h-3.5 w-3.5 text-sky-400" />
+                  <span>Ver / Editar Prompt</span>
+                </button>
+
+                <button
+                  onClick={() => handleGenerateScript(activeProfile.id)}
+                  disabled={isScriptGenerating || isBatchScriptGenerating || currentPageFrames.length === 0}
+                  className="w-full flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-md bg-sky-500/10 hover:bg-sky-500/20 text-sky-400 border border-sky-500/30 text-xs font-semibold transition-colors disabled:opacity-40 cursor-pointer shadow-2xs"
+                  title={`Gerar narração para a Página ${currentPageNumber} com este perfil`}
+                >
+                  {isScriptGenerating ? (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      <span>Gerando Pág. {currentPageNumber}...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="h-3.5 w-3.5" />
+                      <span>Gerar Pág. {currentPageNumber}</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {/* Bloco 4: Barra de Progresso de Operações em Lote */}
+            {batchProgress && (
+              <div className="p-2.5 rounded-lg bg-primary/10 border border-primary/25 flex flex-col gap-1.5 animate-in fade-in">
+                <div className="flex items-center justify-between text-xs">
+                  <div className="flex items-center gap-1.5 font-semibold text-primary truncate mr-1">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin shrink-0" />
+                    <span className="truncate">{batchProgress.stage}</span>
+                  </div>
+                  <span className="text-[11px] font-bold text-primary shrink-0">
+                    {Math.round((batchProgress.current / batchProgress.total) * 100)}%
+                  </span>
+                </div>
+                <div className="w-full bg-primary/20 h-1.5 rounded-full overflow-hidden">
+                  <div
+                    className="bg-primary h-full transition-all duration-300 rounded-full"
+                    style={{ width: `${(batchProgress.current / batchProgress.total) * 100}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Bloco 5: Personagens Rápidos */}
+            {projectMetadata.characters.length > 0 && (
+              <div className="space-y-1.5 pt-2 border-t border-border/50">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground px-1">
+                  Personagens ({projectMetadata.characters.length})
+                </span>
+                <div className="flex flex-wrap gap-1">
+                  {projectMetadata.characters.map((char) => (
+                    <span
+                      key={char.id}
+                      className="text-[10px] font-medium px-2 py-0.5 rounded-full border bg-secondary/50 text-foreground border-border/60"
+                    >
+                      {char.name}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </aside>
+
+        {/* ======================================================== */}
+        {/* RESIZER DIVIDER: ESQUERDA / CENTRO                       */}
+        {/* ======================================================== */}
+        <div
+          onPointerDown={handleLeftResizeStart}
+          className="w-1.5 hover:w-2 bg-transparent hover:bg-primary/50 cursor-col-resize transition-all shrink-0 z-10 select-none group flex items-center justify-center"
+          title="Arrastar para redimensionar barra lateral esquerda"
+        >
+          <div className="w-[1px] h-8 bg-white/20 group-hover:bg-primary" />
+        </div>
+
+        {/* ======================================================== */}
+        {/* PAINEL CENTRAL: Quadros da Página em 2 Colunas           */}
+        {/* ======================================================== */}
+        <main className="flex-1 overflow-y-auto p-4 sm:p-5 bg-background">
+          <div className="w-full flex flex-col gap-4">
+            <div className="flex items-center justify-between pb-2 border-b border-border/40">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold uppercase tracking-wider text-muted-foreground">
+                  Trechos por Quadro ({currentPageFrames.length} {currentPageFrames.length === 1 ? 'cena' : 'cenas'})
+                </span>
+                <span className="text-[11px] text-muted-foreground/70 hidden sm:inline">
+                  · Miniaturas com tags Set-of-Mark e durações individuais
+                </span>
+              </div>
+              <span className="text-[11px] font-mono text-muted-foreground">
+                Página {currentPageNumber} de {totalPages}
+              </span>
+            </div>
+
+            {currentPageFrames.length === 0 ? (
+              <div className="p-12 text-center border border-dashed border-border rounded-xl bg-card/40 flex flex-col items-center justify-center gap-3">
+                <ImageIcon className="h-8 w-8 text-muted-foreground/60" />
+                <div>
+                  <p className="text-xs font-semibold text-foreground">Nenhum quadro recortado nesta página</p>
+                  <p className="text-[11px] text-muted-foreground mt-0.5">
+                    Vá para a aba <strong>Recorte</strong> para recortar os painéis desta página ou gerar recortes automáticos.
+                  </p>
+                </div>
+                <button
+                  onClick={() => onNavigateTab('recorte')}
+                  className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-secondary hover:bg-secondary/80 text-foreground text-xs font-medium border border-border transition-colors cursor-pointer"
+                >
+                  <span>Ir para Recorte</span>
+                </button>
               </div>
             ) : (
-              /* MODO FATIADO: Fita vertical dos recortes individuais já salvos em frame.src */
-              <div className="w-full max-w-md flex flex-col gap-4">
+              <div className="grid grid-cols-1 min-[1100px]:grid-cols-2 gap-3.5">
                 {currentPageFrames.map((frame, idx) => {
-                  const isSelected = selectedFrameId === frame.id;
                   const color = SOM_PALETTE[idx % SOM_PALETTE.length];
+                  const snippet = activeProfile.snippetsByFrameId[frame.id] || '';
+                  const isSelected = selectedFrameId === frame.id;
+                  const wordCount = snippet.trim() ? snippet.trim().split(/\s+/).length : 0;
+                  const estimatedSec = (wordCount / 2.5).toFixed(1);
+
                   return (
                     <div
                       key={frame.id}
+                      ref={(el) => {
+                        frameCardRefs.current[frame.id] = el;
+                      }}
                       onClick={() => setSelectedFrameId(frame.id)}
-                      className={`rounded-lg border overflow-hidden bg-card cursor-pointer transition-all ${
+                      className={`rounded-xl border p-3 bg-card/90 transition-all flex flex-col gap-2.5 ${
                         isSelected
-                          ? 'border-primary ring-2 ring-primary/40 shadow-lg'
-                          : 'border-border hover:border-border/80'
+                          ? 'border-primary ring-1 ring-primary shadow-lg shadow-black/20'
+                          : 'border-border/80 hover:border-border'
                       }`}
                     >
-                      <div className="h-7 px-3 bg-secondary/50 flex items-center justify-between text-xs font-semibold">
-                        <span className="flex items-center gap-1.5" style={{ color: color.border }}>
-                          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: color.border }} />
-                          {frame.label}
-                        </span>
-                        <span className="text-[10px] text-muted-foreground">
-                          {frame.duration?.toFixed(1) || '3.5'}s
-                        </span>
+                      {/* Header do Card */}
+                      <div className="flex items-center justify-between gap-2 min-w-0">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span
+                            className="w-2.5 h-2.5 rounded-full shrink-0"
+                            style={{ backgroundColor: color.border }}
+                          />
+                          <span className="text-xs font-bold text-foreground truncate">
+                            {frame.label}
+                          </span>
+                          <span className="text-[10px] text-muted-foreground font-mono shrink-0">
+                            (Pág. {currentPageNumber})
+                          </span>
+                        </div>
+
+                        <div className="flex items-center gap-2 shrink-0">
+                          <span className="text-[10px] font-mono text-muted-foreground">
+                            {wordCount} pal. · ~{estimatedSec}s
+                          </span>
+                        </div>
                       </div>
-                      <div className="p-2 bg-black flex justify-center">
-                        <img
-                          src={frame.src}
-                          alt={frame.label}
-                          className="max-h-72 object-contain rounded"
-                          loading="lazy"
-                        />
+
+                      {/* Conteúdo: Miniatura + Textarea */}
+                      <div className="flex flex-col sm:flex-row gap-3 items-start flex-1 min-w-0">
+                        {/* Miniatura do Quadro */}
+                        <div className="relative w-full sm:w-36 h-28 rounded-lg overflow-hidden bg-black/80 border border-white/10 shrink-0 flex items-center justify-center group shadow-xs">
+                          {frame.src ? (
+                            <img
+                              src={frame.src}
+                              alt={frame.label}
+                              className="w-full h-full object-contain transition-transform group-hover:scale-105"
+                              loading="lazy"
+                            />
+                          ) : (
+                            <div className="flex flex-col items-center gap-1 text-muted-foreground">
+                              <ImageIcon className="h-5 w-5 opacity-40" />
+                              <span className="text-[10px] font-mono">Sem imagem</span>
+                            </div>
+                          )}
+                          <span
+                            className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded text-[9px] font-bold shadow-xs truncate max-w-[85%]"
+                            style={{ backgroundColor: color.border, color: color.text }}
+                          >
+                            {frame.label}
+                          </span>
+                          <span className="absolute bottom-1.5 right-1.5 px-1.5 py-0.5 rounded text-[9px] font-mono bg-black/80 text-white border border-white/10">
+                            {frame.duration?.toFixed(1) || '3.5'}s
+                          </span>
+                        </div>
+
+                        {/* Narração do Quadro */}
+                        <div className="flex-1 w-full flex flex-col gap-1.5 min-w-0 h-full">
+                          <textarea
+                            rows={4}
+                            value={snippet}
+                            onChange={(e) => handleFrameSnippetChange(frame.id, e.target.value)}
+                            placeholder={`Narração para ${frame.label}...`}
+                            className="w-full flex-1 min-h-[90px] bg-background/80 text-foreground text-xs p-2.5 rounded-lg border border-border focus:outline-none focus:ring-1 focus:ring-primary resize-y leading-relaxed font-sans placeholder:text-muted-foreground/50"
+                          />
+                        </div>
                       </div>
                     </div>
                   );
@@ -1185,267 +1397,142 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
               </div>
             )}
           </div>
-        </div>
+        </main>
 
         {/* ======================================================== */}
-        {/* COLUNA DIREITA: Contexto Bruto & Perfis de Roteiro       */}
+        {/* RESIZER DIVIDER: CENTRO / DIREITA                        */}
         {/* ======================================================== */}
-        <div className="w-1/2 flex flex-col bg-background overflow-hidden">
-          {/* Header da Coluna Direita: Tabs de Perfis de Roteiro */}
-          <div className="h-10 px-3 border-b border-border bg-card/60 flex items-center justify-between shrink-0">
-            <div className="flex items-center gap-1 overflow-x-auto no-scrollbar">
-              {currentPageScriptState.profiles.map((profile) => {
-                const isActiveTab = profile.id === activeProfile.id;
-                const isSelectedForNarration = profile.id === currentPageScriptState.activeProfileId;
-                return (
-                  <button
-                    key={profile.id}
-                    onClick={() => {
-                      updateCurrentScriptState({
-                        ...currentPageScriptState,
-                        activeProfileId: profile.id,
-                      });
-                    }}
-                    className={`inline-flex items-center gap-1.5 px-3 py-1 rounded text-xs font-medium transition-colors cursor-pointer shrink-0 ${
-                      isActiveTab
-                        ? 'bg-secondary text-foreground font-semibold border border-border shadow-2xs'
-                        : 'text-muted-foreground hover:text-foreground'
-                    }`}
-                  >
-                    <span>{profile.name}</span>
-                    {isSelectedForNarration && (
-                      <Star className="h-3 w-3 text-amber-400 fill-amber-400" />
-                    )}
-                  </button>
-                );
-              })}
-
-              <button
-                onClick={() => setIsAddingCustomProfile(true)}
-                className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors cursor-pointer"
-                title="Criar novo perfil de narração"
-              >
-                <Plus className="h-3.5 w-3.5" />
-              </button>
-
-              <button
-                onClick={() => {
-                  setPromptEditText(
-                    activeProfile.systemPromptPreset ||
-                    buildChapterNarrationSystemPrompt(
-                      activeProfile.id,
-                      undefined,
-                      projectMetadata,
-                      chapterMetadata[currentChapterId]
-                    )
-                  );
-                  setIsInspectPromptOpen(true);
-                }}
-                className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium text-muted-foreground hover:text-foreground hover:bg-secondary border border-border/60 transition-colors cursor-pointer shrink-0 ml-1"
-                title="Visualizar e editar o prompt completo enviado à IA para este perfil"
-              >
-                <Code2 className="h-3 w-3 text-sky-400" />
-                <span>Ver Prompt</span>
-              </button>
-            </div>
-
-            {/* Ações da Aba Ativa */}
-            <div className="flex items-center gap-1.5 shrink-0">
-              {currentPageScriptState.activeProfileId !== activeProfile.id ? (
-                <button
-                  onClick={() => handleSetActiveProfile(activeProfile.id)}
-                  className="inline-flex items-center gap-1 px-2 py-1 rounded bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30 text-xs font-medium transition-colors cursor-pointer"
-                  title="Definir este perfil para ser usado na tela de Narração"
-                >
-                  <Star className="h-3 w-3" />
-                  <span>Usar na Narração</span>
-                </button>
-              ) : (
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 text-[11px] font-semibold">
-                  <Check className="h-3 w-3" />
-                  <span>Ativo</span>
-                </span>
-              )}
-
-              {/* Gerar Roteiro Apenas da Página Atual */}
-              <button
-                onClick={() => handleGenerateScript(activeProfile.id)}
-                disabled={isScriptGenerating || isBatchScriptGenerating}
-                className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-secondary hover:bg-secondary/80 border border-border text-foreground text-xs font-medium shadow-2xs transition-colors disabled:opacity-40 cursor-pointer"
-                title={`Gerar roteiro com visão direta apenas para a Página ${currentPageNumber}`}
-              >
-                {isScriptGenerating ? (
-                  <>
-                    <Loader2 className="h-3 w-3 animate-spin text-primary" />
-                    <span>Gerando...</span>
-                  </>
-                ) : (
-                  <>
-                    <Sparkles className="h-3 w-3 text-sky-400" />
-                    <span>Gerar Pág. {currentPageNumber}</span>
-                  </>
-                )}
-              </button>
-            </div>
-          </div>
-
-          {/* Barra de Progresso de Operações em Lote */}
-          {batchProgress && (
-            <div className="mx-3 mt-2 p-2.5 rounded-lg bg-primary/10 border border-primary/25 flex flex-col gap-1.5 animate-in fade-in shrink-0">
-              <div className="flex items-center justify-between text-xs">
-                <div className="flex items-center gap-1.5 font-semibold text-primary truncate mr-2">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin shrink-0" />
-                  <span className="truncate">{batchProgress.stage}</span>
-                </div>
-                <span className="text-[11px] font-bold text-primary shrink-0">
-                  {Math.round((batchProgress.current / batchProgress.total) * 100)}%
-                </span>
-              </div>
-              <div className="w-full bg-primary/20 h-1.5 rounded-full overflow-hidden">
-                <div
-                  className="bg-primary h-full transition-all duration-300 rounded-full"
-                  style={{ width: `${(batchProgress.current / batchProgress.total) * 100}%` }}
-                />
-              </div>
-            </div>
-          )}
-
-          {/* Modal / Popover para Adicionar Novo Perfil */}
-          {isAddingCustomProfile && (
-            <div className="p-3 bg-secondary/80 border-b border-border flex flex-col gap-2 animate-in fade-in">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold text-foreground">Novo Perfil de Estilo</span>
-                <button
-                  onClick={() => setIsAddingCustomProfile(false)}
-                  className="text-muted-foreground hover:text-foreground"
-                >
-                  <X className="h-3.5 w-3.5" />
-                </button>
-              </div>
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  placeholder="Nome do Perfil (ex: Sarcástico / Recap Rápido)"
-                  value={newProfileName}
-                  onChange={(e) => setNewProfileName(e.target.value)}
-                  className="flex-1 bg-background text-foreground text-xs px-2.5 py-1.5 rounded border border-border focus:outline-none focus:ring-1 focus:ring-primary"
-                />
-                <button
-                  onClick={handleAddCustomProfile}
-                  className="px-3 py-1.5 rounded bg-primary text-primary-foreground text-xs font-semibold cursor-pointer"
-                >
-                  Criar
-                </button>
-              </div>
-              <input
-                type="text"
-                placeholder="Instrução de tom opcional (ex: Destaque a comédia e quebre a 4ª parede)"
-                value={customPrompt}
-                onChange={(e) => setCustomPrompt(e.target.value)}
-                className="w-full bg-background text-foreground text-xs px-2.5 py-1.5 rounded border border-border focus:outline-none focus:ring-1 focus:ring-primary"
-              />
-            </div>
-          )}
-
-          {/* Conteúdo com Scroll da Coluna Direita */}
-          <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-4">
-            {/* SEÇÃO: Roteiro Completo Unificado da Página */}
-            <div className="rounded-lg border border-border bg-card p-3.5 flex flex-col gap-2">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold text-foreground">
-                  Roteiro Contínuo da Página ({activeProfile.name})
-                </span>
-                <span className="text-[10px] text-muted-foreground">
-                  Edição sincronizada com os quadros
-                </span>
-              </div>
-              <textarea
-                rows={3}
-                value={activeProfile.fullScriptText || ''}
-                onChange={(e) => handleFullScriptTextChange(e.target.value)}
-                placeholder="Texto narrativo completo desta página..."
-                className="w-full bg-background text-foreground text-xs p-2.5 rounded border border-border focus:outline-none focus:ring-1 focus:ring-primary resize-y leading-relaxed"
-              />
-            </div>
-
-            {/* SEÇÃO: Cards de Roteiro por Quadro (Snippets) */}
-            <div className="flex flex-col gap-3">
-              <span className="text-xs font-bold text-foreground">
-                Trechos por Quadro (Timeline de Narração)
-              </span>
-
-              {currentPageFrames.map((frame, idx) => {
-                const color = SOM_PALETTE[idx % SOM_PALETTE.length];
-                const snippet = activeProfile.snippetsByFrameId[frame.id] || '';
-                const isSelected = selectedFrameId === frame.id;
-
-                return (
-                  <div
-                    key={frame.id}
-                    ref={(el) => {
-                      frameCardRefs.current[frame.id] = el;
-                    }}
-                    onClick={() => setSelectedFrameId(frame.id)}
-                    className={`rounded-lg border p-3 flex flex-col gap-2 bg-card transition-all ${
-                      isSelected
-                        ? 'border-primary ring-1 ring-primary shadow-md'
-                        : 'border-border hover:border-border/80'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <span
-                          className="w-2.5 h-2.5 rounded-full"
-                          style={{ backgroundColor: color.border }}
-                        />
-                        <span className="text-xs font-bold text-foreground">
-                          {frame.label}
-                        </span>
-                      </div>
-
-                      <span className="text-[10px] text-muted-foreground">
-                        {frame.duration?.toFixed(1) || '3.5'}s
-                      </span>
-                    </div>
-
-                    <textarea
-                      rows={2}
-                      value={snippet}
-                      onChange={(e) => handleFrameSnippetChange(frame.id, e.target.value)}
-                      placeholder={`Narração específica para o ${frame.label}...`}
-                      className="w-full bg-background text-foreground text-xs p-2 rounded border border-border focus:outline-none focus:ring-1 focus:ring-primary resize-y leading-relaxed"
-                    />
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* FOOTER BAR: Navegação entre Telas */}
-      <div className="h-14 border-t border-border bg-card px-4 flex items-center justify-between shrink-0">
-        <button
-          onClick={() => onNavigateTab('recorte')}
-          className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-md border border-border bg-secondary hover:bg-secondary/80 text-foreground text-xs font-semibold transition-colors cursor-pointer"
+        <div
+          onPointerDown={handleRightResizeStart}
+          className="w-1.5 hover:w-2 bg-transparent hover:bg-primary/50 cursor-col-resize transition-all shrink-0 z-10 select-none group flex items-center justify-center"
+          title="Arrastar para redimensionar barra lateral de roteiro"
         >
-          <ArrowLeft className="h-3.5 w-3.5" />
-          <span>Voltar ao Recorte</span>
-        </button>
-
-        <div className="flex items-center gap-3">
-          <span className="text-xs text-muted-foreground hidden sm:inline">
-            Perfil ativo: <strong className="text-foreground">{activeProfile.name}</strong>
-          </span>
-          <button
-            onClick={handleProceedToNarration}
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-primary hover:bg-primary/90 text-primary-foreground text-xs font-bold shadow transition-colors cursor-pointer"
-          >
-            <span>Avançar para Narração</span>
-            <ArrowRight className="h-3.5 w-3.5" />
-          </button>
+          <div className="w-[1px] h-8 bg-white/20 group-hover:bg-primary" />
         </div>
+
+        {/* ======================================================== */}
+        {/* BARRA LATERAL DIREITA: Roteiro Geral da Página           */}
+        {/* ======================================================== */}
+        <aside
+          style={{ width: `${rightSidebarWidth}px` }}
+          className="shrink-0 h-full border-l border-border bg-card/60 flex flex-col overflow-hidden select-none"
+        >
+          {/* Cabeçalho da Sidebar Direita */}
+          <div className="p-3 border-b border-border bg-card/40 flex items-center justify-between shrink-0 gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <ScrollText className="h-4 w-4 text-primary shrink-0" />
+              <span className="text-xs font-bold text-foreground truncate">
+                Roteiro (Pág. {currentPageNumber})
+              </span>
+            </div>
+            <span className="text-[10px] font-medium px-2 py-0.5 rounded-full border bg-primary/10 text-primary border-primary/30 truncate shrink-0 max-w-[120px]">
+              {activeProfile.name}
+            </span>
+          </div>
+
+          {/* Subheader / Ações de Distribuição e Métricas */}
+          <div className="px-3 py-2 border-b border-border/40 bg-secondary/20 flex items-center justify-between shrink-0 text-[11px]">
+            <span className="font-mono text-muted-foreground">
+              {pageWordCount} pal. · ~{pageEstimatedSec}s
+            </span>
+            <button
+              type="button"
+              onClick={() => handleDistributeToFrames()}
+              className="font-semibold text-primary hover:underline cursor-pointer flex items-center gap-1 transition-colors"
+              title="Distribuir o texto geral proporcionalmente entre os quadros da página"
+            >
+              <Sparkles className="h-3 w-3" />
+              <span>Distribuir</span>
+            </button>
+          </div>
+
+          {/* Editor do Roteiro Geral Contínuo da Página */}
+          <div className="flex-1 p-3 flex flex-col gap-2 overflow-hidden">
+            <textarea
+              value={activeProfile.fullScriptText || ''}
+              onChange={(e) => handleFullScriptTextChange(e.target.value)}
+              placeholder={`Digite a narração contínua da Página ${currentPageNumber}...\n\nOu use 'Gerar Pág. ${currentPageNumber}' na barra lateral esquerda para roteirizar via IA.`}
+              className="w-full flex-1 bg-background/80 text-foreground text-xs p-3 rounded-xl border border-border focus:outline-none focus:ring-1 focus:ring-primary resize-none leading-relaxed font-sans placeholder:text-muted-foreground/50 shadow-inner"
+            />
+          </div>
+
+          {/* Rodapé da Sidebar Direita */}
+          <div className="p-2.5 border-t border-border/50 bg-card/40 text-[10px] text-muted-foreground flex items-center justify-between shrink-0">
+            <span>{currentPageFrames.length} quadros na página</span>
+            <span className="font-mono opacity-80">Pág. {currentPageNumber} de {totalPages}</span>
+          </div>
+        </aside>
       </div>
+
+      {/* ======================================================== */}
+      {/* TIMELINE DE PÁGINAS FIXA NO FOOTER (ESTILO RECORTE)      */}
+      {/* ======================================================== */}
+      <footer className="h-[74px] shrink-0 border-t border-white/10 bg-[#14151e]/95 backdrop-blur-xl flex items-center px-4 z-20 select-none">
+        {totalPages > 0 && (
+          <div
+            onWheel={(e) => {
+              if (e.deltaY !== 0) {
+                e.currentTarget.scrollLeft += e.deltaY;
+              }
+            }}
+            className="w-full flex items-center gap-2 overflow-x-auto py-1 px-0.5 scrollbar-none"
+          >
+            {Array.from({ length: totalPages }).map((_, idx) => {
+              const pageNum = idx + 1;
+              const isSelected = pageNum === currentPageNumber;
+              const pageFramesCount = frames.filter(
+                (f) => (!f.chapterId || f.chapterId === currentChapterId) && Number(f.pageNumber) === pageNum
+              ).length;
+              const pageScriptKey = `${currentChapterId}_p${pageNum}`;
+              const hasScript = Boolean(
+                pageScripts[pageScriptKey]?.profiles?.some(
+                  (p) => p.fullScriptText?.trim() || Object.values(p.snippetsByFrameId || {}).some((s) => s?.trim())
+                )
+              );
+              const thumbUrl = chapterThumbnails[pageNum];
+
+              return (
+                <button
+                  key={pageNum}
+                  ref={isSelected ? activeThumbRef : null}
+                  onClick={() => onSelectPage(pageNum)}
+                  className={`group relative h-[60px] w-[40px] shrink-0 overflow-hidden rounded-lg border transition-all cursor-pointer ${
+                    isSelected
+                      ? 'border-primary ring-2 ring-primary/60 scale-105 shadow-md shadow-primary/25 z-10'
+                      : 'border-white/10 opacity-70 hover:opacity-100 hover:border-white/30'
+                  }`}
+                  title={`Página ${pageNum} (${pageFramesCount} quadros${hasScript ? ', roteiro pronto' : ''})`}
+                >
+                  {thumbUrl ? (
+                    <img
+                      src={thumbUrl}
+                      alt={`Página ${pageNum}`}
+                      className="h-full w-full object-cover"
+                    />
+                  ) : (
+                    <div className="h-full w-full bg-white/[0.04] flex items-center justify-center">
+                      <span className="text-[10px] font-mono font-medium text-muted-foreground/60">{pageNum}</span>
+                    </div>
+                  )}
+                  {pageFramesCount > 0 && (
+                    <span className="absolute top-0.5 right-0.5 bg-primary text-primary-foreground text-[8px] font-bold px-1 rounded shadow-xs leading-tight">
+                      {pageFramesCount}
+                    </span>
+                  )}
+                  {hasScript && (
+                    <span className="absolute right-0.5 bottom-0.5 grid h-3.5 w-3.5 place-items-center rounded-full bg-emerald-500 shadow-xs">
+                      <Check className="h-2 w-2 text-white" />
+                    </span>
+                  )}
+                  <span className="absolute top-0.5 left-0.5 bg-black/85 text-[8.5px] font-mono px-1 rounded text-white leading-tight">
+                    {pageNum}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </footer>
 
       {/* ======================================================== */}
       {/* DRAWER LATERAL: Metadados da Obra & Personagens          */}

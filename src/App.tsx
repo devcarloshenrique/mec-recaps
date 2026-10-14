@@ -851,57 +851,6 @@ export default function App() {
     ? `${currentChapter.label} · página ${currentPageNumber} de ${Math.max(1, currentChapter.pages)}`
     : 'Nenhum capítulo carregado — importe uma pasta para começar';
 
-  const persistenceControlsNode = (
-    <div className="flex items-center gap-1.5 sm:gap-2">
-      {/* Auto-save status badge */}
-      {saveStatus === 'saving' && (
-        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-card/80 text-[11px] font-medium text-cyan-400 border border-cyan-400/20 shadow-sm animate-pulse">
-          <RefreshCw className="h-3 w-3 animate-spin text-cyan-400" />
-          <span className="hidden sm:inline">Salvando...</span>
-        </span>
-      )}
-      {saveStatus === 'saved' && (
-        <span
-          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-500/10 text-[11px] font-semibold text-emerald-400 border border-emerald-500/20 shadow-sm"
-          title={`Salvo no IndexedDB às ${new Date(lastSavedAt || Date.now()).toLocaleTimeString()}`}
-        >
-          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_6px_#34d399]" />
-          <span className="hidden md:inline">Salvo no IndexedDB</span>
-        </span>
-      )}
-      {saveStatus === 'error' && (
-        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-rose-500/10 text-[11px] font-semibold text-rose-400 border border-rose-500/20 shadow-sm">
-          <AlertCircle className="h-3 w-3 text-rose-400" />
-          <span className="hidden sm:inline">Erro ao Salvar</span>
-        </span>
-      )}
-
-      {/* Manual Save Button (Outline Pro style from reference) */}
-      <button
-        type="button"
-        onClick={handleManualSave}
-        className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-card/80 px-2.5 py-1.5 text-xs font-semibold hover:bg-white/[0.06] hover:border-white/20 cursor-pointer text-white shadow-sm transition-all"
-        title="Salvar alterações no IndexedDB agora"
-      >
-        <Save className="h-3.5 w-3.5 text-cyan-400" />
-        <span className="hidden lg:inline">Salvar</span>
-      </button>
-
-      {/* Clear / New Project Button */}
-      {(chapters.length > 0 || frames.length > 0) && (
-        <button
-          type="button"
-          onClick={() => setIsConfirmClearModalOpen(true)}
-          className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-card/60 px-2.5 py-1.5 text-xs font-semibold hover:bg-rose-500/10 hover:text-rose-400 hover:border-rose-500/30 cursor-pointer text-muted-foreground transition-all shadow-sm"
-          title="Limpar projeto atual e começar do zero no IndexedDB"
-        >
-          <Trash2 className="h-3.5 w-3.5" />
-          <span className="hidden lg:inline">Novo Projeto</span>
-        </button>
-      )}
-    </div>
-  );
-
   let actionsNode: React.ReactNode = null;
 
   if (currentTab === 'recorte') {
@@ -913,11 +862,7 @@ export default function App() {
   } else if (currentTab === 'roteiro') {
     title = '2. Roteiro e Contexto';
     subtitle = `${currentChapter.label} · página ${currentPageNumber} de ${Math.max(1, currentChapter.pages)} · Fase 1 (Visão 1x) & Fase 2 (Perfis de Roteiro)`;
-    actionsNode = (
-      <div className="flex items-center gap-2">
-        {persistenceControlsNode}
-      </div>
-    );
+    actionsNode = null;
   } else if (currentTab === 'narracao') {
     const chaptersWithCuts = chapters.filter((ch) =>
       frames.some((f) => f.chapterId === ch.id)
@@ -931,18 +876,12 @@ export default function App() {
       pagesWithCutsCount > 0
         ? `${pagesWithCutsCount} páginas com recortes · ${frames.length} cenas em ${chaptersWithCuts.length} capítulo(s)`
         : 'Recorte quadros no Capítulo para gerar a narração';
-    actionsNode = (
-      <div className="flex items-center gap-2">
-        {persistenceControlsNode}
-      </div>
-    );
+    actionsNode = null;
   } else if (currentTab === 'montagem') {
     title = '4. Montagem e timeline';
     subtitle = `${frames.length} quadros na timeline · ${scenes.length} cenas`;
     actionsNode = (
       <div className="flex items-center gap-2">
-        {persistenceControlsNode}
-
         <button
           onClick={() => setIsExportModalOpen(true)}
           className="inline-flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-sm font-medium hover:bg-secondary cursor-pointer"
@@ -994,7 +933,7 @@ export default function App() {
         title={title}
         subtitle={subtitle}
         centerContent={
-          currentTab === 'recorte' && currentChapter ? (
+          (currentTab === 'recorte' || currentTab === 'roteiro') && currentChapter ? (
             <div className="flex items-center gap-2">
               {/* Seletor de Capítulo (abre gaveta de capítulos) */}
               <button
