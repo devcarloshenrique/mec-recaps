@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   Play,
   Pause,
@@ -363,7 +363,7 @@ export const MontagemView: React.FC<MontagemViewProps> = ({
   };
 
   // Sort frames strictly in natural chronological order (Chapter 1 -> 2; Page 1 -> 2; Frame 1 -> 2)
-  const handleSortChronologically = () => {
+  const handleSortChronologically = useCallback(() => {
     if (!onReorderFrames) return;
     const chapterOrderMap = new Map(chapters.map((ch, idx) => [ch.id, idx]));
     const sorted = [...frames].sort((a, b) => {
@@ -371,14 +371,42 @@ export const MontagemView: React.FC<MontagemViewProps> = ({
       const chB = chapterOrderMap.has(b.chapterId || '') ? chapterOrderMap.get(b.chapterId || '')! : 999;
       if (chA !== chB) return chA - chB;
 
-      const pageA = a.pageNumber || 0;
-      const pageB = b.pageNumber || 0;
+      const pageA = Number(a.pageNumber) || 0;
+      const pageB = Number(b.pageNumber) || 0;
       if (pageA !== pageB) return pageA - pageB;
 
       return a.label.localeCompare(b.label, undefined, { numeric: true, sensitivity: 'base' });
     });
     onReorderFrames(sorted);
-  };
+  }, [chapters, frames, onReorderFrames]);
+
+  // Auto-sort frames chronologically if any pages are detected out of sequence
+  useEffect(() => {
+    if (!onReorderFrames || frames.length < 2) return;
+    const chapterOrderMap = new Map(chapters.map((ch, idx) => [ch.id, idx]));
+    let needsSort = false;
+    for (let i = 0; i < frames.length - 1; i++) {
+      const cur = frames[i];
+      const nxt = frames[i + 1];
+      const chCur = chapterOrderMap.has(cur.chapterId || '') ? chapterOrderMap.get(cur.chapterId || '')! : 999;
+      const chNxt = chapterOrderMap.has(nxt.chapterId || '') ? chapterOrderMap.get(nxt.chapterId || '')! : 999;
+      if (chCur > chNxt) {
+        needsSort = true;
+        break;
+      }
+      if (chCur === chNxt) {
+        const pCur = Number(cur.pageNumber) || 0;
+        const pNxt = Number(nxt.pageNumber) || 0;
+        if (pCur > pNxt) {
+          needsSort = true;
+          break;
+        }
+      }
+    }
+    if (needsSort) {
+      handleSortChronologically();
+    }
+  }, [frames, chapters, handleSortChronologically, onReorderFrames]);
 
   // Build consecutive Chapter and Page Groupers from timeline frames
   const chapterGroups: ChapterGroup[] = [];
@@ -388,7 +416,7 @@ export const MontagemView: React.FC<MontagemViewProps> = ({
     const f = frames[idx];
     const chId = f.chapterId || 'default_ch';
     const chLabel = (f.chapterId && chapterMap.get(f.chapterId)?.label) || 'Capítulo 01';
-    const pNum = f.pageNumber || 1;
+    const pNum = Number(f.pageNumber) || 1;
     const dur = f.duration || 4;
 
     let lastChapter = chapterGroups[chapterGroups.length - 1];
@@ -408,7 +436,7 @@ export const MontagemView: React.FC<MontagemViewProps> = ({
     lastChapter.totalFrames += 1;
 
     let lastPage = lastChapter.pageGroups[lastChapter.pageGroups.length - 1];
-    if (!lastPage || lastPage.pageNumber !== pNum) {
+    if (!lastPage || Number(lastPage.pageNumber) !== pNum) {
       lastPage = {
         chapterId: chId,
         chapterLabel: chLabel,
@@ -1169,8 +1197,9 @@ export const MontagemView: React.FC<MontagemViewProps> = ({
                       <div
                         key={`page_grp_${pGroup.chapterId}_p${pGroup.pageNumber}_${pIdx}`}
                         style={{ width: `${Math.max(50, widthPx)}px` }}
-                        className="h-6 shrink-0 rounded border border-blue-500/25 bg-blue-500/10 px-2 flex items-center justify-between text-[11px] font-semibold text-blue-300 shadow-xs overflow-hidden"
-                        title={`${pGroup.chapterLabel} — Página ${pGroup.pageNumber}: ${pGroup.frames.length} cenas (${pGroup.duration}s)`}
+                        onClick={() => setCurrentTime(pGroup.startTime)}
+                        className="h-6 shrink-0 rounded border border-blue-500/25 bg-blue-500/10 px-2 flex items-center justify-between text-[11px] font-semibold text-blue-300 shadow-xs overflow-hidden cursor-pointer hover:bg-blue-500/25 transition-colors"
+                        title={`${pGroup.chapterLabel} — Página ${pGroup.pageNumber}: ${pGroup.frames.length} cenas (${pGroup.duration}s) · Clique para ir à página`}
                       >
                         <span className="truncate">Pág {pGroup.pageNumber}</span>
                         <span className="text-[9px] font-mono opacity-80 shrink-0 ml-1">
@@ -1353,9 +1382,9 @@ export const MontagemView: React.FC<MontagemViewProps> = ({
                     const pageScene =
                       scenes.find(
                         (s) =>
-                          (s.chapterId && s.chapterId === pGroup.chapterId && s.pageNumber && s.pageNumber === pGroup.pageNumber) ||
+                          (s.chapterId && s.chapterId === pGroup.chapterId && s.pageNumber && Number(s.pageNumber) === Number(pGroup.pageNumber)) ||
                           s.frames?.some((sf) => pGroup.frames.some((pf) => pf.id === sf.id))
-                      ) || scenes.find((s) => s.pageNumber === pGroup.pageNumber);
+                      ) || scenes.find((s) => Number(s.pageNumber) === Number(pGroup.pageNumber));
 
                     const clipAudioUrl =
                       pageScene?.audioUrl ||

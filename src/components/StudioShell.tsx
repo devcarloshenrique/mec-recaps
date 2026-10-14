@@ -30,6 +30,7 @@ export interface StudioShellProps {
   onTabChange: (tab: StudioTab) => void;
   title: string;
   subtitle: string;
+  centerContent?: React.ReactNode;
   actions?: React.ReactNode;
   onExportClick?: () => void;
   onNewProject?: () => void;
@@ -53,6 +54,7 @@ export const StudioShell: React.FC<StudioShellProps> = ({
   onTabChange,
   title,
   subtitle,
+  centerContent,
   actions,
   onExportClick,
   onNewProject,
@@ -648,61 +650,22 @@ export const StudioShell: React.FC<StudioShellProps> = ({
             </div>
           </div>
 
-          {/* Center: Current Document / Chapter Status Indicator (Photoshop title strip) */}
-          <div className="hidden lg:flex items-center gap-2 px-3 py-1 rounded-md bg-white/[0.03] border border-white/10 text-xs font-mono text-muted-foreground max-w-[450px]">
-            <span className="text-white font-semibold truncate">{title}</span>
-            <span className="text-white/20">|</span>
-            <span className="text-muted-foreground/80 text-[11px] truncate">{subtitle}</span>
-          </div>
+          {/* Center: Current Document / Chapter Status or Custom Content */}
+          {centerContent ? (
+            <div className="flex items-center justify-center min-w-0">
+              {centerContent}
+            </div>
+          ) : (
+            <div className="hidden lg:flex items-center gap-2 px-3 py-1 rounded-md bg-white/[0.03] border border-white/10 text-xs font-mono text-muted-foreground max-w-[450px]">
+              <span className="text-white font-semibold truncate">{title}</span>
+              <span className="text-white/20">|</span>
+              <span className="text-muted-foreground/80 text-[11px] truncate">{subtitle}</span>
+            </div>
+          )}
 
-          {/* Right: Auto-Save Status, Quick Save & Export Primary CTA */}
-          <div className="flex shrink-0 items-center gap-2 sm:gap-2.5">
-            {/* Auto-save status badge */}
-            {saveStatus === 'saving' && (
-              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-card/80 text-[11px] font-medium text-cyan-400 border border-cyan-400/20 shadow-sm animate-pulse">
-                <RefreshCw className="h-3 w-3 animate-spin text-cyan-400" />
-                <span className="hidden xl:inline">Salvando...</span>
-              </span>
-            )}
-            {saveStatus === 'saved' && (
-              <span
-                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-500/10 text-[11px] font-semibold text-emerald-400 border border-emerald-500/20 shadow-sm"
-                title={`Salvo no IndexedDB às ${new Date(lastSavedAt || Date.now()).toLocaleTimeString()}`}
-              >
-                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_6px_#34d399]" />
-                <span className="hidden xl:inline">Salvo no IndexedDB</span>
-              </span>
-            )}
-            {saveStatus === 'error' && (
-              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-rose-500/10 text-[11px] font-semibold text-rose-400 border border-rose-500/20 shadow-sm">
-                <AlertCircle className="h-3 w-3 text-rose-400" />
-                <span className="hidden xl:inline">Erro ao Salvar</span>
-              </span>
-            )}
-
-            {/* Quick Save Button */}
-            <button
-              type="button"
-              onClick={onSave}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-card/80 px-2.5 py-1 text-xs font-semibold hover:bg-white/[0.06] hover:border-white/20 cursor-pointer text-white shadow-sm transition-all"
-              title="Salvar alterações no IndexedDB agora (Ctrl+S)"
-            >
-              <Save className="h-3.5 w-3.5 text-cyan-400" />
-              <span className="hidden sm:inline">Salvar</span>
-            </button>
-
-            {/* Custom actions (if passed) */}
+          {/* Right: Custom actions (if any) or clean spacer */}
+          <div className="flex shrink-0 items-center gap-2">
             {actions}
-
-            {/* High-Contrast Primary CTA (Electric Cyan EXPORTAR Button) */}
-            <button
-              onClick={onExportClick}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-gradient-to-r from-cyan-400 via-teal-300 to-emerald-400 px-3 py-1 sm:px-3.5 sm:py-1.5 text-xs font-bold text-slate-950 shadow-lg shadow-cyan-500/20 transition-all hover:shadow-cyan-400/40 hover:brightness-110 active:scale-[0.98] cursor-pointer"
-              title="Exportar Vídeo / Renderizar (Ctrl+E)"
-            >
-              <Download className="h-3.5 w-3.5 stroke-[2.5]" />
-              <span className="tracking-tight uppercase">Exportar</span>
-            </button>
           </div>
         </header>
 

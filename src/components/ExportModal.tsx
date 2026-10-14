@@ -147,10 +147,23 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
     abortControllerRef.current = new AbortController();
 
+    const chapterOrderMap = new Map(chapters.map((ch, idx) => [ch.id, idx]));
+    const sortedFrames = [...frames].sort((a, b) => {
+      const chA = chapterOrderMap.has(a.chapterId || '') ? chapterOrderMap.get(a.chapterId || '')! : 999;
+      const chB = chapterOrderMap.has(b.chapterId || '') ? chapterOrderMap.get(b.chapterId || '')! : 999;
+      if (chA !== chB) return chA - chB;
+
+      const pageA = Number(a.pageNumber) || 0;
+      const pageB = Number(b.pageNumber) || 0;
+      if (pageA !== pageB) return pageA - pageB;
+
+      return a.label.localeCompare(b.label, undefined, { numeric: true, sensitivity: 'base' });
+    });
+
     try {
       const result = await exportRecap({
         format: selectedFormat,
-        frames,
+        frames: sortedFrames,
         scenes,
         chapters,
         resolution: selectedResolution,

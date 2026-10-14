@@ -39,15 +39,24 @@ import {
   Trash2,
   Database,
   RefreshCw,
+  ChevronLeft,
+  ChevronRight,
+  ChevronDown,
 } from 'lucide-react';
 
 const DEMO_CHAPTERS: ChapterItem[] = [
   {
     id: 'chap_demo_01',
     label: 'Capítulo 01 — O Covil das Sombras',
-    pages: 1,
+    pages: 5,
     done: 3,
-    imageUrls: ['/assets/page-01.jpg'],
+    imageUrls: [
+      '/assets/page-01.jpg',
+      '/assets/page-01.jpg',
+      '/assets/page-01.jpg',
+      '/assets/page-01.jpg',
+      '/assets/page-01.jpg',
+    ],
   },
 ];
 
@@ -60,7 +69,7 @@ const DEMO_FRAMES: FrameItem[] = [
     duration: 4,
     chapterId: 'chap_demo_01',
     pageNumber: 1,
-    panelId: 'panel_demo_1',
+    panelId: 'panel_demo_p1_1',
     cropRect: { x: 42, y: 70, width: 620, height: 349 },
   },
   {
@@ -71,7 +80,7 @@ const DEMO_FRAMES: FrameItem[] = [
     duration: 5,
     chapterId: 'chap_demo_01',
     pageNumber: 1,
-    panelId: 'panel_demo_2',
+    panelId: 'panel_demo_p1_2',
     cropRect: { x: 42, y: 470, width: 620, height: 349 },
   },
   {
@@ -82,7 +91,7 @@ const DEMO_FRAMES: FrameItem[] = [
     duration: 4,
     chapterId: 'chap_demo_01',
     pageNumber: 1,
-    panelId: 'panel_demo_3',
+    panelId: 'panel_demo_p1_3',
     cropRect: { x: 42, y: 870, width: 620, height: 349 },
   },
 ];
@@ -91,7 +100,7 @@ const DEMO_CHAPTER_PANELS: Record<string, Record<number, DetectedPanel[]>> = {
   chap_demo_01: {
     1: [
       {
-        id: 'panel_demo_1',
+        id: 'panel_demo_p1_1',
         x: 42,
         y: 70,
         width: 620,
@@ -103,7 +112,7 @@ const DEMO_CHAPTER_PANELS: Record<string, Record<number, DetectedPanel[]>> = {
         pageHeight: 1408,
       },
       {
-        id: 'panel_demo_2',
+        id: 'panel_demo_p1_2',
         x: 42,
         y: 470,
         width: 620,
@@ -115,7 +124,7 @@ const DEMO_CHAPTER_PANELS: Record<string, Record<number, DetectedPanel[]>> = {
         pageHeight: 1408,
       },
       {
-        id: 'panel_demo_3',
+        id: 'panel_demo_p1_3',
         x: 42,
         y: 870,
         width: 620,
@@ -123,6 +132,58 @@ const DEMO_CHAPTER_PANELS: Record<string, Record<number, DetectedPanel[]>> = {
         confidence: 0.97,
         algorithm: 'profile',
         label: 'Quadro 03',
+        pageWidth: 704,
+        pageHeight: 1408,
+      },
+    ],
+    2: [
+      {
+        id: 'panel_demo_p2_1',
+        x: 42,
+        y: 120,
+        width: 620,
+        height: 349,
+        confidence: 0.96,
+        algorithm: 'profile',
+        label: 'Quadro 01',
+        pageWidth: 704,
+        pageHeight: 1408,
+      },
+      {
+        id: 'panel_demo_p2_2',
+        x: 42,
+        y: 560,
+        width: 620,
+        height: 349,
+        confidence: 0.94,
+        algorithm: 'profile',
+        label: 'Quadro 02',
+        pageWidth: 704,
+        pageHeight: 1408,
+      },
+    ],
+    3: [
+      {
+        id: 'panel_demo_p3_1',
+        x: 42,
+        y: 80,
+        width: 620,
+        height: 349,
+        confidence: 0.97,
+        algorithm: 'profile',
+        label: 'Quadro 01',
+        pageWidth: 704,
+        pageHeight: 1408,
+      },
+      {
+        id: 'panel_demo_p3_2',
+        x: 42,
+        y: 520,
+        width: 620,
+        height: 349,
+        confidence: 0.95,
+        algorithm: 'profile',
+        label: 'Quadro 02',
         pageWidth: 704,
         pageHeight: 1408,
       },
@@ -180,6 +241,7 @@ export default function App() {
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
   const [isConfirmClearModalOpen, setIsConfirmClearModalOpen] = useState<boolean>(false);
+  const [isChaptersDrawerOpen, setIsChaptersDrawerOpen] = useState<boolean>(false);
   const folderInputRef = useRef<HTMLInputElement>(null);
 
   // Global Keyboard Shortcuts (Ctrl+S, Ctrl+O, Ctrl+E, Ctrl+N)
@@ -567,7 +629,21 @@ export default function App() {
       }
     });
 
-    setFrames((prev) => [...prev, ...newFrames]);
+    setFrames((prev) => {
+      const merged = [...prev, ...newFrames];
+      const chapterOrderMap = new Map(chapters.map((ch, idx) => [ch.id, idx]));
+      return merged.sort((a, b) => {
+        const chA = chapterOrderMap.has(a.chapterId || '') ? chapterOrderMap.get(a.chapterId || '')! : 999;
+        const chB = chapterOrderMap.has(b.chapterId || '') ? chapterOrderMap.get(b.chapterId || '')! : 999;
+        if (chA !== chB) return chA - chB;
+
+        const pageA = Number(a.pageNumber) || 0;
+        const pageB = Number(b.pageNumber) || 0;
+        if (pageA !== pageB) return pageA - pageB;
+
+        return a.label.localeCompare(b.label, undefined, { numeric: true, sensitivity: 'base' });
+      });
+    });
 
     // Aggregate counts by chapter in a single pass
     const countsByChapter = new Map<string, number>();
@@ -599,11 +675,11 @@ export default function App() {
       framesByPage.forEach((pageFrames) => {
         const sample = pageFrames[0];
         const chId = sample.chapterId || currentChapterId;
-        const pNum = sample.pageNumber || 1;
+        const pNum = Number(sample.pageNumber) || 1;
         const sceneId = `scene_${chId}_p${pNum}`;
 
         const existingIdx = updatedScenes.findIndex(
-          (s) => (s.chapterId === chId && s.pageNumber === pNum) || s.id === sceneId
+          (s) => (s.chapterId === chId && Number(s.pageNumber) === pNum) || s.id === sceneId
         );
 
         if (existingIdx >= 0) {
@@ -917,6 +993,48 @@ export default function App() {
         onTabChange={setCurrentTab}
         title={title}
         subtitle={subtitle}
+        centerContent={
+          currentTab === 'recorte' && currentChapter ? (
+            <div className="flex items-center gap-2">
+              {/* Seletor de Capítulo (abre gaveta de capítulos) */}
+              <button
+                type="button"
+                onClick={() => setIsChaptersDrawerOpen(true)}
+                className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-card/70 hover:bg-white/10 text-xs font-semibold text-white transition-colors cursor-pointer border border-white/10 shadow-xs"
+                title="Abrir gaveta de capítulos"
+              >
+                <FolderUp className="h-3.5 w-3.5 text-primary shrink-0" />
+                <span className="truncate max-w-[130px] font-display text-[11px]">{currentChapter.label}</span>
+                <ChevronDown className="h-3 w-3 text-muted-foreground shrink-0" />
+              </button>
+
+              {/* Navegação de Página Compacta */}
+              <div className="flex items-center gap-1 bg-black/50 border border-white/10 rounded-lg px-2 py-0.5 text-xs font-mono shadow-xs">
+                <button
+                  type="button"
+                  onClick={() => setCurrentPageNumber(Math.max(1, currentPageNumber - 1))}
+                  disabled={currentPageNumber <= 1}
+                  className="p-1 rounded hover:bg-white/10 disabled:opacity-30 cursor-pointer text-muted-foreground hover:text-white transition-colors"
+                  title="Página anterior (Seta Esquerda)"
+                >
+                  <ChevronLeft className="h-3.5 w-3.5" />
+                </button>
+                <span className="px-1.5 font-bold text-[11px] text-white">
+                  {currentPageNumber} <span className="text-muted-foreground font-normal">/ {Math.max(1, currentChapter.pages)}</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setCurrentPageNumber(Math.min(currentChapter.pages, currentPageNumber + 1))}
+                  disabled={currentPageNumber >= currentChapter.pages}
+                  className="p-1 rounded hover:bg-white/10 disabled:opacity-30 cursor-pointer text-muted-foreground hover:text-white transition-colors"
+                  title="Próxima página (Seta Direita)"
+                >
+                  <ChevronRight className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
+          ) : undefined
+        }
         actions={actionsNode}
         onExportClick={() => setIsExportModalOpen(true)}
         onNewProject={() => setIsConfirmClearModalOpen(true)}
@@ -940,12 +1058,15 @@ export default function App() {
           onAddFramesBatch={handleAddFramesBatch}
           onRemoveFrame={handleRemoveFrame}
           onUpdateFrame={handleUpdateFrame}
+          onReorderFrames={handleReorderFrames}
           onUploadFolder={handleUploadFolder}
           onDeleteChapter={handleDeleteChapter}
           onDeleteChapters={handleDeleteChapters}
           onClearAllChapters={handleClearAllChapters}
           onSortChapters={handleSortChapters}
           onAddChapter={handleAddChapter}
+          isChaptersDrawerOpen={isChaptersDrawerOpen}
+          onToggleChaptersDrawer={setIsChaptersDrawerOpen}
         />
       </div>
 

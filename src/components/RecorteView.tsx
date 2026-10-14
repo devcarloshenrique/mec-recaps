@@ -22,6 +22,8 @@ import {
   Grid,
   RotateCw,
   Plus,
+  Focus,
+  GripVertical,
   Keyboard,
   HelpCircle,
   AlertTriangle,
@@ -30,6 +32,8 @@ import {
   CheckSquare,
   Square,
   RotateCcw,
+  Undo2,
+  Redo2,
   Wand2,
   Layers,
   Loader2,
@@ -75,6 +79,7 @@ interface RecorteViewProps {
   onAddFramesBatch?: (frames: FrameItem[]) => void;
   onRemoveFrame: (id: string) => void;
   onUpdateFrame?: (id: string, partial: Partial<FrameItem>) => void;
+  onReorderFrames?: (frames: FrameItem[]) => void;
   onUploadFolder: (files: FileList | File[]) => void;
   onDeleteChapter?: (id: string) => boolean | void;
   onDeleteChapters?: (ids: string[]) => void;
@@ -83,6 +88,8 @@ interface RecorteViewProps {
   onAddChapter?: (files?: FileList | File[]) => void;
   chapterPanels?: Record<string, Record<number, DetectedPanel[]>>;
   onUpdateChapterPanels?: React.Dispatch<React.SetStateAction<Record<string, Record<number, DetectedPanel[]>>>>;
+  isChaptersDrawerOpen?: boolean;
+  onToggleChaptersDrawer?: (open: boolean) => void;
 }
 
 const RATIOS: AspectRatio[] = ['16:9', '9:16', '1:1', '4:3', 'Livre'];
@@ -124,6 +131,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
   onAddFramesBatch,
   onRemoveFrame,
   onUpdateFrame,
+  onReorderFrames,
   onUploadFolder,
   onDeleteChapter,
   onDeleteChapters,
@@ -132,6 +140,8 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
   onAddChapter,
   chapterPanels: propChapterPanels,
   onUpdateChapterPanels,
+  isChaptersDrawerOpen: propIsChaptersDrawerOpen,
+  onToggleChaptersDrawer,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
@@ -157,8 +167,14 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
   const [isBulkSelectMode, setIsBulkSelectMode] = useState<boolean>(false);
   const [selectedChapterIds, setSelectedChapterIds] = useState<Set<string>>(new Set());
   const [isClearAllModalOpen, setIsClearAllModalOpen] = useState<boolean>(false);
-  const [isChaptersDrawerOpen, setIsChaptersDrawerOpen] = useState<boolean>(false);
+  const [internalIsChaptersDrawerOpen, setInternalIsChaptersDrawerOpen] = useState<boolean>(false);
+  const isChaptersDrawerOpen = propIsChaptersDrawerOpen !== undefined ? propIsChaptersDrawerOpen : internalIsChaptersDrawerOpen;
+  const setIsChaptersDrawerOpen = onToggleChaptersDrawer || setInternalIsChaptersDrawerOpen;
   const [inspectorTab, setInspectorTab] = useState<'manual' | 'auto'>('manual');
+  const [isClearMenuOpen, setIsClearMenuOpen] = useState<boolean>(false);
+  const [isTimelineClearMenuOpen, setIsTimelineClearMenuOpen] = useState<boolean>(false);
+  const [draggedSidebarIndex, setDraggedSidebarIndex] = useState<number | null>(null);
+  const [dragOverSidebarIndex, setDragOverSidebarIndex] = useState<number | null>(null);
 
   // Floating Properties Panel States (Photoshop / Figma HUD style - Only opens when user activates)
   const [isPropertiesOpen, setIsPropertiesOpen] = useState<boolean>(false);
@@ -234,11 +250,64 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
   const [zoomLevel, setZoomLevel] = useState<number>(100);
   const [isFullWidthMode, setIsFullWidthMode] = useState<boolean>(true);
 
+  // Auto-focus crop box tool with margin framing (toggleable on/off)
+  const [isCropFocusActive, setIsCropFocusActive] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('recap_crop_focus_active') === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('recap_crop_focus_active', String(isCropFocusActive));
+    } catch {
+      // ignore
+    }
+  }, [isCropFocusActive]);
+
   // Natural image dimensions
   const [naturalDimensions, setNaturalDimensions] = useState<{ width: number; height: number }>({
     width: 704,
     height: 1408,
   });
+
+  // Multi-page side-by-side view (user configurable, no limit)
+  const [pagesPerView, setPagesPerView] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('recap_pages_per_view');
+      return saved ? Math.max(1, parseInt(saved, 10)) : 3;
+    } catch {
+      return 3;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('recap_pages_per_view', String(pagesPerView));
+    } catch {
+      // ignore
+    }
+  }, [pagesPerView]);
+
+  // Map of image elements by page number for accurate natural dimension calculations
+  const pageImageRefs = useRef<Map<number, HTMLImageElement>>(new Map());
+  const [pageDimensions, setPageDimensions] = useState<Record<number, { width: number; height: number }>>({});
+
+  // Which page is currently being drawn or edited with Tool C
+  const [drawingTargetPage, setDrawingTargetPage] = useState<number | null>(null);
+  const drawingTargetPageRef = useRef<number | null>(null);
+
+  // Visual drawing rectangle in viewport coordinates (allows drawing freely outside image boundaries)
+  const [drawingVisualRect, setDrawingVisualRect] = useState<{
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+    clampedW: number;
+    clampedH: number;
+  } | null>(null);
 
   // Normalized crop box in NATURAL IMAGE PIXELS
   const [cropBox, setCropBox] = useState<CropRect>({
@@ -250,6 +319,109 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
 
   // Selected / Active panel ID from detectedPanels
   const [selectedPanelId, setSelectedPanelId] = useState<string | null>(null);
+
+  // Undo / Redo History Stack for Recorte (Ctrl+Z / Ctrl+Y)
+  const undoStackRef = useRef<{
+    chapterPanels: Record<string, Record<number, DetectedPanel[]>>;
+    cropBox: CropRect;
+    selectedPanelId: string | null;
+    currentPageNumber: number;
+  }[]>([]);
+  const redoStackRef = useRef<{
+    chapterPanels: Record<string, Record<number, DetectedPanel[]>>;
+    cropBox: CropRect;
+    selectedPanelId: string | null;
+    currentPageNumber: number;
+  }[]>([]);
+  const [canUndo, setCanUndo] = useState<boolean>(false);
+  const [canRedo, setCanRedo] = useState<boolean>(false);
+  const preDragSnapshotRef = useRef<{
+    chapterPanels: Record<string, Record<number, DetectedPanel[]>>;
+    cropBox: CropRect;
+    selectedPanelId: string | null;
+    currentPageNumber: number;
+  } | null>(null);
+
+  const pushUndoSnapshot = useCallback(
+    (override?: Partial<{
+      chapterPanels: Record<string, Record<number, DetectedPanel[]>>;
+      cropBox: CropRect;
+      selectedPanelId: string | null;
+      currentPageNumber: number;
+    }>) => {
+      const snap = {
+        chapterPanels: JSON.parse(JSON.stringify(chapterPanelsRef.current || {})),
+        cropBox: { ...cropBox },
+        selectedPanelId,
+        currentPageNumber,
+        ...override,
+      };
+      undoStackRef.current.push(snap);
+      if (undoStackRef.current.length > 40) {
+        undoStackRef.current.shift();
+      }
+      redoStackRef.current = [];
+      setCanUndo(true);
+      setCanRedo(false);
+    },
+    [cropBox, selectedPanelId, currentPageNumber]
+  );
+
+  const handleUndo = useCallback(() => {
+    if (undoStackRef.current.length === 0) {
+      showToast('Nenhuma ação para desfazer');
+      return;
+    }
+    const prevSnap = undoStackRef.current.pop()!;
+
+    const currentSnap = {
+      chapterPanels: JSON.parse(JSON.stringify(chapterPanelsRef.current || {})),
+      cropBox: { ...cropBox },
+      selectedPanelId,
+      currentPageNumber,
+    };
+    redoStackRef.current.push(currentSnap);
+
+    setChapterPanels(prevSnap.chapterPanels);
+    chapterPanelsRef.current = prevSnap.chapterPanels;
+    setCropBox(prevSnap.cropBox);
+    setSelectedPanelId(prevSnap.selectedPanelId);
+    if (prevSnap.currentPageNumber !== currentPageNumber) {
+      onSelectPageNumber(prevSnap.currentPageNumber);
+    }
+
+    setCanUndo(undoStackRef.current.length > 0);
+    setCanRedo(true);
+    showToast('↩️ Desfazer (Ctrl+Z) aplicado');
+  }, [cropBox, selectedPanelId, currentPageNumber, onSelectPageNumber, setChapterPanels]);
+
+  const handleRedo = useCallback(() => {
+    if (redoStackRef.current.length === 0) {
+      showToast('Nenhuma ação para refazer');
+      return;
+    }
+    const nextSnap = redoStackRef.current.pop()!;
+
+    const currentSnap = {
+      chapterPanels: JSON.parse(JSON.stringify(chapterPanelsRef.current || {})),
+      cropBox: { ...cropBox },
+      selectedPanelId,
+      currentPageNumber,
+    };
+    undoStackRef.current.push(currentSnap);
+
+    setChapterPanels(nextSnap.chapterPanels);
+    chapterPanelsRef.current = nextSnap.chapterPanels;
+    setCropBox(nextSnap.cropBox);
+    setSelectedPanelId(nextSnap.selectedPanelId);
+    if (nextSnap.currentPageNumber !== currentPageNumber) {
+      onSelectPageNumber(nextSnap.currentPageNumber);
+    }
+
+    setCanUndo(true);
+    setCanRedo(redoStackRef.current.length > 0);
+    showToast('↪️ Refazer (Ctrl+Y) aplicado');
+  }, [cropBox, selectedPanelId, currentPageNumber, onSelectPageNumber, setChapterPanels]);
 
   // Live drawing rectangle when dragging with tool C
   const [drawingBox, setDrawingBox] = useState<CropRect | null>(null);
@@ -314,6 +486,18 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
   };
 
   const currentImageUrl = getPageUrl(currentPageNumber);
+
+  // Compute visible pages for multi-page view (no limit on pages count)
+  const visiblePageNumbers = useMemo(() => {
+    const total = Math.max(1, currentChapter.pages || 1);
+    const count = Math.max(1, pagesPerView);
+    const start = Math.floor((currentPageNumber - 1) / count) * count + 1;
+    const list: number[] = [];
+    for (let p = start; p < start + count && p <= total; p++) {
+      list.push(p);
+    }
+    return list.length > 0 ? list : [currentPageNumber];
+  }, [currentPageNumber, pagesPerView, currentChapter.pages]);
 
   // Progressive hydration of low-res proxy thumbnails (80x128px, ~2.5KB each)
   const [chapterThumbnails, setChapterThumbnails] = useState<Record<number, string>>({});
@@ -445,6 +629,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       height: number;
       x: number;
       y: number;
+      pageNum: number;
     };
 
     const items: UnifiedItem[] = detectedPanels.map((dp, idx) => {
@@ -479,11 +664,23 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
 
       if (matchingFrame) {
         matchedFrameIds.add(matchingFrame.id);
+        // Mark any redundant duplicate frames matching this same panel so they don't leak into the list
+        pageFrames.forEach((f) => {
+          if (f.panelId && (f.panelId === dp.id || f.panelId === matchingFrame.panelId)) {
+            matchedFrameIds.add(f.id);
+          }
+          if (dp.label && f.label && dp.label.split(/[·\-\(]/)[0].trim() === f.label.split(/[·\-\(]/)[0].trim()) {
+            matchedFrameIds.add(f.id);
+          }
+        });
       }
 
       const isCurr = dp.id === selectedPanelId;
-      const liveW = Math.round(isCurr ? cropBox.width : (matchingFrame?.cropRect?.width || dp.width));
-      const liveH = Math.round(isCurr ? cropBox.height : (matchingFrame?.cropRect?.height || dp.height));
+      // dp is the user's authoritative zone geometry (never overwritten by stale frame crops)
+      const liveW = Math.round(isCurr ? cropBox.width : dp.width);
+      const liveH = Math.round(isCurr ? cropBox.height : dp.height);
+      const liveX = Math.round(isCurr ? cropBox.x : dp.x);
+      const liveY = Math.round(isCurr ? cropBox.y : dp.y);
       const liveRatio = liveW && liveH ? getClosestAspectRatio(liveW, liveH) : null;
 
       return {
@@ -498,28 +695,36 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
         ratio: matchingFrame?.ratio || liveRatio,
         width: liveW,
         height: liveH,
-        x: Math.round(isCurr ? cropBox.x : (matchingFrame?.cropRect?.x ?? dp.x)),
-        y: Math.round(isCurr ? cropBox.y : (matchingFrame?.cropRect?.y ?? dp.y)),
+        x: liveX,
+        y: liveY,
+        pageNum: currentPageNumber,
       };
     });
 
-    // Add any pageFrames that were cropped manually without an existing detectedPanel
-    pageFrames.forEach((f, idx) => {
+    // Add any pageFrames that were cropped manually without an existing detectedPanel (deduplicated)
+    const seenFrameLabels = new Set<string>();
+    pageFrames.forEach((f) => {
       if (!matchedFrameIds.has(f.id)) {
+        const cleanL = (f.label || '').trim();
+        if (cleanL && seenFrameLabels.has(cleanL)) return;
+        if (cleanL) seenFrameLabels.add(cleanL);
+        matchedFrameIds.add(f.id);
+
         items.push({
           id: f.id,
           panelId: null,
           frameId: f.id,
-          label: f.label || `Quadro ${String(items.length + idx + 1).padStart(2, '0')}`,
+          label: f.label || `Quadro ${String(items.length + 1).padStart(2, '0')}`,
           panel: null,
           frame: f,
           isCropped: true,
           src: f.src,
-          ratio: f.ratio || null,
-          width: Math.round(f.cropRect?.width || 0),
-          height: Math.round(f.cropRect?.height || 0),
+          ratio: f.ratio,
+          width: Math.round(f.cropRect?.width || 620),
+          height: Math.round(f.cropRect?.height || 349),
           x: Math.round(f.cropRect?.x || 0),
           y: Math.round(f.cropRect?.y || 0),
+          pageNum: f.pageNumber || currentPageNumber,
         });
       }
     });
@@ -552,17 +757,17 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
     [currentChapterId]
   );
 
-  // Synchronize active panel dimensions with chapterPanels
+  // Synchronize active panel dimensions with chapterPanels for any page
   const syncPanelCoords = useCallback(
-    (panelId: string, rect: CropRect) => {
+    (panelId: string, rect: CropRect, pageNum: number = currentPageNumber) => {
       setChapterPanels((prev) => {
         const chap = prev[currentChapterId] || {};
-        const pagePanels = chap[currentPageNumber] || [];
+        const pagePanels = chap[pageNum] || [];
         return {
           ...prev,
           [currentChapterId]: {
             ...chap,
-            [currentPageNumber]: pagePanels.map((p) =>
+            [pageNum]: pagePanels.map((p) =>
               p.id === panelId
                 ? { ...p, x: rect.x, y: rect.y, width: rect.width, height: rect.height }
                 : p
@@ -574,17 +779,89 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
     [currentChapterId, currentPageNumber]
   );
 
-  // Handle natural image load
-  const handleImageLoad = (e: React.SyntheticEvent<HTMLImageElement>) => {
+  // Reorder sidebar items via Drag and Drop
+  const handleReorderSidebarItems = (fromIndex: number, toIndex: number) => {
+    if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0) return;
+    if (fromIndex >= unifiedItems.length || toIndex >= unifiedItems.length) return;
+
+    pushUndoSnapshot();
+    const itemToMove = unifiedItems[fromIndex];
+    const targetItem = unifiedItems[toIndex];
+    if (!itemToMove) return;
+
+    // 1. Reorder in detectedPanels
+    const currentPanels = [...detectedPanels];
+    const pFrom = currentPanels.findIndex((p) => p.id === itemToMove.panelId || p.id === itemToMove.id);
+    const pTo = currentPanels.findIndex((p) => p.id === targetItem?.panelId || p.id === targetItem?.id);
+
+    if (pFrom !== -1 && pTo !== -1) {
+      const reorderedPanels = [...currentPanels];
+      const [movedPanel] = reorderedPanels.splice(pFrom, 1);
+      reorderedPanels.splice(pTo, 0, movedPanel);
+      setPageDetectedPanels(currentPageNumber, reorderedPanels);
+    }
+
+    // 2. Reorder in global frames if applicable
+    if (onReorderFrames && itemToMove.frameId) {
+      const allFrames = [...frames];
+      const fFrom = allFrames.findIndex((f) => f.id === itemToMove.frameId);
+      const fTo = targetItem?.frameId ? allFrames.findIndex((f) => f.id === targetItem.frameId) : -1;
+
+      if (fFrom !== -1 && fTo !== -1) {
+        const [movedFrame] = allFrames.splice(fFrom, 1);
+        allFrames.splice(fTo, 0, movedFrame);
+        onReorderFrames(allFrames);
+      }
+    }
+
+    showToast('↕️ Ordem dos quadros atualizada!');
+  };
+
+  // Delete a sidebar item directly
+  const handleDeleteSidebarItem = (item: { panelId?: string | null; frameId?: string | null; label: string; pageNum?: number }) => {
+    const pageNum = item.pageNum || currentPageNumber;
+    if (item.panelId) {
+      handleRemovePanel(item.panelId, pageNum);
+    }
+    if (item.frameId) {
+      onRemoveFrame(item.frameId);
+    }
+    showToast(`🗑️ ${item.label} excluído com sucesso`);
+  };
+
+  // Handle natural image load for a specific page in multi-page mode
+  const handlePageImageLoad = (pageNum: number, e: React.SyntheticEvent<HTMLImageElement>) => {
     const img = e.currentTarget;
     if (img.naturalWidth && img.naturalHeight) {
-      const natW = img.naturalWidth;
-      const natH = img.naturalHeight;
-      setNaturalDimensions({
-        width: natW,
-        height: natH,
-      });
+      setPageDimensions((prev) => ({
+        ...prev,
+        [pageNum]: { width: img.naturalWidth, height: img.naturalHeight },
+      }));
+      if (pageNum === currentPageNumber) {
+        setNaturalDimensions({
+          width: img.naturalWidth,
+          height: img.naturalHeight,
+        });
+      }
     }
+  };
+
+  // Sync active page dimensions when currentPageNumber changes
+  useEffect(() => {
+    const activeDim = pageDimensions[currentPageNumber];
+    if (activeDim && activeDim.width > 0) {
+      setNaturalDimensions(activeDim);
+    }
+    const imgEl = pageImageRefs.current.get(currentPageNumber);
+    if (imgEl && imgEl.naturalWidth > 0) {
+      (imageRef as any).current = imgEl;
+      setNaturalDimensions({ width: imgEl.naturalWidth, height: imgEl.naturalHeight });
+    }
+  }, [currentPageNumber, pageDimensions]);
+
+  // Handle natural image load (fallback)
+  const handleImageLoad = (e: React.SyntheticEvent<HTMLImageElement>) => {
+    handlePageImageLoad(currentPageNumber, e);
   };
 
   // Change Aspect Ratio and adapt current box
@@ -688,34 +965,36 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
     });
   };
 
-  // Fit to screen calculation: fits the full image from beginning to end
+  // Fit to screen calculation: fits all visible pages side-by-side from beginning to end
   const handleFitToScreen = () => {
     const vp = viewportRef.current;
-    const img = imageRef.current;
     if (!vp) return;
 
     const vpW = Math.max(100, vp.clientWidth - 48); // account for padding
     const vpH = Math.max(100, vp.clientHeight - 48);
 
-    const natW = img?.naturalWidth || naturalDimensions.width || 704;
-    const natH = img?.naturalHeight || naturalDimensions.height || 1408;
+    const activeDim = pageDimensions[currentPageNumber] || naturalDimensions;
+    const natW = activeDim.width || 704;
+    const natH = activeDim.height || 1408;
 
-    // At zoomLevel = 100%, image width is 440px and rendered height is 440 * (natH / natW)
-    const baseWidthAt100 = 440;
-    const baseHeightAt100 = baseWidthAt100 * (natH / natW);
+    const numPages = Math.max(1, visiblePageNumbers.length);
+    const baseWidthPerCol = 440;
+    // Total combined width at 100% zoom: width of columns + gap (32px between columns)
+    const totalBaseWidthAt100 = (numPages * baseWidthPerCol) + Math.max(0, (numPages - 1) * 32);
+    const baseHeightAt100 = baseWidthPerCol * (natH / natW);
 
     // Zoom needed to fit height completely
     const zoomToFitHeight = (vpH / baseHeightAt100) * 100;
-    // Zoom needed to fit width completely
-    const zoomToFitWidth = (vpW / baseWidthAt100) * 100;
+    // Zoom needed to fit total width completely
+    const zoomToFitWidth = (vpW / totalBaseWidthAt100) * 100;
 
-    // To see the entire image "do começo ao fim", both width AND height must fit within the viewport
+    // Both width AND height must fit within the viewport
     const fitZoom = Math.min(zoomToFitHeight, zoomToFitWidth);
-    const idealZoom = Math.max(5, Math.min(200, Math.round(fitZoom)));
+    const idealZoom = Math.max(5, Math.min(220, Math.round(fitZoom)));
 
     setZoomLevel(idealZoom);
     setPanOffset({ x: 0, y: 0 });
-    showToast(`Visão geral ajustada: ${idealZoom}%`);
+    showToast(`Visualização ajustada (${numPages} ${numPages === 1 ? 'página' : 'páginas'}): ${idealZoom}%`);
   };
 
   // Rotate canvas
@@ -724,43 +1003,85 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
     showToast(`Orientação girada em 90°`);
   };
 
-  // Focus viewport smoothly on a specific crop box
+  // Focus viewport smoothly on a specific crop box with optional auto-zoom and margin framing
   const focusCropBox = useCallback(
-    (box: { x?: number; y?: number; width?: number; height?: number }) => {
+    (
+      box: { x?: number; y?: number; width?: number; height?: number },
+      targetPage: number = currentPageNumber,
+      withZoom: boolean = false
+    ) => {
       const vp = viewportRef.current;
-      const imgContainer = imageContainerRef.current;
-      const img = imageRef.current;
-      if (!vp || !imgContainer || !img) return;
+      if (!vp) return;
 
-      const natW = img.naturalWidth || naturalDimensions.width || 704;
-      const natH = img.naturalHeight || naturalDimensions.height || 1408;
+      const imgEl = pageImageRefs.current.get(targetPage);
+      const pageDim = pageDimensions[targetPage] || naturalDimensions;
+      const natW = imgEl && imgEl.naturalWidth > 0 ? imgEl.naturalWidth : pageDim.width || naturalDimensions.width || 704;
+      const natH = imgEl && imgEl.naturalHeight > 0 ? imgEl.naturalHeight : pageDim.height || naturalDimensions.height || 1408;
 
-      const vpHeight = vp.clientHeight || 700;
-      const imgHeight = imgContainer.clientHeight || img.clientHeight || (natH * (((zoomLevel / 100) * 440) / natW));
-      const scaleY = imgHeight / natH;
+      const vpWidth = Math.max(200, vp.clientWidth);
+      const vpHeight = Math.max(200, vp.clientHeight);
 
       const boxY = typeof box.y === 'number' ? box.y : 0;
       const boxH = typeof box.height === 'number' && box.height > 0 ? box.height : Math.round(natH * 0.2);
-      const boxCenterYInImage = (boxY + boxH / 2) * scaleY;
 
-      // untranslatedTop is the top of image container relative to viewport (typically 24px from p-6)
-      const untranslatedTop = imgContainer.offsetTop || 0;
+      let effectiveZoom = zoomLevel;
 
-      // targetPanY centers boxCenterYInImage exactly in the middle of viewport
-      const targetPanY = (vpHeight / 2) - untranslatedTop - boxCenterYInImage;
+      if (withZoom) {
+        // Enquadramento: o quadro ocupa ~55% da altura da tela,
+        // garantindo ~22.5% de folga acima e abaixo para visualização de contexto e ajustes finos
+        const targetCoverage = 0.55;
+        const desiredRenderedH = vpHeight * targetCoverage;
+        const scaleFromHeight = desiredRenderedH / Math.max(20, boxH);
+
+        // Limite para que a largura também não transborde o viewport
+        const maxColWidth = vpWidth * 0.85;
+        const maxScaleFromWidth = maxColWidth / natW;
+
+        const idealScale = Math.min(scaleFromHeight, maxScaleFromWidth);
+        const calculatedZoom = (natW * idealScale / 440) * 100;
+        effectiveZoom = Math.max(15, Math.min(220, Math.round(calculatedZoom)));
+        setZoomLevel(effectiveZoom);
+      }
+
+      // Cálculo de Pan com o zoom efetivo
+      const colWidth = (effectiveZoom / 100) * 440;
+      const scaleY = colWidth / natW;
+      const gap = 32;
+      const headerH = 34;
+
+      const boxCenterYInContainer = headerH + (boxY + boxH / 2) * scaleY;
+      const totalContainerHeight = headerH + natH * scaleY;
+
+      // Centralização vertical precisa:
+      // Quando containerHeight >= vpHeight, flexbox com p-6 alinha no topo (paddingTop = 24px).
+      // Quando containerHeight < vpHeight, my-auto centraliza verticalmente.
+      const containerTop = totalContainerHeight >= vpHeight ? 24 : Math.round((vpHeight - totalContainerHeight) / 2);
+      const targetPanY = Math.round((vpHeight / 2) - (containerTop + boxCenterYInContainer));
+
+      // Centralização horizontal da coluna da página correspondente:
+      // No flexbox, justify-content: center sempre centraliza o container horizontalmente.
+      // Portanto: (totalContainerWidth / 2) - colCenterX traz o centro da coluna exatamente para o centro da tela!
+      const numCols = Math.max(1, visiblePageNumbers.length);
+      const colIndex = visiblePageNumbers.indexOf(targetPage);
+      const effectiveColIndex = colIndex >= 0 ? colIndex : 0;
+
+      const totalContainerWidth = numCols * colWidth + Math.max(0, (numCols - 1) * gap);
+      const colCenterX = effectiveColIndex * (colWidth + gap) + colWidth / 2;
+      const targetPanX = Math.round((totalContainerWidth / 2) - colCenterX);
 
       setPanOffset({
-        x: 0,
-        y: Math.round(targetPanY),
+        x: targetPanX,
+        y: targetPanY,
       });
     },
-    [naturalDimensions, zoomLevel]
+    [naturalDimensions, pageDimensions, zoomLevel, currentPageNumber, visiblePageNumbers]
   );
 
-  // Reset pan on page or chapter change
+  // Reset pan only when changing chapter or when the visible page window changes completely
+  const visibleWindowKey = `${currentChapterId}-${visiblePageNumbers[0] || 1}-${visiblePageNumbers.length}`;
   useEffect(() => {
     setPanOffset({ x: 0, y: 0 });
-  }, [currentPageNumber, currentChapterId]);
+  }, [currentChapterId, visibleWindowKey]);
 
   // Non-passive wheel listener for smooth zoom (Ctrl+wheel) and pan (wheel / trackpad)
   useEffect(() => {
@@ -869,9 +1190,10 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
 
   // Fit single panel or selected panel to 100% full width of page
   const handleFitPanelToFullWidth = useCallback(
-    (panelId?: string | null) => {
+    (panelId?: string | null, targetPage: number = currentPageNumber) => {
       const targetId = panelId || selectedPanelId;
-      const natW = naturalDimensions.width || 704;
+      const pageDim = pageDimensions[targetPage] || naturalDimensions;
+      const natW = pageDim.width || 704;
       if (!targetId) return;
 
       const next = {
@@ -880,10 +1202,10 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
         width: natW,
       };
       setCropBox(next);
-      syncPanelCoords(targetId, next);
+      syncPanelCoords(targetId, next, targetPage);
       showToast('↔️ Quadro ajustado para 100% da largura');
     },
-    [selectedPanelId, naturalDimensions.width, cropBox, syncPanelCoords, showToast]
+    [selectedPanelId, pageDimensions, naturalDimensions.width, cropBox, syncPanelCoords, currentPageNumber]
   );
 
   // Fit all detected panels on current page to 100% full width
@@ -914,6 +1236,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
 
   // Add a new manual crop zone to the current page
   const handleAddManualCropZone = () => {
+    pushUndoSnapshot();
     const natW = naturalDimensions.width || 704;
     const natH = naturalDimensions.height || 1408;
     const count = detectedPanels.length + 1;
@@ -951,14 +1274,15 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
   };
 
   // Remove a specific panel / crop zone
-  const handleRemovePanel = (panelId: string) => {
+  const handleRemovePanel = (panelId: string, targetPage: number = currentPageNumber) => {
+    pushUndoSnapshot();
     setChapterPanels((prev) => {
       const chap = prev[currentChapterId] || {};
-      const pagePanels = chap[currentPageNumber] || [];
+      const pagePanels = chap[targetPage] || [];
       const toRemove = pagePanels.find((p) => p.id === panelId);
       const updated = pagePanels.filter((p) => p.id !== panelId);
 
-      if (selectedPanelId === panelId) {
+      if (selectedPanelId === panelId && targetPage === currentPageNumber) {
         if (updated.length > 0) {
           const next = updated[0];
           setSelectedPanelId(next.id);
@@ -979,7 +1303,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
         ...prev,
         [currentChapterId]: {
           ...chap,
-          [currentPageNumber]: updated,
+          [targetPage]: updated,
         },
       };
     });
@@ -987,9 +1311,54 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
 
   // Clear all panels / crop zones on current page
   const handleClearAllPanels = () => {
+    pushUndoSnapshot();
     setPageDetectedPanels(currentPageNumber, []);
     setSelectedPanelId(null);
     showToast('🗑️ Todas as zonas de corte desta página foram removidas');
+  };
+
+  // Clear all panels and frames on current page
+  const handleClearCurrentPage = () => {
+    pushUndoSnapshot();
+    setPageDetectedPanels(currentPageNumber, []);
+    pageFrames.forEach((f) => onRemoveFrame(f.id));
+    setSelectedPanelId(null);
+    showToast(`🗑️ Zonas e quadros da Página ${currentPageNumber} foram limpos`);
+  };
+
+  // Clear all panels and frames on all currently visible pages
+  const handleClearVisiblePages = () => {
+    pushUndoSnapshot();
+    setChapterPanels((prev) => {
+      const chap = { ...(prev[currentChapterId] || {}) };
+      visiblePageNumbers.forEach((p) => {
+        delete chap[p];
+      });
+      return {
+        ...prev,
+        [currentChapterId]: chap,
+      };
+    });
+    frames
+      .filter((f) => (!f.chapterId || f.chapterId === currentChapterId) && f.pageNumber !== undefined && visiblePageNumbers.includes(f.pageNumber))
+      .forEach((f) => onRemoveFrame(f.id));
+    setSelectedPanelId(null);
+    showToast(`🗑️ Zonas e quadros das páginas visíveis (${visiblePageNumbers.join(', ')}) foram limpos`);
+  };
+
+  // Clear all panels and frames across all pages of current chapter
+  const handleClearAllChapterPanels = () => {
+    pushUndoSnapshot();
+    setChapterPanels((prev) => {
+      const next = { ...prev };
+      delete next[currentChapterId];
+      return next;
+    });
+    frames
+      .filter((f) => (!f.chapterId || f.chapterId === currentChapterId))
+      .forEach((f) => onRemoveFrame(f.id));
+    setSelectedPanelId(null);
+    showToast('🗑️ Zonas e quadros de todas as páginas do capítulo foram limpos');
   };
 
   // Crop or update a single specified panel / selection
@@ -1001,8 +1370,10 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
     y?: number;
     width?: number;
     height?: number;
+    pageNum?: number;
   }) => {
-    const img = imageRef.current;
+    const targetPage = target.pageNum || currentPageNumber;
+    const img = pageImageRefs.current.get(targetPage) || imageRef.current;
     if (!img) return;
 
     // Use passed coordinates if valid, otherwise fallback to the current live cropBox
@@ -1023,7 +1394,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
 
     // Synchronize chapterPanels with the updated coordinates
     if (target.id) {
-      syncPanelCoords(target.id, { x: cropX, y: cropY, width: cropW, height: cropH });
+      syncPanelCoords(target.id, { x: cropX, y: cropY, width: cropW, height: cropH }, targetPage);
     }
 
     try {
@@ -1080,7 +1451,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       } else {
         const frameNumber = frames.length + 1;
         const label = target.label
-          ? (target.label.includes('Pág.') ? target.label : `${target.label} (Pág. ${currentPageNumber})`)
+          ? (target.label.includes('Pág.') ? target.label : `${target.label} (Pág. ${targetPage})`)
           : `Quadro ${String(frameNumber).padStart(2, '0')}`;
         const newFrame: FrameItem = {
           id: `q_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
@@ -1090,7 +1461,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
           ratio: finalRatio,
           duration: 5.0,
           chapterId: currentChapterId,
-          pageNumber: currentPageNumber,
+          pageNumber: targetPage,
           panelId: target.id,
           cropRect: { x: cropX, y: cropY, width: cropW, height: cropH },
         };
@@ -1114,6 +1485,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       return;
     }
 
+    pushUndoSnapshot();
     const algo = algoOverride || selectedAlgorithm;
     setIsDetecting(true);
 
@@ -1178,39 +1550,65 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
 
   // Helper to crop a list of panels from an image
   const executeCropPanelsList = async (img: HTMLImageElement, panels: DetectedPanel[]) => {
-    const panelsToCrop = panels.filter((p) => !isSelectionAlreadyCropped(p));
-    if (panelsToCrop.length === 0) {
-      showToast('ℹ️ Todas as seleções desta página já foram recortadas anteriormente!');
-      return;
-    }
-
     playShutterSound();
     setIsCropFlashing(true);
     setTimeout(() => setIsCropFlashing(false), 300);
 
     const newFrames: FrameItem[] = [];
+    let updatedCount = 0;
 
-    for (let i = 0; i < panelsToCrop.length; i++) {
-      const p = panelsToCrop[i];
-      try {
-        const { blob, url } = await extractPanelToBlobAndUrl(img, p, 0.88);
-        const closestRatio = getClosestAspectRatio(p.width, p.height);
-        const frameNumber = frames.length + newFrames.length + 1;
-        const newFrame: FrameItem = {
-          id: `q_auto_${Date.now()}_${i}_${Math.random().toString(36).substring(2, 5)}`,
-          label: p.label ? `${p.label} (Pág. ${currentPageNumber})` : `Quadro ${String(frameNumber).padStart(2, '0')}`,
-          src: registerCreatedUrl(url),
-          blob,
-          ratio: closestRatio,
-          duration: 5.0,
-          chapterId: currentChapterId,
-          pageNumber: currentPageNumber,
-          panelId: p.id,
-          cropRect: { x: Math.round(p.x), y: Math.round(p.y), width: Math.round(p.width), height: Math.round(p.height) },
-        };
-        newFrames.push(newFrame);
-      } catch (err) {
-        console.error('Erro ao recortar painel:', err);
+    for (let i = 0; i < panels.length; i++) {
+      const p = panels[i];
+      const existingFrame = findExistingFrame(p);
+
+      if (existingFrame) {
+        const isChanged = !existingFrame.cropRect ||
+          Math.abs(existingFrame.cropRect.x - p.x) > 3 ||
+          Math.abs(existingFrame.cropRect.y - p.y) > 3 ||
+          Math.abs(existingFrame.cropRect.width - p.width) > 3 ||
+          Math.abs(existingFrame.cropRect.height - p.height) > 3;
+
+        if (isChanged) {
+          try {
+            const { blob, url } = await extractPanelToBlobAndUrl(img, p, 0.88);
+            const closestRatio = getClosestAspectRatio(p.width, p.height);
+            if (existingFrame.src?.startsWith('blob:')) {
+              revokeCreatedUrl(existingFrame.src);
+            }
+            if (onUpdateFrame) {
+              onUpdateFrame(existingFrame.id, {
+                src: registerCreatedUrl(url),
+                blob,
+                ratio: closestRatio,
+                cropRect: { x: Math.round(p.x), y: Math.round(p.y), width: Math.round(p.width), height: Math.round(p.height) },
+              });
+            }
+            updatedCount++;
+          } catch (err) {
+            console.error('Erro ao atualizar frame recortado:', err);
+          }
+        }
+      } else {
+        try {
+          const { blob, url } = await extractPanelToBlobAndUrl(img, p, 0.88);
+          const closestRatio = getClosestAspectRatio(p.width, p.height);
+          const frameNumber = frames.length + newFrames.length + 1;
+          const newFrame: FrameItem = {
+            id: `q_auto_${Date.now()}_${i}_${Math.random().toString(36).substring(2, 5)}`,
+            label: p.label ? `${p.label} (Pág. ${currentPageNumber})` : `Quadro ${String(frameNumber).padStart(2, '0')}`,
+            src: registerCreatedUrl(url),
+            blob,
+            ratio: closestRatio,
+            duration: 5.0,
+            chapterId: currentChapterId,
+            pageNumber: currentPageNumber,
+            panelId: p.id,
+            cropRect: { x: Math.round(p.x), y: Math.round(p.y), width: Math.round(p.width), height: Math.round(p.height) },
+          };
+          newFrames.push(newFrame);
+        } catch (err) {
+          console.error('Erro ao recortar painel:', err);
+        }
       }
     }
 
@@ -1222,11 +1620,14 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       }
     }
 
-    const skipped = panels.length - newFrames.length;
-    if (skipped > 0) {
-      showToast(`🎉 ${newFrames.length} novo(s) quadro(s) recortado(s)! (${skipped} já existia(m) nesta página)`);
+    if (newFrames.length > 0 && updatedCount > 0) {
+      showToast(`✂️ ${newFrames.length} novo(s) e ${updatedCount} quadro(s) atualizado(s)!`);
+    } else if (updatedCount > 0) {
+      showToast(`🔄 ${updatedCount} quadro(s) atualizado(s) com novo recorte!`);
+    } else if (newFrames.length > 0) {
+      showToast(`🎉 ${newFrames.length} quadro(s) recortado(s) com sucesso para a timeline!`);
     } else {
-      showToast(`🎉 ${newFrames.length} quadros recortados com sucesso para a timeline!`);
+      showToast('ℹ️ Todas as seleções desta página já estão atualizadas!');
     }
   };
 
@@ -1237,10 +1638,14 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       return;
     }
 
+    pushUndoSnapshot();
+
     const algo = algoOverride || selectedAlgorithm;
     setIsBatchProcessing(true);
     const total = currentChapter.pages;
     let totalPanelsFound = 0;
+    let preservedPagesCount = 0;
+    let newlyDetectedPagesCount = 0;
     const newPanelsByPage: Record<number, DetectedPanel[]> = {};
 
     setBatchProgress({ mode: 'detect', current: 1, total, count: 0 });
@@ -1250,6 +1655,35 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       try {
         const pageUrl = getPageUrl(pNum);
         if (!pageUrl) continue;
+
+        // Check if page already has user-adjusted panels or existing frames!
+        const currentChapData = chapterPanelsRef.current[currentChapterId] || {};
+        const isCurrentPage = pNum === currentPageNumber;
+        const existingPanels = isCurrentPage ? detectedPanels : (currentChapData[pNum] || []);
+        const existingFramesForPage = frames.filter((f) => 
+          (!f.chapterId || f.chapterId === currentChapterId) && 
+          Number(f.pageNumber || 1) === pNum
+        );
+
+        if (existingPanels.length > 0 || existingFramesForPage.length > 0) {
+          // Page ALREADY has user manual selections or adjustments: PRESERVE THEM!
+          const preserved = existingPanels.length > 0
+            ? existingPanels
+            : existingFramesForPage.map((f, fIdx) => ({
+                id: f.panelId || `panel_p${pNum}_${fIdx + 1}`,
+                x: f.cropRect?.x ?? 0,
+                y: f.cropRect?.y ?? 0,
+                width: f.cropRect?.width ?? 620,
+                height: f.cropRect?.height ?? 349,
+                confidence: 1.0,
+                algorithm: 'profile' as const,
+                label: f.label || `Quadro ${String(fIdx + 1).padStart(2, '0')}`,
+              }));
+          newPanelsByPage[pNum] = preserved;
+          totalPanelsFound += preserved.length;
+          preservedPagesCount++;
+          continue;
+        }
 
         const img = await loadImage(pageUrl);
         if (pNum === currentPageNumber && img.naturalWidth && img.naturalHeight) {
@@ -1273,6 +1707,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
         if (panels && panels.length > 0) {
           newPanelsByPage[pNum] = panels;
           totalPanelsFound += panels.length;
+          newlyDetectedPagesCount++;
         }
       } catch (err) {
         console.error(`Erro ao detectar seleções na página ${pNum}:`, err);
@@ -1288,8 +1723,8 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       },
     }));
 
-    // If active page has detected panels, automatically select first panel into cropBox
-    if (newPanelsByPage[currentPageNumber] && newPanelsByPage[currentPageNumber].length > 0) {
+    // If active page didn't have an active selection and has newly detected panels, select first panel into cropBox
+    if (!selectedPanelId && newPanelsByPage[currentPageNumber] && newPanelsByPage[currentPageNumber].length > 0) {
       const first = newPanelsByPage[currentPageNumber][0];
       setSelectedPanelId(first.id);
       setSelectedRatio('Livre');
@@ -1310,12 +1745,19 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
     setIsBatchProcessing(false);
     setIsAutoDetectModalOpen(false);
     playShutterSound();
-    const algoName = ALGORITHM_INFO[algo]?.name || 'Projeção';
-    showToast(
-      `✨ Detecção em lote concluída! ${totalPanelsFound} seleções geradas em ${total} páginas via ${algoName}${
-        filterTextBubbles ? ' (com filtro de balões)' : ''
-      }!`
-    );
+    if (newlyDetectedPagesCount > 0 && preservedPagesCount > 0) {
+      showToast(
+        `⚡ Detecção em lote: ${newlyDetectedPagesCount} página(s) detectada(s) e ${preservedPagesCount} página(s) com ajustes preservadas!`
+      );
+    } else if (newlyDetectedPagesCount > 0) {
+      showToast(
+        `⚡ Detecção em lote concluída! ${totalPanelsFound} quadros em ${newlyDetectedPagesCount} páginas.`
+      );
+    } else {
+      showToast(
+        `ℹ️ Todas as ${preservedPagesCount} página(s) já possuem seleções manuais e foram preservadas.`
+      );
+    }
   };
 
   // Crop the CURRENT page's detected panels (respecting any deletions or edits made by the user)
@@ -1346,6 +1788,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
     setIsBatchProcessing(true);
     const total = currentChapter.pages;
     let totalCut = 0;
+    let totalUpdated = 0;
     const newPanelsByPage: Record<number, DetectedPanel[]> = {};
     const allNewFrames: FrameItem[] = [];
 
@@ -1396,21 +1839,58 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
         }
 
         if (panels && panels.length > 0) {
-          const existingForPage = frames.filter((f) => f.chapterId === currentChapterId && f.pageNumber === pNum);
+          const existingForPage = frames.filter((f) => 
+            (!f.chapterId || f.chapterId === currentChapterId) && 
+            Number(f.pageNumber || 1) === pNum
+          );
           for (let i = 0; i < panels.length; i++) {
             const p = panels[i];
-            const alreadyExists = existingForPage.some((f) => {
+            const pNumMatch = p.label ? p.label.match(/\d+/)?.[0] : String(i + 1);
+
+            // Find existing frame for this panel
+            const existingFrame = existingForPage.find((f) => {
               if (p.id && f.panelId && f.panelId === p.id) return true;
+              if (f.label && pNumMatch) {
+                const fNumMatch = f.label.match(/\d+/)?.[0];
+                if (fNumMatch && fNumMatch === pNumMatch) return true;
+              }
               if (f.cropRect) {
-                const dx = Math.abs(f.cropRect.x - p.x);
-                const dy = Math.abs(f.cropRect.y - p.y);
-                const dw = Math.abs(f.cropRect.width - p.width);
-                const dh = Math.abs(f.cropRect.height - p.height);
-                if (dx <= 12 && dy <= 12 && dw <= 12 && dh <= 12) return true;
+                const y1 = Math.max(f.cropRect.y, p.y);
+                const y2 = Math.min(f.cropRect.y + f.cropRect.height, p.y + p.height);
+                if (y2 - y1 > 35) return true;
               }
               return false;
             });
-            if (alreadyExists) continue;
+
+            if (existingFrame) {
+              const isChanged = !existingFrame.cropRect ||
+                Math.abs(existingFrame.cropRect.x - p.x) > 3 ||
+                Math.abs(existingFrame.cropRect.y - p.y) > 3 ||
+                Math.abs(existingFrame.cropRect.width - p.width) > 3 ||
+                Math.abs(existingFrame.cropRect.height - p.height) > 3;
+
+              if (isChanged) {
+                try {
+                  const { blob, url: panelUrl } = await extractPanelToBlobAndUrl(img, p, 0.88);
+                  const closestRatio = getClosestAspectRatio(p.width, p.height);
+                  if (existingFrame.src?.startsWith('blob:')) {
+                    revokeCreatedUrl(existingFrame.src);
+                  }
+                  if (onUpdateFrame) {
+                    onUpdateFrame(existingFrame.id, {
+                      src: registerCreatedUrl(panelUrl),
+                      blob,
+                      ratio: closestRatio,
+                      cropRect: { x: Math.round(p.x), y: Math.round(p.y), width: Math.round(p.width), height: Math.round(p.height) },
+                    });
+                  }
+                  totalUpdated++;
+                } catch (err) {
+                  console.error(`Erro ao atualizar painel da página ${pNum}:`, err);
+                }
+              }
+              continue;
+            }
 
             try {
               const { blob, url: panelUrl } = await extractPanelToBlobAndUrl(img, p, 0.88);
@@ -1461,7 +1941,15 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
     playShutterSound();
     setIsBatchProcessing(false);
     setIsAutoDetectModalOpen(false);
-    showToast(`🚀 Processamento em lote concluído! ${totalCut} quadros recortados de ${total} páginas.`);
+    if (totalCut > 0 || totalUpdated > 0) {
+      showToast(
+        `⚡ Lote concluído: ${totalCut > 0 ? `${totalCut} novo(s)` : ''}${
+          totalCut > 0 && totalUpdated > 0 ? ', ' : ''
+        }${totalUpdated > 0 ? `${totalUpdated} atualizado(s)` : ''}!`
+      );
+    } else {
+      showToast('ℹ️ Todos os quadros do capítulo já estão atualizados!');
+    }
   };
 
   // When switching page or chapter, auto-focus cropBox to selected or first detected panel if present
@@ -1523,6 +2011,23 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
         return;
       }
 
+      // UNDO: Ctrl+Z / Cmd+Z (without Shift)
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        handleUndo();
+        return;
+      }
+
+      // REDO: Ctrl+Y / Cmd+Y OR Ctrl+Shift+Z / Cmd+Shift+Z
+      if (
+        ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') ||
+        ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && e.shiftKey)
+      ) {
+        e.preventDefault();
+        handleRedo();
+        return;
+      }
+
       // Crop entire page shortcut: Shift+Enter or X
       if (
         ((e.key === 'x' || e.key === 'X') && !e.ctrlKey && !e.metaKey) ||
@@ -1554,7 +2059,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       } else if (e.key === 'v' || e.key === 'V') {
         setActiveTool('move');
         showToast('↖️ Ferramenta Mover ativada');
-      } else if (e.key === 'z' || e.key === 'Z') {
+      } else if ((e.key === 'z' || e.key === 'Z') && !e.ctrlKey && !e.metaKey) {
         setActiveTool('zoom');
         showToast('🔍 Ferramenta Zoom ativada (Clique para ampliar, Alt+Clique para reduzir)');
       } else if (e.key === 'g' || e.key === 'G') {
@@ -1575,10 +2080,110 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       } else if (e.key === '-' || e.key === '_') {
         e.preventDefault();
         setZoomLevel((z) => Math.max(5, z - 10));
+      } else if (e.key === 'ArrowDown') {
+        const currentPanels = currentChapterPanels[currentPageNumber] || [];
+        if (currentPanels.length > 0) {
+          e.preventDefault();
+          const currentIndex = currentPanels.findIndex((p) => p.id === selectedPanelId);
+          const nextIndex = currentIndex >= 0 && currentIndex < currentPanels.length - 1 ? currentIndex + 1 : 0;
+          const targetPanel = currentPanels[nextIndex];
+
+          const matchingFrame = frames.find(
+            (f) => (!f.chapterId || f.chapterId === currentChapterId) &&
+                   f.pageNumber === currentPageNumber &&
+                   (f.panelId === targetPanel.id || f.id === targetPanel.id)
+          );
+          const nextBox = {
+            x: matchingFrame?.cropRect?.x ?? targetPanel.x,
+            y: matchingFrame?.cropRect?.y ?? targetPanel.y,
+            width: matchingFrame?.cropRect?.width ?? targetPanel.width,
+            height: matchingFrame?.cropRect?.height ?? targetPanel.height,
+          };
+          setSelectedPanelId(targetPanel.id);
+          setSelectedRatio('Livre');
+          setCropBox(nextBox);
+          focusCropBox(nextBox, currentPageNumber, isCropFocusActive);
+        }
+      } else if (e.key === 'ArrowUp') {
+        const currentPanels = currentChapterPanels[currentPageNumber] || [];
+        if (currentPanels.length > 0) {
+          e.preventDefault();
+          const currentIndex = currentPanels.findIndex((p) => p.id === selectedPanelId);
+          const prevIndex = currentIndex > 0 ? currentIndex - 1 : currentPanels.length - 1;
+          const targetPanel = currentPanels[prevIndex];
+
+          const matchingFrame = frames.find(
+            (f) => (!f.chapterId || f.chapterId === currentChapterId) &&
+                   f.pageNumber === currentPageNumber &&
+                   (f.panelId === targetPanel.id || f.id === targetPanel.id)
+          );
+          const nextBox = {
+            x: matchingFrame?.cropRect?.x ?? targetPanel.x,
+            y: matchingFrame?.cropRect?.y ?? targetPanel.y,
+            width: matchingFrame?.cropRect?.width ?? targetPanel.width,
+            height: matchingFrame?.cropRect?.height ?? targetPanel.height,
+          };
+          setSelectedPanelId(targetPanel.id);
+          setSelectedRatio('Livre');
+          setCropBox(nextBox);
+          focusCropBox(nextBox, currentPageNumber, isCropFocusActive);
+        }
       } else if (e.key === 'ArrowLeft') {
-        onSelectPageNumber(Math.max(1, currentPageNumber - 1));
+        e.preventDefault();
+        const prevPage = Math.max(1, currentPageNumber - 1);
+        if (prevPage !== currentPageNumber) {
+          onSelectPageNumber(prevPage);
+          const prevPanels = currentChapterPanels[prevPage] || [];
+          if (prevPanels.length > 0) {
+            const firstPanel = prevPanels[0];
+            const matchingFrame = frames.find(
+              (f) => (!f.chapterId || f.chapterId === currentChapterId) &&
+                     f.pageNumber === prevPage &&
+                     (f.panelId === firstPanel.id || f.id === firstPanel.id)
+            );
+            const nextBox = {
+              x: matchingFrame?.cropRect?.x ?? firstPanel.x,
+              y: matchingFrame?.cropRect?.y ?? firstPanel.y,
+              width: matchingFrame?.cropRect?.width ?? firstPanel.width,
+              height: matchingFrame?.cropRect?.height ?? firstPanel.height,
+            };
+            setSelectedPanelId(firstPanel.id);
+            setSelectedRatio('Livre');
+            setCropBox(nextBox);
+            focusCropBox(nextBox, prevPage, isCropFocusActive);
+          } else {
+            setSelectedPanelId(null);
+            focusCropBox({ x: 0, y: 0, width: 440, height: 440 }, prevPage, isCropFocusActive);
+          }
+        }
       } else if (e.key === 'ArrowRight') {
-        onSelectPageNumber(Math.min(currentChapter.pages, currentPageNumber + 1));
+        e.preventDefault();
+        const nextPage = Math.min(currentChapter.pages, currentPageNumber + 1);
+        if (nextPage !== currentPageNumber) {
+          onSelectPageNumber(nextPage);
+          const nextPanels = currentChapterPanels[nextPage] || [];
+          if (nextPanels.length > 0) {
+            const firstPanel = nextPanels[0];
+            const matchingFrame = frames.find(
+              (f) => (!f.chapterId || f.chapterId === currentChapterId) &&
+                     f.pageNumber === nextPage &&
+                     (f.panelId === firstPanel.id || f.id === firstPanel.id)
+            );
+            const nextBox = {
+              x: matchingFrame?.cropRect?.x ?? firstPanel.x,
+              y: matchingFrame?.cropRect?.y ?? firstPanel.y,
+              width: matchingFrame?.cropRect?.width ?? firstPanel.width,
+              height: matchingFrame?.cropRect?.height ?? firstPanel.height,
+            };
+            setSelectedPanelId(firstPanel.id);
+            setSelectedRatio('Livre');
+            setCropBox(nextBox);
+            focusCropBox(nextBox, nextPage, isCropFocusActive);
+          } else {
+            setSelectedPanelId(null);
+            focusCropBox({ x: 0, y: 0, width: 440, height: 440 }, nextPage, isCropFocusActive);
+          }
+        }
       } else if (e.key === 'Delete' || e.key === 'Backspace') {
         if (selectedPanelId) {
           e.preventDefault();
@@ -1626,6 +2231,26 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
             handleFitPanelToFullWidth();
           }
         }
+      } else if ((e.key === 'f' || e.key === 'F') && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        setIsCropFocusActive((prev) => {
+          const next = !prev;
+          showToast(
+            next
+              ? '🎯 Auto-Foco no Quadro ATIVADO (F)'
+              : '🔓 Auto-Foco no Quadro DESATIVADO (F)'
+          );
+          if (next && selectedPanelId) {
+            const currentPanels = currentChapterPanels[currentPageNumber] || [];
+            const activePanel = currentPanels.find((p) => p.id === selectedPanelId);
+            if (activePanel) {
+              focusCropBox(activePanel, currentPageNumber, true);
+            } else if (cropBox) {
+              focusCropBox(cropBox, currentPageNumber, true);
+            }
+          }
+          return next;
+        });
       } else if (e.key === '?' || (e.shiftKey && e.key === '/')) {
         setIsShortcutsModalOpen(true);
       }
@@ -1651,7 +2276,97 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       window.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('blur', handleBlur);
     };
-  }, [currentPageNumber, currentChapter.pages, naturalDimensions, cropBox, selectedPanelId, detectedPanels, dragMode, handleFitPanelToFullWidth, handleFitAllPanelsToFullWidth]);
+  }, [currentPageNumber, currentChapter.pages, naturalDimensions, cropBox, selectedPanelId, detectedPanels, dragMode, handleFitPanelToFullWidth, handleFitAllPanelsToFullWidth, handleUndo, handleRedo]);
+
+  // Convert client coordinates to natural image coordinates (supports target page)
+  const clientToNatural = (clientX: number, clientY: number, targetPage: number = currentPageNumber) => {
+    const img = pageImageRefs.current.get(targetPage) || imageRef.current;
+    if (!img) return { x: 0, y: 0 };
+    const rect = img.getBoundingClientRect();
+    const pageDim = pageDimensions[targetPage] || naturalDimensions;
+    const natW = img.naturalWidth || pageDim.width || 704;
+    const natH = img.naturalHeight || pageDim.height || 1408;
+
+    const scaleX = natW / Math.max(1, rect.width);
+    const scaleY = natH / Math.max(1, rect.height);
+
+    return {
+      x: Math.max(0, Math.min(natW, (clientX - rect.left) * scaleX)),
+      y: Math.max(0, Math.min(natH, (clientY - rect.top) * scaleY)),
+    };
+  };
+
+  // Identify which visible page column is closest or directly under client coordinates
+  const getTargetPageFromCoords = (clientX: number): number => {
+    if (visiblePageNumbers.length <= 1) {
+      return visiblePageNumbers[0] || currentPageNumber;
+    }
+    const entries = visiblePageNumbers
+      .map((pageNum) => {
+        const img = pageImageRefs.current.get(pageNum);
+        if (!img) return null;
+        return { pageNum, rect: img.getBoundingClientRect() };
+      })
+      .filter((e): e is { pageNum: number; rect: DOMRect } => Boolean(e));
+
+    if (entries.length === 0) return currentPageNumber;
+
+    // Check if directly within horizontal span of a page column
+    const directHit = entries.find((e) => clientX >= e.rect.left && clientX <= e.rect.right);
+    if (directHit) return directHit.pageNum;
+
+    // Left of all visible pages
+    if (clientX < entries[0].rect.left) return entries[0].pageNum;
+
+    // Right of all visible pages
+    if (clientX > entries[entries.length - 1].rect.right) return entries[entries.length - 1].pageNum;
+
+    // Between columns: pick closest
+    let closest = entries[0];
+    let minDist = Infinity;
+    for (const e of entries) {
+      const dist = clientX < e.rect.left ? e.rect.left - clientX : clientX > e.rect.right ? clientX - e.rect.right : 0;
+      if (dist < minDist) {
+        minDist = dist;
+        closest = e;
+      }
+    }
+    return closest.pageNum;
+  };
+
+  // Resolve target page during drag based on horizontal overlap with visible page columns
+  const getTargetPageFromDragRange = (screenLeft: number, screenRight: number, fallbackPage: number): number => {
+    if (visiblePageNumbers.length <= 1) {
+      return visiblePageNumbers[0] || currentPageNumber;
+    }
+    const entries = visiblePageNumbers
+      .map((pageNum) => {
+        const img = pageImageRefs.current.get(pageNum);
+        if (!img) return null;
+        return { pageNum, rect: img.getBoundingClientRect() };
+      })
+      .filter((e): e is { pageNum: number; rect: DOMRect } => Boolean(e));
+
+    if (entries.length === 0) return fallbackPage;
+
+    let bestPage = fallbackPage;
+    let maxOverlap = 0;
+
+    for (const entry of entries) {
+      const overlapStart = Math.max(screenLeft, entry.rect.left);
+      const overlapEnd = Math.min(screenRight, entry.rect.right);
+      const overlap = Math.max(0, overlapEnd - overlapStart);
+      if (overlap > maxOverlap) {
+        maxOverlap = overlap;
+        bestPage = entry.pageNum;
+      }
+    }
+
+    if (maxOverlap > 10) {
+      return bestPage;
+    }
+    return fallbackPage;
+  };
 
   // Viewport Pan Pointer Handlers
   const isHandModeActive = isSpacePressed || activeTool === 'hand';
@@ -1674,7 +2389,21 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
     // If Crop tool is active and left-click on viewport (outside image): start drawing crop box!
     if (activeTool === 'crop' && e.button === 0 && !dragMode && !dragRef.current.isDragging) {
       e.preventDefault();
-      const nat = clientToNatural(e.clientX, e.clientY);
+      const targetPage = getTargetPageFromCoords(e.clientX);
+      if (targetPage !== currentPageNumber) {
+        onSelectPageNumber(targetPage);
+      }
+      drawingTargetPageRef.current = targetPage;
+      setDrawingTargetPage(targetPage);
+
+      preDragSnapshotRef.current = {
+        chapterPanels: JSON.parse(JSON.stringify(chapterPanelsRef.current || {})),
+        cropBox: { ...cropBox },
+        selectedPanelId,
+        currentPageNumber: targetPage,
+      };
+
+      const nat = clientToNatural(e.clientX, e.clientY, targetPage);
       const initialCrop = { ...cropBox };
 
       dragRef.current = {
@@ -1702,6 +2431,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       };
       drawingBoxRef.current = initialDrawBox;
       setDrawingBox(initialDrawBox);
+      setDrawingVisualRect(null);
 
       try {
         (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
@@ -1719,6 +2449,10 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
         x: panStartRef.current.panX + deltaX,
         y: panStartRef.current.panY + deltaY,
       });
+      return;
+    }
+    if (dragMode === 'draw') {
+      handlePointerMove(e);
     }
   };
 
@@ -1730,6 +2464,10 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       } catch {
         // ignore
       }
+      return;
+    }
+    if (dragMode === 'draw') {
+      handlePointerUp(e);
     }
   };
 
@@ -1746,49 +2484,66 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
     });
   };
 
-  // Convert client coordinates to natural image coordinates
-  const clientToNatural = (clientX: number, clientY: number) => {
-    if (!imageRef.current) return { x: 0, y: 0 };
-    const rect = imageRef.current.getBoundingClientRect();
-    const scaleX = naturalDimensions.width / rect.width;
-    const scaleY = naturalDimensions.height / rect.height;
-
-    return {
-      x: Math.max(0, Math.min(naturalDimensions.width, (clientX - rect.left) * scaleX)),
-      y: Math.max(0, Math.min(naturalDimensions.height, (clientY - rect.top) * scaleY)),
-    };
-  };
-
   // Pointer Down for Move or Resize Handles
   const handlePointerDown = (
     e: React.PointerEvent,
     mode: 'move' | 'nw' | 'ne' | 'se' | 'sw' | 'n' | 's' | 'w' | 'e',
-    panel?: DetectedPanel
+    panel?: DetectedPanel,
+    targetPage: number = currentPageNumber
   ) => {
     if (isHandModeActive) return; // Priority to Spacebar / Hand pan
     e.preventDefault();
     e.stopPropagation();
 
+    // Automatically switch active page to targetPage if different!
+    if (targetPage !== currentPageNumber) {
+      onSelectPageNumber(targetPage);
+    }
+
     if (mode !== 'move') {
       setSelectedRatio('Livre');
     }
 
+    preDragSnapshotRef.current = {
+      chapterPanels: JSON.parse(JSON.stringify(chapterPanelsRef.current || {})),
+      cropBox: { ...cropBox },
+      selectedPanelId: panel?.id || selectedPanelId,
+      currentPageNumber: targetPage,
+    };
+
     let initialCrop = { ...cropBox };
     if (panel) {
-      initialCrop = {
-        x: panel.x,
-        y: panel.y,
-        width: panel.width,
-        height: panel.height,
-      };
-      if (panel.id !== selectedPanelId) {
+      const isAlreadyActive = panel.id === selectedPanelId && targetPage === currentPageNumber;
+      if (!isAlreadyActive) {
+        // Find matching frame if one exists
+        const matchingFrame = frames.find(
+          (f) => (!f.chapterId || f.chapterId === currentChapterId) &&
+                 f.pageNumber === targetPage &&
+                 (f.panelId === panel.id || f.id === panel.id)
+        );
+        const targetX = typeof panel.x === 'number' ? panel.x : (matchingFrame?.cropRect?.x ?? 0);
+        const targetY = typeof panel.y === 'number' ? panel.y : (matchingFrame?.cropRect?.y ?? 0);
+        const targetW = typeof panel.width === 'number' && panel.width > 0 ? panel.width : (matchingFrame?.cropRect?.width ?? 620);
+        const targetH = typeof panel.height === 'number' && panel.height > 0 ? panel.height : (matchingFrame?.cropRect?.height ?? 349);
+
+        initialCrop = {
+          x: targetX,
+          y: targetY,
+          width: targetW,
+          height: targetH,
+        };
         setSelectedPanelId(panel.id);
         setSelectedRatio('Livre');
         setCropBox(initialCrop);
+        if (isCropFocusActive) {
+          focusCropBox(initialCrop, targetPage, true);
+        }
       }
     }
 
-    const nat = clientToNatural(e.clientX, e.clientY);
+    const nat = clientToNatural(e.clientX, e.clientY, targetPage);
+    drawingTargetPageRef.current = targetPage;
+    setDrawingTargetPage(targetPage);
 
     dragRef.current = {
       isDragging: true,
@@ -1809,8 +2564,13 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
   };
 
   // Pointer Down on Image (Outside Crop Box) -> Start drawing a new crop box or Zoom!
-  const handleImagePointerDown = (e: React.PointerEvent) => {
+  const handleImagePointerDown = (e: React.PointerEvent, targetPage: number = currentPageNumber) => {
     if (isHandModeActive) return; // Priority to Spacebar / Hand pan
+
+    // Automatically switch active page to targetPage if different!
+    if (targetPage !== currentPageNumber) {
+      onSelectPageNumber(targetPage);
+    }
 
     // If Zoom tool is selected
     if (activeTool === 'zoom') {
@@ -1826,8 +2586,11 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
     if (dragMode || dragRef.current.isDragging) return;
     e.preventDefault();
 
-    const nat = clientToNatural(e.clientX, e.clientY);
+    const nat = clientToNatural(e.clientX, e.clientY, targetPage);
     const initialCrop = { ...cropBox };
+
+    drawingTargetPageRef.current = targetPage;
+    setDrawingTargetPage(targetPage);
 
     dragRef.current = {
       isDragging: true,
@@ -1846,7 +2609,8 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       naturalStart: nat,
     });
 
-    const natW = naturalDimensions.width || 704;
+    const pageDim = pageDimensions[targetPage] || naturalDimensions;
+    const natW = pageDim.width || 704;
     const isFullW = isFullWidthMode && !e.altKey;
     const initialDrawBox = isFullW
       ? {
@@ -1863,6 +2627,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
         };
     drawingBoxRef.current = initialDrawBox;
     setDrawingBox(initialDrawBox);
+    setDrawingVisualRect(null);
 
     try {
       (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
@@ -1873,61 +2638,123 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
 
   // Pointer Move (Handles Drag, Resize, and Draw)
   const handlePointerMove = (e: React.PointerEvent | PointerEvent) => {
-    if (isHandModeActive || !dragMode || !imageRef.current) return;
+    if (isHandModeActive || !dragMode) return;
 
-    const img = imageRef.current;
+    const targetPage = drawingTargetPageRef.current || currentPageNumber;
+    const img = pageImageRefs.current.get(targetPage) || imageRef.current;
+    if (!img) return;
+
     const rect = img.getBoundingClientRect();
-    const scaleX = naturalDimensions.width / rect.width;
-    const scaleY = naturalDimensions.height / rect.height;
+    const pageDim = pageDimensions[targetPage] || naturalDimensions;
+    const natW = pageDim.width || 704;
+    const natH = pageDim.height || 1408;
+
+    const scaleX = natW / Math.max(1, rect.width);
+    const scaleY = natH / Math.max(1, rect.height);
 
     const deltaX = (e.clientX - dragStart.clientX) * scaleX;
     const deltaY = (e.clientY - dragStart.clientY) * scaleY;
 
-    const natW = naturalDimensions.width;
-    const natH = naturalDimensions.height;
     const orig = dragStart.crop;
     const ratio = getRatioValue();
 
     if (dragMode === 'draw') {
-      const curNat = clientToNatural(e.clientX, e.clientY);
-      const startX = dragStart.naturalStart.x;
-      const startY = dragStart.naturalStart.y;
+      const initialTarget = drawingTargetPageRef.current || currentPageNumber;
+      const screenLeft = Math.min(dragStart.clientX, e.clientX);
+      const screenRight = Math.max(dragStart.clientX, e.clientX);
+      const screenTop = Math.min(dragStart.clientY, e.clientY);
+      const screenBottom = Math.max(dragStart.clientY, e.clientY);
+
+      const resolvedTarget = getTargetPageFromDragRange(screenLeft, screenRight, initialTarget);
+      if (resolvedTarget !== drawingTargetPageRef.current) {
+        drawingTargetPageRef.current = resolvedTarget;
+        setDrawingTargetPage(resolvedTarget);
+      }
+
+      const activePage = resolvedTarget;
+      const targetImg = pageImageRefs.current.get(activePage) || imageRef.current;
+      if (!targetImg) return;
+
+      const pageImgRect = targetImg.getBoundingClientRect();
+      const pageDim = pageDimensions[activePage] || naturalDimensions;
+      const natW = pageDim.width || 704;
+      const natH = pageDim.height || 1408;
+
+      const pScaleX = natW / Math.max(1, pageImgRect.width);
+      const pScaleY = natH / Math.max(1, pageImgRect.height);
 
       const isFullW = isFullWidthMode && !e.altKey;
 
-      let x1 = isFullW ? 0 : Math.min(startX, curNat.x);
-      let y1 = Math.min(startY, curNat.y);
-      let w = isFullW ? natW : Math.abs(curNat.x - startX);
-      let h = Math.abs(curNat.y - startY);
+      const vp = viewportRef.current;
+      const vpRect = vp ? vp.getBoundingClientRect() : { left: 0, top: 0 };
 
-      if (!isFullW) {
-        // Magnetic snap to edges
-        const snapMargin = Math.min(30, natW * 0.05);
-        if (x1 < snapMargin) {
-          w += x1;
-          x1 = 0;
-        }
-        if (x1 + w > natW - snapMargin) {
-          w = natW - x1;
+      // Visual box in viewport coordinates - always follows true cursor position freely
+      const visualLeft = screenLeft - vpRect.left;
+      const visualTop = screenTop - vpRect.top;
+      const visualWidth = Math.max(0, screenRight - screenLeft);
+      const visualHeight = Math.max(0, screenBottom - screenTop);
+
+      // Clamped natural coordinates on the image (inner intersection)
+      const overlapLeft = Math.max(pageImgRect.left, screenLeft);
+      const overlapRight = Math.min(pageImgRect.right, screenRight);
+      const overlapTop = Math.max(pageImgRect.top, screenTop);
+      const overlapBottom = Math.min(pageImgRect.bottom, screenBottom);
+      const hasOverlap = overlapRight > overlapLeft && overlapBottom > overlapTop;
+
+      let clampedX = 0;
+      let clampedY = 0;
+      let clampedW = 0;
+      let clampedH = 0;
+
+      if (hasOverlap) {
+        if (isFullW) {
+          clampedX = 0;
+          clampedW = natW;
+          clampedY = Math.round((overlapTop - pageImgRect.top) * pScaleY);
+          clampedH = Math.round((overlapBottom - overlapTop) * pScaleY);
+        } else {
+          clampedX = Math.round((overlapLeft - pageImgRect.left) * pScaleX);
+          clampedY = Math.round((overlapTop - pageImgRect.top) * pScaleY);
+          clampedW = Math.round((overlapRight - overlapLeft) * pScaleX);
+          clampedH = Math.round((overlapBottom - overlapTop) * pScaleY);
+
+          // Magnetic snap to edges
+          const snapMargin = Math.min(30, natW * 0.05);
+          if (clampedX < snapMargin && clampedX > 0) {
+            clampedW += clampedX;
+            clampedX = 0;
+          }
+          if (clampedX + clampedW > natW - snapMargin && clampedW > 0) {
+            clampedW = natW - clampedX;
+          }
         }
       }
 
-      if (ratio && w > 10) {
-        h = Math.round(w / ratio);
-        if (y1 + h > natH) {
-          h = natH - y1;
-          w = Math.round(h * ratio);
+      if (ratio && clampedW > 10) {
+        clampedH = Math.round(clampedW / ratio);
+        if (clampedY + clampedH > natH) {
+          clampedH = natH - clampedY;
+          clampedW = Math.round(clampedH * ratio);
         }
       }
 
       const nextBox = {
-        x: Math.round(x1),
-        y: Math.round(y1),
-        width: Math.round(w),
-        height: Math.round(h),
+        x: Math.max(0, Math.min(natW, Math.round(clampedX))),
+        y: Math.max(0, Math.min(natH, Math.round(clampedY))),
+        width: Math.max(0, Math.min(natW - clampedX, Math.round(clampedW))),
+        height: Math.max(0, Math.min(natH - clampedY, Math.round(clampedH))),
       };
       drawingBoxRef.current = nextBox;
       setDrawingBox(nextBox);
+
+      setDrawingVisualRect({
+        left: visualLeft,
+        top: visualTop,
+        width: visualWidth,
+        height: visualHeight,
+        clampedW: nextBox.width,
+        clampedH: nextBox.height,
+      });
       return;
     }
 
@@ -1941,7 +2768,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       };
       setCropBox(nextBox);
       if (selectedPanelId) {
-        syncPanelCoords(selectedPanelId, nextBox);
+        syncPanelCoords(selectedPanelId, nextBox, targetPage);
       }
       return;
     }
@@ -2087,7 +2914,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
     };
     setCropBox(nextBox);
     if (selectedPanelId) {
-      syncPanelCoords(selectedPanelId, nextBox);
+      syncPanelCoords(selectedPanelId, nextBox, targetPage);
     }
   };
 
@@ -2103,30 +2930,47 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
 
     if (dragMode === 'draw') {
       const finalBox = drawingBoxRef.current || drawingBox;
-      if (finalBox && finalBox.width >= 20 && finalBox.height >= 20) {
-        const natW = naturalDimensions.width || 704;
-        const natH = naturalDimensions.height || 1408;
-        const isFullW = isFullWidthMode && !e.altKey;
-        const boxX = isFullW ? 0 : finalBox.x;
-        const boxW = isFullW ? natW : finalBox.width;
+      const targetPage = drawingTargetPageRef.current || currentPageNumber;
+      const pageDim = pageDimensions[targetPage] || naturalDimensions;
+      const natW = pageDim.width || 704;
+      const natH = pageDim.height || 1408;
 
-        const nextNum = detectedPanels.length + 1;
+      if (finalBox && finalBox.width >= 20 && finalBox.height >= 20) {
+        if (preDragSnapshotRef.current) {
+          undoStackRef.current.push(preDragSnapshotRef.current);
+          if (undoStackRef.current.length > 40) undoStackRef.current.shift();
+          redoStackRef.current = [];
+          setCanUndo(true);
+          setCanRedo(false);
+        }
+
+        const isFullW = isFullWidthMode && !e.altKey;
+        const boxX = isFullW ? 0 : Math.max(0, Math.min(natW - 20, finalBox.x));
+        const boxW = isFullW ? natW : Math.min(natW - boxX, finalBox.width);
+        const boxY = Math.max(0, Math.min(natH - 20, finalBox.y));
+        const boxH = Math.min(natH - boxY, finalBox.height);
+
+        const targetPanels = currentChapterPanels[targetPage] || [];
+        const nextNum = targetPanels.length + 1;
         const newId = `crop_manual_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
         const newPanel: DetectedPanel = {
           id: newId,
           x: boxX,
-          y: finalBox.y,
+          y: boxY,
           width: boxW,
-          height: finalBox.height,
+          height: boxH,
           confidence: 1.0,
           algorithm: 'manual',
-          label: `Zona ${String(nextNum).padStart(2, '0')}`,
+          label: `Quadro ${String(nextNum).padStart(2, '0')}`,
           pageWidth: natW,
           pageHeight: natH,
         };
 
-        const updated = [...detectedPanels, newPanel];
-        setPageDetectedPanels(currentPageNumber, updated);
+        const updated = [...targetPanels, newPanel];
+        setPageDetectedPanels(targetPage, updated);
+        if (targetPage !== currentPageNumber) {
+          onSelectPageNumber(targetPage);
+        }
         setSelectedPanelId(newId);
         setCropBox({
           x: newPanel.x,
@@ -2134,13 +2978,33 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
           width: newPanel.width,
           height: newPanel.height,
         });
-        showToast(`✂️ ${newPanel.label} criada! (${newPanel.width}×${newPanel.height}px)`);
+        showToast(`✂️ ${newPanel.label} enquadrado na área interna (${newPanel.width}×${newPanel.height}px)`);
       }
       drawingBoxRef.current = null;
       setDrawingBox(null);
+      setDrawingVisualRect(null);
+      setDrawingTargetPage(null);
+      drawingTargetPageRef.current = null;
     }
 
     if (dragMode) {
+      if (dragMode !== 'draw' && preDragSnapshotRef.current) {
+        const prevCrop = preDragSnapshotRef.current.cropBox;
+        if (
+          Math.abs(cropBox.x - prevCrop.x) > 1 ||
+          Math.abs(cropBox.y - prevCrop.y) > 1 ||
+          Math.abs(cropBox.width - prevCrop.width) > 1 ||
+          Math.abs(cropBox.height - prevCrop.height) > 1
+        ) {
+          undoStackRef.current.push(preDragSnapshotRef.current);
+          if (undoStackRef.current.length > 40) undoStackRef.current.shift();
+          redoStackRef.current = [];
+          setCanUndo(true);
+          setCanRedo(false);
+        }
+      }
+      preDragSnapshotRef.current = null;
+
       try {
         if (e.target && (e.target as HTMLElement).releasePointerCapture) {
           (e.target as HTMLElement).releasePointerCapture((e as any).pointerId);
@@ -2171,7 +3035,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       window.removeEventListener('pointermove', onGlobalPointerMove);
       window.removeEventListener('pointerup', onGlobalPointerUp);
     };
-  }, [dragMode, dragStart, naturalDimensions, selectedRatio, selectedPanelId]);
+  }, [dragMode, dragStart, naturalDimensions, selectedRatio, selectedPanelId, isFullWidthMode, visiblePageNumbers]);
 
   // Download single cropped frame
   const handleDownloadSingleFrame = (frame: FrameItem) => {
@@ -2547,23 +3411,66 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
 
           <div className="h-[1px] w-4 bg-white/10 my-0.5" />
 
-          {/* 100% Largura Tool */}
+          {/* Desfazer (Ctrl+Z) */}
+          <button
+            onClick={handleUndo}
+            disabled={!canUndo}
+            className={`p-2 rounded-xl transition-all ${
+              canUndo
+                ? 'text-muted-foreground hover:text-white hover:bg-white/10 cursor-pointer'
+                : 'text-white/20 cursor-not-allowed opacity-40'
+            }`}
+            title="Desfazer (Ctrl+Z)"
+          >
+            <Undo2 className="h-4 w-4" />
+          </button>
+
+          {/* Refazer (Ctrl+Y ou Ctrl+Shift+Z) */}
+          <button
+            onClick={handleRedo}
+            disabled={!canRedo}
+            className={`p-2 rounded-xl transition-all ${
+              canRedo
+                ? 'text-muted-foreground hover:text-white hover:bg-white/10 cursor-pointer'
+                : 'text-white/20 cursor-not-allowed opacity-40'
+            }`}
+            title="Refazer (Ctrl+Y ou Ctrl+Shift+Z)"
+          >
+            <Redo2 className="h-4 w-4" />
+          </button>
+
+          <div className="h-[1px] w-4 bg-white/10 my-0.5" />
+
+          {/* Auto-Foco no Quadro Tool (Substitui botão da toolbar) */}
           <button
             onClick={() => {
-              setIsFullWidthMode((prev) => {
+              setIsCropFocusActive((prev) => {
                 const next = !prev;
-                showToast(next ? '↔️ Largura Total ATIVADA (100% Manhwa)' : '🔓 Modo Largura Livre');
+                showToast(
+                  next
+                    ? '🎯 Auto-Foco no Quadro ATIVADO (Zoom ajustado ao selecionar)'
+                    : '🔓 Auto-Foco no Quadro DESATIVADO'
+                );
+                if (next && selectedPanelId) {
+                  const currentPanels = currentChapterPanels[currentPageNumber] || [];
+                  const activePanel = currentPanels.find((p) => p.id === selectedPanelId);
+                  if (activePanel) {
+                    focusCropBox(activePanel, currentPageNumber, true);
+                  } else if (cropBox) {
+                    focusCropBox(cropBox, currentPageNumber, true);
+                  }
+                }
                 return next;
               });
             }}
             className={`p-2 rounded-xl transition-all cursor-pointer ${
-              isFullWidthMode
-                ? 'bg-primary/20 text-primary border border-primary/30'
+              isCropFocusActive
+                ? 'bg-primary/20 text-primary border border-primary/30 shadow-sm'
                 : 'text-muted-foreground hover:text-white hover:bg-white/5'
             }`}
-            title="Fixar seleções em 100% da largura da imagem (W)"
+            title="Foco no Quadro e Ajuste Fino (F)"
           >
-            <ArrowRightLeft className="h-4 w-4" />
+            <Focus className="h-4 w-4" />
           </button>
 
           {/* Grade Tool */}
@@ -2651,11 +3558,69 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
           <button
             onClick={handleFitToScreen}
             className="flex items-center gap-1 px-2 py-0.5 rounded-lg hover:bg-white/10 text-muted-foreground hover:text-primary transition-colors cursor-pointer font-sans"
-            title="Ajustar à tela (Ctrl + 0)"
+            title="Ajustar todas as páginas visíveis à tela (Ctrl + 0)"
           >
             <Maximize2 className="h-3.5 w-3.5 text-primary" />
             <span className="text-[11px] font-medium text-white/80">Ajustar</span>
           </button>
+
+          <div className="h-3.5 w-[1px] bg-white/15 mx-0.5" />
+
+          {/* Multi-page controls (sem limite na quantidade de páginas) */}
+          <div className="flex items-center gap-1 font-sans">
+            <span
+              className="text-[10px] text-muted-foreground uppercase font-semibold pl-1 font-mono"
+              title="Quantidade de páginas exibidas simultaneamente lado a lado"
+            >
+              Págs:
+            </span>
+            <button
+              onClick={() => setPagesPerView((p) => Math.max(1, p - 1))}
+              disabled={pagesPerView <= 1}
+              className="p-1 rounded hover:bg-white/10 disabled:opacity-30 text-muted-foreground hover:text-white transition-colors cursor-pointer"
+              title="Exibir menos páginas lado a lado"
+            >
+              <Minus className="h-3 w-3" />
+            </button>
+            <input
+              type="number"
+              min={1}
+              max={Math.max(1, currentChapter.pages || 999)}
+              value={pagesPerView}
+              onChange={(e) => {
+                const val = Math.max(1, parseInt(e.target.value, 10) || 1);
+                setPagesPerView(val);
+              }}
+              className="w-10 text-center bg-black/40 border border-white/15 rounded px-1 py-0.5 font-mono text-[11px] font-bold text-cyan-300 focus:outline-hidden focus:border-cyan-400"
+              title="Digite quantas páginas quiser visualizar lado a lado (sem limites!)"
+            />
+            <button
+              onClick={() => setPagesPerView((p) => p + 1)}
+              className="p-1 rounded hover:bg-white/10 text-muted-foreground hover:text-white transition-colors cursor-pointer"
+              title="Exibir mais páginas lado a lado"
+            >
+              <Plus className="h-3 w-3" />
+            </button>
+            {currentChapter.pages > 1 && (
+              <button
+                onClick={() => {
+                  if (pagesPerView === currentChapter.pages) {
+                    setPagesPerView(3);
+                  } else {
+                    setPagesPerView(currentChapter.pages);
+                  }
+                }}
+                className={`px-1.5 py-0.5 rounded text-[10px] font-mono transition-colors cursor-pointer ${
+                  pagesPerView === currentChapter.pages
+                    ? 'bg-cyan-500/25 border border-cyan-400/50 text-cyan-300 font-bold'
+                    : 'hover:bg-white/10 text-muted-foreground hover:text-white border border-white/10'
+                }`}
+                title="Exibir todas as páginas do capítulo lado a lado"
+              >
+                Todas
+              </button>
+            )}
+          </div>
         </div>
 
           {/* Checkerboard Viewport */}
@@ -2711,10 +3676,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
             ) : (
               <div
                 ref={imageContainerRef}
-                onPointerDown={handleImagePointerDown}
-                onPointerMove={handlePointerMove}
-                onPointerUp={handlePointerUp}
-                className={`relative inline-block shadow-2xl my-auto ${
+                className={`relative inline-flex flex-row items-start gap-8 my-auto select-none ${
                   isHandModeActive
                     ? 'pointer-events-none'
                     : activeTool === 'zoom'
@@ -2724,326 +3686,445 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
                     : 'cursor-crosshair'
                 }`}
                 style={{
-                  width: `${(zoomLevel / 100) * 440}px`,
                   transform: `translate3d(${panOffset.x}px, ${panOffset.y}px, 0px)${
                     rotationAngle !== 0 ? ` rotate(${rotationAngle}deg)` : ''
                   }`,
                   transition: isPanning ? 'none' : 'transform 260ms cubic-bezier(0.16, 1, 0.3, 1)',
                 }}
               >
-                {/* Manhwa Page Artwork */}
-                <img
-                  ref={imageRef}
-                  src={currentImageUrl}
-                  onLoad={handleImageLoad}
-                  alt="Página do capítulo em recorte"
-                  width={704}
-                  height={1408}
-                  className="w-full h-auto block select-none pointer-events-none rounded shadow-2xl"
-                />
+                {visiblePageNumbers.map((pageNum) => {
+                  const isActivePage = pageNum === currentPageNumber;
+                  const pagePanels = currentChapterPanels[pageNum] || [];
+                  const pageUrl = getPageUrl(pageNum);
+                  const pageDim = pageDimensions[pageNum] || naturalDimensions;
+                  const natW = pageDim.width || 704;
+                  const natH = pageDim.height || 1408;
+                  const isDrawingOnThisPage = drawingTargetPage === pageNum && Boolean(drawingBox);
 
-                {/* SVG Dark Mask with cutouts for all active selection zones */}
-                {detectedPanels.length > 0 && (
-                  <svg className="absolute inset-0 w-full h-full pointer-events-none rounded overflow-hidden z-10">
-                    <defs>
-                      <mask id={`multi-crop-mask-${currentChapterId}-${currentPageNumber}`}>
-                        <rect width="100%" height="100%" fill="white" />
-                        {detectedPanels.map((p) => {
-                          const baseW = p.pageWidth || naturalDimensions.width || 704;
-                          const baseH = p.pageHeight || naturalDimensions.height || 1408;
-                          const isCurr = p.id === selectedPanelId;
-                          const liveX = isCurr ? cropBox.x : p.x;
-                          const liveY = isCurr ? cropBox.y : p.y;
-                          const liveW = isCurr ? cropBox.width : p.width;
-                          const liveH = isCurr ? cropBox.height : p.height;
+                  return (
+                    <div
+                      key={`page-canvas-col-${currentChapterId}-${pageNum}`}
+                      data-page-number={pageNum}
+                      className={`relative flex flex-col shrink-0 select-none transition-all duration-150 rounded-xl ${
+                        isActivePage
+                          ? 'ring-2 ring-primary/80 shadow-[0_0_35px_rgba(0,122,204,0.35)] z-10'
+                          : 'border border-white/10 hover:border-white/30 opacity-85 hover:opacity-100 shadow-2xl'
+                      }`}
+                      style={{
+                        width: `${(zoomLevel / 100) * 440}px`,
+                      }}
+                    >
+                      {/* Page Header Bar (Document title & click to select) */}
+                      <div
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (!isActivePage) onSelectPageNumber(pageNum);
+                        }}
+                        className={`h-6 flex items-center justify-between px-2 rounded-t-xl text-[10px] font-mono select-none cursor-pointer border-b transition-colors overflow-hidden whitespace-nowrap ${
+                          isActivePage
+                            ? 'bg-primary/20 border-primary/40 text-white'
+                            : 'bg-[#181922]/95 border-white/10 text-muted-foreground hover:text-white'
+                        }`}
+                        title={`Página ${pageNum}${isActivePage ? ' (Ativa)' : ' - Clique para ativar'}`}
+                      >
+                        <div className="flex items-center gap-1.5 min-w-0 truncate">
+                          <span className="font-bold text-[10px] text-white/95 truncate">
+                            Pág {pageNum}
+                          </span>
+                          {isActivePage && (
+                            <span
+                              className="h-1.5 w-1.5 rounded-full bg-cyan-400 shrink-0 shadow-[0_0_6px_#22d3ee] animate-pulse"
+                              title="Página Ativa"
+                            />
+                          )}
+                        </div>
+                        {pagePanels.length > 0 && (
+                          <span className="text-[9px] text-muted-foreground font-mono shrink-0 ml-1">
+                            {pagePanels.length}z
+                          </span>
+                        )}
+                      </div>
 
-                          // Subpixel & edge tolerance: if within 2px of edges, snap cut to exact 0% and 100%
+                      {/* Page Artwork & Overlays Container */}
+                      <div
+                        onPointerDown={(e) => handleImagePointerDown(e, pageNum)}
+                        onPointerMove={handlePointerMove}
+                        onPointerUp={handlePointerUp}
+                        className="relative w-full rounded-b-xl overflow-hidden bg-black/40"
+                      >
+                        {/* Page Image */}
+                        <img
+                          ref={(el) => {
+                            if (el) {
+                              pageImageRefs.current.set(pageNum, el);
+                              if (isActivePage) {
+                                (imageRef as any).current = el;
+                              }
+                            } else {
+                              pageImageRefs.current.delete(pageNum);
+                            }
+                          }}
+                          src={pageUrl}
+                          onLoad={(e) => handlePageImageLoad(pageNum, e)}
+                          alt={`Página ${pageNum}`}
+                          className="w-full h-auto block select-none pointer-events-none rounded-b-xl shadow-2xl"
+                        />
+
+                        {/* SVG Dark Mask for this page */}
+                        {pagePanels.length > 0 && (
+                          <svg className="absolute inset-0 w-full h-full pointer-events-none rounded-b-xl overflow-hidden z-10">
+                            <defs>
+                              <mask id={`multi-crop-mask-${currentChapterId}-${pageNum}`}>
+                                <rect width="100%" height="100%" fill="white" />
+                                {pagePanels.map((p) => {
+                                  const baseW = p.pageWidth || natW;
+                                  const baseH = p.pageHeight || natH;
+                                  const isCurr = p.id === selectedPanelId && isActivePage;
+                                  const liveX = isCurr ? cropBox.x : p.x;
+                                  const liveY = isCurr ? cropBox.y : p.y;
+                                  const liveW = isCurr ? cropBox.width : p.width;
+                                  const liveH = isCurr ? cropBox.height : p.height;
+
+                                  const isLeftEdge = liveX <= 2;
+                                  const isRightEdge = (liveX + liveW) >= (baseW - 2);
+                                  const svgX = isLeftEdge ? '0%' : `${(liveX / baseW) * 100}%`;
+                                  const svgW = (isLeftEdge && isRightEdge)
+                                    ? '100%'
+                                    : `${((isRightEdge ? (baseW - (isLeftEdge ? 0 : liveX)) : liveW) / baseW) * 100}%`;
+
+                                  return (
+                                    <rect
+                                      key={p.id}
+                                      x={svgX}
+                                      y={`${(liveY / baseH) * 100}%`}
+                                      width={svgW}
+                                      height={`${(liveH / baseH) * 100}%`}
+                                      fill="black"
+                                    />
+                                  );
+                                })}
+                                {isDrawingOnThisPage && drawingBox && (() => {
+                                  const baseW = natW;
+                                  const baseH = natH;
+                                  const isLeftEdge = drawingBox.x <= 2;
+                                  const isRightEdge = (drawingBox.x + drawingBox.width) >= (baseW - 2);
+                                  const svgX = isLeftEdge ? '0%' : `${(drawingBox.x / baseW) * 100}%`;
+                                  const svgW = (isLeftEdge && isRightEdge)
+                                    ? '100%'
+                                    : `${((isRightEdge ? (baseW - (isLeftEdge ? 0 : drawingBox.x)) : drawingBox.width) / baseW) * 100}%`;
+                                  return (
+                                    <rect
+                                      x={svgX}
+                                      y={`${(drawingBox.y / baseH) * 100}%`}
+                                      width={svgW}
+                                      height={`${(drawingBox.height / baseH) * 100}%`}
+                                      fill="black"
+                                    />
+                                  );
+                                })()}
+                              </mask>
+                            </defs>
+                            <rect
+                              width="100%"
+                              height="100%"
+                              fill="rgba(0, 0, 0, 0.65)"
+                              mask={`url(#multi-crop-mask-${currentChapterId}-${pageNum})`}
+                            />
+                          </svg>
+                        )}
+
+                        {/* Panels of this page */}
+                        {pagePanels.map((dp) => {
+                          const baseW = dp.pageWidth || natW;
+                          const baseH = dp.pageHeight || natH;
+                          const isSelected = dp.id === selectedPanelId && isActivePage;
+                          const liveX = isSelected ? cropBox.x : dp.x;
+                          const liveY = isSelected ? cropBox.y : dp.y;
+                          const liveW = isSelected ? cropBox.width : dp.width;
+                          const liveH = isSelected ? cropBox.height : dp.height;
+
                           const isLeftEdge = liveX <= 2;
                           const isRightEdge = (liveX + liveW) >= (baseW - 2);
-                          const svgX = isLeftEdge ? '0%' : `${(liveX / baseW) * 100}%`;
-                          const svgW = (isLeftEdge && isRightEdge)
-                            ? '100%'
-                            : `${((isRightEdge ? (baseW - (isLeftEdge ? 0 : liveX)) : liveW) / baseW) * 100}%`;
+                          const isFullPageW = isLeftEdge && isRightEdge;
 
+                          const pctX = isLeftEdge ? 0 : (liveX / baseW) * 100;
+                          const pctY = (liveY / baseH) * 100;
+                          const pctW = isFullPageW ? 100 : (liveW / baseW) * 100;
+                          const pctH = (liveH / baseH) * 100;
+
+                          if (isSelected) {
+                            return (
+                              <div
+                                key={dp.id}
+                                onPointerDown={(e) => handlePointerDown(e, 'move', dp, pageNum)}
+                                className={`absolute border-2 border-primary cursor-move select-none transition-shadow z-30 ${
+                                  isCropFlashing
+                                    ? 'ring-4 ring-primary shadow-[0_0_25px_oklch(78%_0.16_62)] scale-[1.01]'
+                                    : 'shadow-[0_0_0_1px_rgba(0,0,0,0.8),0_4px_16px_rgba(0,0,0,0.4)]'
+                                }`}
+                                style={{
+                                  left: `${pctX}%`,
+                                  top: `${pctY}%`,
+                                  width: `${pctW}%`,
+                                  height: `${pctH}%`,
+                                }}
+                              >
+                                {/* Floating Action Pill */}
+                                {(() => {
+                                  const matchingFrameForDp = frames.find(
+                                    (f) => (!f.chapterId || f.chapterId === currentChapterId) &&
+                                           f.pageNumber === pageNum &&
+                                           (f.panelId === dp.id || f.id === dp.id)
+                                  );
+                                  const isAlreadyCut = Boolean(matchingFrameForDp);
+                                  return (
+                                    <div
+                                      onPointerDown={(e) => e.stopPropagation()}
+                                      className="absolute -top-7 left-0 flex items-center gap-1.5 bg-[#14161b]/95 backdrop-blur-md border border-primary/40 px-2 py-0.5 rounded shadow-xl pointer-events-auto z-40 select-none whitespace-nowrap"
+                                    >
+                                      <span className="text-[10px] font-bold text-primary">{dp.label}</span>
+                                      <span className="text-[9px] font-mono text-muted-foreground">
+                                        {Math.round(cropBox.width)}×{Math.round(cropBox.height)}px
+                                      </span>
+                                      {isAlreadyCut && (
+                                        <span className="text-[9px] font-bold text-emerald-400 bg-emerald-500/20 px-1 py-0.2 rounded border border-emerald-500/30">
+                                          ✓ Recortado
+                                        </span>
+                                      )}
+                                      <div className="h-3 w-[1px] bg-border/60 mx-0.5" />
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handleFitPanelToFullWidth(dp.id, pageNum);
+                                        }}
+                                        className="p-0.5 rounded hover:bg-primary/20 text-muted-foreground hover:text-primary transition-colors cursor-pointer"
+                                        title="Ajustar para largura total (100% da imagem) - Atalho: W"
+                                      >
+                                        <ArrowRightLeft className="h-3 w-3 stroke-[2.5]" />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setIsPropertiesOpen(true);
+                                          setIsPropertiesCollapsed(false);
+                                        }}
+                                        className="p-0.5 rounded hover:bg-white/10 text-muted-foreground hover:text-cyan-400 transition-colors cursor-pointer"
+                                        title="Propriedades e Proporção (P)"
+                                      >
+                                        <SlidersHorizontal className="h-3 w-3 stroke-[2.5]" />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handleCropSinglePanel({
+                                            id: dp.id,
+                                            frameId: matchingFrameForDp?.id,
+                                            label: dp.label,
+                                            x: cropBox.x,
+                                            y: cropBox.y,
+                                            width: cropBox.width,
+                                            height: cropBox.height,
+                                            pageNum,
+                                          });
+                                        }}
+                                        className={`p-0.5 rounded transition-colors cursor-pointer ${
+                                          isAlreadyCut
+                                            ? 'hover:bg-emerald-500/20 text-emerald-400 hover:text-emerald-300'
+                                            : 'hover:bg-primary/20 text-muted-foreground hover:text-primary'
+                                        }`}
+                                        title={isAlreadyCut ? 'Atualizar recorte deste quadro' : 'Recortar esta seleção individual'}
+                                      >
+                                        <Check className="h-3 w-3 stroke-[2.5]" />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handleRemovePanel(dp.id, pageNum);
+                                        }}
+                                        className="p-0.5 rounded hover:bg-destructive/20 text-muted-foreground hover:text-red-400 transition-colors cursor-pointer"
+                                        title="Remover esta seleção (Del ou Backspace)"
+                                      >
+                                        <X className="h-3 w-3 stroke-[2.5]" />
+                                      </button>
+                                    </div>
+                                  );
+                                })()}
+
+                                {/* 3x3 Composition Grid */}
+                                {showGrid && (
+                                  <div className="absolute inset-0 grid grid-cols-3 grid-rows-3 pointer-events-none opacity-30">
+                                    {Array.from({ length: 9 }).map((_, i) => (
+                                      <div key={i} className="border border-primary/30" />
+                                    ))}
+                                  </div>
+                                )}
+
+                                {/* Resize Handles */}
+                                <span
+                                  onPointerDown={(e) => handlePointerDown(e, 'nw', dp, pageNum)}
+                                  className="absolute h-3 w-3 rounded-xs bg-primary -top-1.5 -left-1.5 cursor-nwse-resize shadow-md ring-1 ring-background z-20 after:absolute after:-inset-1.5 after:content-['']"
+                                  title="Redimensionar (Noroeste)"
+                                />
+                                <span
+                                  onPointerDown={(e) => handlePointerDown(e, 'ne', dp, pageNum)}
+                                  className="absolute h-3 w-3 rounded-xs bg-primary -top-1.5 -right-1.5 cursor-nesw-resize shadow-md ring-1 ring-background z-20 after:absolute after:-inset-1.5 after:content-['']"
+                                  title="Redimensionar (Nordeste)"
+                                />
+                                <span
+                                  onPointerDown={(e) => handlePointerDown(e, 'sw', dp, pageNum)}
+                                  className="absolute h-3 w-3 rounded-xs bg-primary -bottom-1.5 -left-1.5 cursor-nesw-resize shadow-md ring-1 ring-background z-20 after:absolute after:-inset-1.5 after:content-['']"
+                                  title="Redimensionar (Sudoeste)"
+                                />
+                                <span
+                                  onPointerDown={(e) => handlePointerDown(e, 'se', dp, pageNum)}
+                                  className="absolute h-3 w-3 rounded-xs bg-primary -bottom-1.5 -right-1.5 cursor-nwse-resize shadow-md ring-1 ring-background z-20 after:absolute after:-inset-1.5 after:content-['']"
+                                  title="Redimensionar (Sudeste)"
+                                />
+                                <span
+                                  onPointerDown={(e) => handlePointerDown(e, 'n', dp, pageNum)}
+                                  className="absolute h-1.5 w-6 rounded-xs bg-primary/90 top-[-3px] left-1/2 -translate-x-1/2 cursor-ns-resize shadow z-20 after:absolute after:-inset-1.5 after:content-['']"
+                                  title="Redimensionar (Topo)"
+                                />
+                                <span
+                                  onPointerDown={(e) => handlePointerDown(e, 's', dp, pageNum)}
+                                  className="absolute h-1.5 w-6 rounded-xs bg-primary/90 bottom-[-3px] left-1/2 -translate-x-1/2 cursor-ns-resize shadow z-20 after:absolute after:-inset-1.5 after:content-['']"
+                                  title="Redimensionar (Base)"
+                                />
+                                <span
+                                  onPointerDown={(e) => handlePointerDown(e, 'w', dp, pageNum)}
+                                  className="absolute w-1.5 h-6 rounded-xs bg-primary/90 left-[-3px] top-1/2 -translate-y-1/2 cursor-ew-resize shadow z-20 after:absolute after:-inset-1.5 after:content-['']"
+                                  title="Redimensionar (Esquerda)"
+                                />
+                                <span
+                                  onPointerDown={(e) => handlePointerDown(e, 'e', dp, pageNum)}
+                                  className="absolute w-1.5 h-6 rounded-xs bg-primary/90 right-[-3px] top-1/2 -translate-y-1/2 cursor-ew-resize shadow z-20 after:absolute after:-inset-1.5 after:content-['']"
+                                  title="Redimensionar (Direita)"
+                                />
+                              </div>
+                            );
+                          }
+
+                          // Inactive panel
                           return (
-                            <rect
-                              key={p.id}
-                              x={svgX}
-                              y={`${(liveY / baseH) * 100}%`}
-                              width={svgW}
-                              height={`${(liveH / baseH) * 100}%`}
-                              fill="black"
-                            />
+                            <div
+                              key={dp.id}
+                              onPointerDown={(e) => handlePointerDown(e, 'move', dp, pageNum)}
+                              className="absolute border border-dashed border-white/60 hover:border-primary hover:bg-primary/5 transition-all cursor-move group z-20"
+                              style={{
+                                left: `${pctX}%`,
+                                top: `${pctY}%`,
+                                width: `${pctW}%`,
+                                height: `${pctH}%`,
+                              }}
+                              title={`Clique ou arraste para selecionar ${dp.label} (Pág ${pageNum})`}
+                            >
+                              <div
+                                onPointerDown={(e) => e.stopPropagation()}
+                                className="absolute top-1 left-1 flex items-center gap-1 rounded bg-black/75 px-1.5 py-0.5 text-[9px] font-mono text-white/90 border border-white/10 shadow select-none group-hover:border-primary/50"
+                              >
+                                <span>{dp.label}</span>
+                                <span className="opacity-50 font-mono text-[8px]">{Math.round(dp.width)}×{Math.round(dp.height)}</span>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleRemovePanel(dp.id, pageNum);
+                                  }}
+                                  className="ml-0.5 p-0.5 hover:text-red-400 rounded transition-colors cursor-pointer"
+                                  title={`Remover ${dp.label}`}
+                                >
+                                  <X className="h-2.5 w-2.5" />
+                                </button>
+                              </div>
+                            </div>
                           );
                         })}
-                        {drawingBox && (() => {
-                          const baseW = naturalDimensions.width || 704;
-                          const baseH = naturalDimensions.height || 1408;
+
+                        {/* Drawing Box Preview on this specific page (fallback when no global overlay) */}
+                        {!drawingVisualRect && isDrawingOnThisPage && drawingBox && (() => {
                           const isLeftEdge = drawingBox.x <= 2;
-                          const isRightEdge = (drawingBox.x + drawingBox.width) >= (baseW - 2);
-                          const svgX = isLeftEdge ? '0%' : `${(drawingBox.x / baseW) * 100}%`;
-                          const svgW = (isLeftEdge && isRightEdge)
-                            ? '100%'
-                            : `${((isRightEdge ? (baseW - (isLeftEdge ? 0 : drawingBox.x)) : drawingBox.width) / baseW) * 100}%`;
+                          const isRightEdge = (drawingBox.x + drawingBox.width) >= (natW - 2);
+                          const isFullPageW = isLeftEdge && isRightEdge;
+
+                          const pctX = isLeftEdge ? 0 : (drawingBox.x / natW) * 100;
+                          const pctY = (drawingBox.y / natH) * 100;
+                          const pctW = isFullPageW ? 100 : (drawingBox.width / natW) * 100;
+                          const pctH = (drawingBox.height / natH) * 100;
+
                           return (
-                            <rect
-                              x={svgX}
-                              y={`${(drawingBox.y / baseH) * 100}%`}
-                              width={svgW}
-                              height={`${(drawingBox.height / baseH) * 100}%`}
-                              fill="black"
-                            />
-                          );
-                        })()}
-                      </mask>
-                    </defs>
-                    <rect
-                      width="100%"
-                      height="100%"
-                      fill="rgba(0, 0, 0, 0.65)"
-                      mask={`url(#multi-crop-mask-${currentChapterId}-${currentPageNumber})`}
-                    />
-                  </svg>
-                )}
-
-                {/* Render ALL Selection Squares */}
-                {detectedPanels.map((dp) => {
-                  const baseW = dp.pageWidth || naturalDimensions.width || 704;
-                  const baseH = dp.pageHeight || naturalDimensions.height || 1408;
-                  const isSelected = dp.id === selectedPanelId;
-                  const liveX = isSelected ? cropBox.x : dp.x;
-                  const liveY = isSelected ? cropBox.y : dp.y;
-                  const liveW = isSelected ? cropBox.width : dp.width;
-                  const liveH = isSelected ? cropBox.height : dp.height;
-
-                  const isLeftEdge = liveX <= 2;
-                  const isRightEdge = (liveX + liveW) >= (baseW - 2);
-                  const isFullPageW = isLeftEdge && isRightEdge;
-
-                  const pctX = isLeftEdge ? 0 : (liveX / baseW) * 100;
-                  const pctY = (liveY / baseH) * 100;
-                  const pctW = isFullPageW ? 100 : (liveW / baseW) * 100;
-                  const pctH = (liveH / baseH) * 100;
-
-                  if (isSelected) {
-                    return (
-                      <div
-                        key={dp.id}
-                        onPointerDown={(e) => handlePointerDown(e, 'move')}
-                        className={`absolute border-2 border-primary cursor-move select-none transition-shadow z-30 ${
-                          isCropFlashing
-                            ? 'ring-4 ring-primary shadow-[0_0_25px_oklch(78%_0.16_62)] scale-[1.01]'
-                            : 'shadow-[0_0_0_1px_rgba(0,0,0,0.8),0_4px_16px_rgba(0,0,0,0.4)]'
-                        }`}
-                        style={{
-                          left: `${pctX}%`,
-                          top: `${pctY}%`,
-                          width: `${pctW}%`,
-                          height: `${pctH}%`,
-                        }}
-                      >
-                        {/* Floating Action Pill above top edge - NEVER collides with corner handles */}
-                        {(() => {
-                          const matchingFrameForDp = pageFrames.find((f) => f.panelId === dp.id || f.id === dp.id) ||
-                            unifiedItems.find((it) => it.panelId === dp.id || it.id === dp.id)?.frame;
-                          const isAlreadyCut = isSelectionAlreadyCropped(dp) || Boolean(matchingFrameForDp);
-                          return (
-                            <div 
-                              onPointerDown={(e) => e.stopPropagation()}
-                              className="absolute -top-7 left-0 flex items-center gap-1.5 bg-[#14161b]/95 backdrop-blur-md border border-primary/40 px-2 py-0.5 rounded shadow-xl pointer-events-auto z-40 select-none whitespace-nowrap"
+                            <div
+                              className="absolute border-2 border-primary bg-primary/20 pointer-events-none z-30 ring-2 ring-primary/40 animate-pulse"
+                              style={{
+                                left: `${pctX}%`,
+                                top: `${pctY}%`,
+                                width: `${pctW}%`,
+                                height: `${pctH}%`,
+                              }}
                             >
-                              <span className="text-[10px] font-bold text-primary">{dp.label}</span>
-                              <span className="text-[9px] font-mono text-muted-foreground">{Math.round(cropBox.width)}×{Math.round(cropBox.height)}px</span>
-                              {isAlreadyCut && (
-                                <span className="text-[9px] font-bold text-emerald-400 bg-emerald-500/20 px-1 py-0.2 rounded border border-emerald-500/30">
-                                  ✓ Recortado
-                                </span>
-                              )}
-                              <div className="h-3 w-[1px] bg-border/60 mx-0.5" />
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  handleFitPanelToFullWidth(dp.id);
-                                }}
-                                className="p-0.5 rounded hover:bg-primary/20 text-muted-foreground hover:text-primary transition-colors cursor-pointer"
-                                title="Ajustar para largura total (100% da imagem) - Atalho: W"
-                              >
-                                <ArrowRightLeft className="h-3 w-3 stroke-[2.5]" />
-                              </button>
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setIsPropertiesOpen(true);
-                                  setIsPropertiesCollapsed(false);
-                                }}
-                                className="p-0.5 rounded hover:bg-white/10 text-muted-foreground hover:text-cyan-400 transition-colors cursor-pointer"
-                                title="Propriedades e Proporção (P)"
-                              >
-                                <SlidersHorizontal className="h-3 w-3 stroke-[2.5]" />
-                              </button>
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  handleCropSinglePanel({
-                                    id: dp.id,
-                                    frameId: matchingFrameForDp?.id,
-                                    label: dp.label,
-                                    x: cropBox.x,
-                                    y: cropBox.y,
-                                    width: cropBox.width,
-                                    height: cropBox.height,
-                                  });
-                                }}
-                                className={`p-0.5 rounded transition-colors cursor-pointer ${
-                                  isAlreadyCut
-                                    ? 'hover:bg-emerald-500/20 text-emerald-400 hover:text-emerald-300'
-                                    : 'hover:bg-primary/20 text-muted-foreground hover:text-primary'
-                                }`}
-                                title={isAlreadyCut ? 'Atualizar recorte deste quadro com o novo enquadramento' : 'Recortar esta seleção individual'}
-                              >
-                                <Check className="h-3 w-3 stroke-[2.5]" />
-                              </button>
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  handleRemovePanel(dp.id);
-                                }}
-                                className="p-0.5 rounded hover:bg-destructive/20 text-muted-foreground hover:text-red-400 transition-colors cursor-pointer"
-                                title="Remover esta seleção (Del ou Backspace)"
-                              >
-                                <X className="h-3 w-3 stroke-[2.5]" />
-                              </button>
+                              <div className="absolute -top-6 left-0 rounded bg-primary text-primary-foreground px-1.5 py-0.5 font-bold text-[10px] shadow flex items-center gap-1 font-mono whitespace-nowrap">
+                                <Crop className="h-2.5 w-2.5" />
+                                <span>Nova Zona ({Math.round(drawingBox.width)}×{Math.round(drawingBox.height)}px)</span>
+                              </div>
                             </div>
                           );
                         })()}
-
-                        {/* 3x3 Composition Grid (Rule of Thirds) - subtle lines */}
-                        {showGrid && (
-                          <div className="absolute inset-0 grid grid-cols-3 grid-rows-3 pointer-events-none opacity-30">
-                            {Array.from({ length: 9 }).map((_, i) => (
-                              <div key={i} className="border border-primary/30" />
-                            ))}
-                          </div>
-                        )}
-
-                        {/* Corner Handles with enlarged hit area */}
-                        <span
-                          onPointerDown={(e) => handlePointerDown(e, 'nw')}
-                          className="absolute h-3 w-3 rounded-xs bg-primary -top-1.5 -left-1.5 cursor-nwse-resize shadow-md ring-1 ring-background z-20 after:absolute after:-inset-1.5 after:content-['']"
-                          title="Redimensionar (Noroeste)"
-                        />
-                        <span
-                          onPointerDown={(e) => handlePointerDown(e, 'ne')}
-                          className="absolute h-3 w-3 rounded-xs bg-primary -top-1.5 -right-1.5 cursor-nesw-resize shadow-md ring-1 ring-background z-20 after:absolute after:-inset-1.5 after:content-['']"
-                          title="Redimensionar (Nordeste)"
-                        />
-                        <span
-                          onPointerDown={(e) => handlePointerDown(e, 'sw')}
-                          className="absolute h-3 w-3 rounded-xs bg-primary -bottom-1.5 -left-1.5 cursor-nesw-resize shadow-md ring-1 ring-background z-20 after:absolute after:-inset-1.5 after:content-['']"
-                          title="Redimensionar (Sudoeste)"
-                        />
-                        <span
-                          onPointerDown={(e) => handlePointerDown(e, 'se')}
-                          className="absolute h-3 w-3 rounded-xs bg-primary -bottom-1.5 -right-1.5 cursor-nwse-resize shadow-md ring-1 ring-background z-20 after:absolute after:-inset-1.5 after:content-['']"
-                          title="Redimensionar (Sudeste)"
-                        />
-
-                        {/* Edge Handles with enlarged hit area */}
-                        <span
-                          onPointerDown={(e) => handlePointerDown(e, 'n')}
-                          className="absolute h-1.5 w-6 rounded-xs bg-primary/90 top-[-3px] left-1/2 -translate-x-1/2 cursor-ns-resize shadow z-20 after:absolute after:-inset-1.5 after:content-['']"
-                          title="Redimensionar (Topo)"
-                        />
-                        <span
-                          onPointerDown={(e) => handlePointerDown(e, 's')}
-                          className="absolute h-1.5 w-6 rounded-xs bg-primary/90 bottom-[-3px] left-1/2 -translate-x-1/2 cursor-ns-resize shadow z-20 after:absolute after:-inset-1.5 after:content-['']"
-                          title="Redimensionar (Base)"
-                        />
-                        <span
-                          onPointerDown={(e) => handlePointerDown(e, 'w')}
-                          className="absolute w-1.5 h-6 rounded-xs bg-primary/90 left-[-3px] top-1/2 -translate-y-1/2 cursor-ew-resize shadow z-20 after:absolute after:-inset-1.5 after:content-['']"
-                          title="Redimensionar (Esquerda)"
-                        />
-                        <span
-                          onPointerDown={(e) => handlePointerDown(e, 'e')}
-                          className="absolute w-1.5 h-6 rounded-xs bg-primary/90 right-[-3px] top-1/2 -translate-y-1/2 cursor-ew-resize shadow z-20 after:absolute after:-inset-1.5 after:content-['']"
-                          title="Redimensionar (Direita)"
-                        />
-                      </div>
-                    );
-                  }
-
-                  // Inactive selection square - clean, unpolluted, transparent, immediate click-to-drag
-                  return (
-                    <div
-                      key={dp.id}
-                      onPointerDown={(e) => handlePointerDown(e, 'move', dp)}
-                      className="absolute border border-dashed border-white/60 hover:border-primary hover:bg-primary/5 transition-all cursor-move group z-20"
-                      style={{
-                        left: `${pctX}%`,
-                        top: `${pctY}%`,
-                        width: `${pctW}%`,
-                        height: `${pctH}%`,
-                      }}
-                      title={`Clique ou arraste para selecionar ${dp.label}`}
-                    >
-                      {/* Subtle corner tag with label and remove button */}
-                      <div 
-                        onPointerDown={(e) => e.stopPropagation()}
-                        className="absolute top-1 left-1 flex items-center gap-1 rounded bg-black/75 px-1.5 py-0.5 text-[9px] font-mono text-white/90 border border-white/10 shadow select-none group-hover:border-primary/50"
-                      >
-                        <span>{dp.label}</span>
-                        <span className="opacity-50 font-mono text-[8px]">{Math.round(dp.width)}×{Math.round(dp.height)}</span>
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleRemovePanel(dp.id);
-                          }}
-                          className="ml-0.5 p-0.5 hover:text-red-400 rounded transition-colors cursor-pointer"
-                          title={`Remover ${dp.label}`}
-                        >
-                          <X className="h-2.5 w-2.5" />
-                        </button>
                       </div>
                     </div>
                   );
                 })}
+              </div>
+            )}
 
-                {/* Drawing Box Preview during Tool C drag */}
-                {drawingBox && (() => {
-                  const baseW = naturalDimensions.width || 704;
-                  const baseH = naturalDimensions.height || 1408;
-                  const isLeftEdge = drawingBox.x <= 2;
-                  const isRightEdge = (drawingBox.x + drawingBox.width) >= (baseW - 2);
-                  const isFullPageW = isLeftEdge && isRightEdge;
+            {/* Global Viewport Drawing Overlay (Free rectangle across and outside images) */}
+            {dragMode === 'draw' && drawingVisualRect && (
+              <div
+                className="absolute border-2 border-orange-500 bg-orange-500/15 pointer-events-none z-40 shadow-[0_0_15px_rgba(249,115,22,0.35)]"
+                style={{
+                  left: `${drawingVisualRect.left}px`,
+                  top: `${drawingVisualRect.top}px`,
+                  width: `${drawingVisualRect.width}px`,
+                  height: `${drawingVisualRect.height}px`,
+                }}
+              >
+                {/* 8 Handles matching reference image */}
+                <span className="absolute -top-1 -left-1 w-2.5 h-2.5 bg-orange-500 shadow-xs border border-black/50" />
+                <span className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-orange-500 shadow-xs border border-black/50" />
+                <span className="absolute -bottom-1 -left-1 w-2.5 h-2.5 bg-orange-500 shadow-xs border border-black/50" />
+                <span className="absolute -bottom-1 -right-1 w-2.5 h-2.5 bg-orange-500 shadow-xs border border-black/50" />
+                <span className="absolute -top-1 left-1/2 -translate-x-1/2 w-2.5 h-2.5 bg-orange-500 shadow-xs border border-black/50" />
+                <span className="absolute -bottom-1 left-1/2 -translate-x-1/2 w-2.5 h-2.5 bg-orange-500 shadow-xs border border-black/50" />
+                <span className="absolute top-1/2 -left-1 -translate-y-1/2 w-2.5 h-2.5 bg-orange-500 shadow-xs border border-black/50" />
+                <span className="absolute top-1/2 -right-1 -translate-y-1/2 w-2.5 h-2.5 bg-orange-500 shadow-xs border border-black/50" />
 
-                  const pctX = isLeftEdge ? 0 : (drawingBox.x / baseW) * 100;
-                  const pctY = (drawingBox.y / baseH) * 100;
-                  const pctW = isFullPageW ? 100 : (drawingBox.width / baseW) * 100;
-                  const pctH = (drawingBox.height / baseH) * 100;
-
-                  return (
-                    <div
-                      className="absolute border-2 border-primary bg-primary/20 pointer-events-none z-30 ring-2 ring-primary/40 animate-pulse"
-                      style={{
-                        left: `${pctX}%`,
-                        top: `${pctY}%`,
-                        width: `${pctW}%`,
-                        height: `${pctH}%`,
-                      }}
-                    >
-                      <div className="absolute -top-6 left-0 rounded bg-primary text-primary-foreground px-1.5 py-0.5 font-bold text-[10px] shadow flex items-center gap-1 font-mono whitespace-nowrap">
-                        <Crop className="h-2.5 w-2.5" />
-                        <span>Nova Zona ({drawingBox.width}×{drawingBox.height}px)</span>
-                      </div>
-                    </div>
-                  );
-                })()}
+                {/* Top HUD Tag matching reference image */}
+                <div
+                  className={`absolute ${
+                    drawingVisualRect.top < 28 ? 'top-1' : '-top-7'
+                  } left-0 rounded bg-[#1e2029]/95 border border-orange-500/60 text-white px-2 py-0.5 font-bold text-[10px] shadow-xl flex items-center gap-1.5 font-mono whitespace-nowrap`}
+                >
+                  <span className="text-orange-400">
+                    Quadro {drawingTargetPage ? `(Pág ${drawingTargetPage})` : ''}
+                  </span>
+                  <span className="text-white/30">|</span>
+                  <span>
+                    {Math.round(drawingVisualRect.clampedW)}×{Math.round(drawingVisualRect.clampedH)}px
+                  </span>
+                  {drawingVisualRect.clampedW >= 20 && drawingVisualRect.clampedH >= 20 ? (
+                    <>
+                      <span className="text-white/30">|</span>
+                      <span className="text-emerald-400 font-semibold">Área Interna</span>
+                    </>
+                  ) : (
+                    <>
+                      <span className="text-white/30">|</span>
+                      <span className="text-amber-400/80 font-normal">Fora da Imagem</span>
+                    </>
+                  )}
+                </div>
               </div>
             )}
           </div>
@@ -3437,6 +4518,7 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
                 {Array.from({ length: currentChapter.pages }).map((_, idx) => {
                   const pageNum = idx + 1;
                   const isSelected = pageNum === currentPageNumber;
+                  const isVisibleOnCanvas = visiblePageNumbers.includes(pageNum);
                   const hasFrames = frames.some(
                     (f) => (!f.chapterId || f.chapterId === currentChapterId) && f.pageNumber === pageNum
                   );
@@ -3451,9 +4533,11 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
                       className={`group relative h-[60px] w-[40px] shrink-0 overflow-hidden rounded-lg border transition-all cursor-pointer ${
                         isSelected
                           ? 'border-primary ring-2 ring-primary/60 scale-105 shadow-md shadow-primary/25 z-10'
-                          : 'border-white/10 opacity-70 hover:opacity-100 hover:border-white/30'
+                          : isVisibleOnCanvas
+                          ? 'border-cyan-400/50 ring-1 ring-cyan-400/30 opacity-90 hover:opacity-100 shadow-sm'
+                          : 'border-white/10 opacity-60 hover:opacity-100 hover:border-white/30'
                       }`}
-                      title={`Página ${pageNum} (${pagePanelsCount} zonas, ${hasFrames ? 'recortada' : 'não recortada'})`}
+                      title={`Página ${pageNum} (${pagePanelsCount} zonas, ${hasFrames ? 'recortada' : 'não recortada'}${isVisibleOnCanvas ? ' · Visível na tela' : ''})`}
                     >
                       {thumbUrl ? (
                         <img
@@ -3492,43 +4576,6 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
       {/* ======================================================== */}
       <div className="w-full lg:w-[320px] shrink-0 border-t border-border bg-[#161720] lg:h-[calc(100vh-61px)] lg:border-t-0 lg:border-l border-white/10 flex flex-col justify-between overflow-y-auto z-10">
         <div>
-          {/* Top Header: Capítulo & Navegação de Páginas (Estilo Photoshop / Figma) */}
-          <div className="border-b border-white/10 px-3.5 py-2 flex items-center justify-between bg-[#14151e]">
-            {/* Seletor de Capítulo (abre gaveta de capítulos) */}
-            <button
-              onClick={() => setIsChaptersDrawerOpen(true)}
-              className="flex items-center gap-1.5 px-2 py-1 rounded-lg hover:bg-white/5 text-xs font-semibold text-white transition-colors cursor-pointer min-w-0"
-              title="Abrir gaveta de capítulos"
-            >
-              <FolderUp className="h-3.5 w-3.5 text-primary shrink-0" />
-              <span className="truncate max-w-[110px] font-display text-[11px]">{currentChapter.label}</span>
-              <ChevronDown className="h-3 w-3 text-muted-foreground shrink-0" />
-            </button>
-
-            {/* Navegação de Página Compacta */}
-            <div className="flex items-center gap-1 bg-black/40 border border-white/10 rounded-lg px-1.5 py-0.5 text-xs font-mono">
-              <button
-                onClick={() => onSelectPageNumber(Math.max(1, currentPageNumber - 1))}
-                disabled={currentPageNumber <= 1}
-                className="p-1 rounded hover:bg-white/10 disabled:opacity-30 cursor-pointer text-muted-foreground hover:text-white transition-colors"
-                title="Página anterior (Seta Esquerda)"
-              >
-                <ChevronLeft className="h-3.5 w-3.5" />
-              </button>
-              <span className="px-1 font-bold text-[11px] text-white">
-                {currentPageNumber} <span className="text-muted-foreground font-normal">/ {Math.max(1, currentChapter.pages)}</span>
-              </span>
-              <button
-                onClick={() => onSelectPageNumber(Math.min(currentChapter.pages, currentPageNumber + 1))}
-                disabled={currentPageNumber >= currentChapter.pages}
-                className="p-1 rounded hover:bg-white/10 disabled:opacity-30 cursor-pointer text-muted-foreground hover:text-white transition-colors"
-                title="Próxima página (Seta Direita)"
-              >
-                <ChevronRight className="h-3.5 w-3.5" />
-              </button>
-            </div>
-          </div>
-
           {/* Photoshop Style Docked Tab Strip (from image_b7e5a9.png) */}
           <div className="h-8 border-b border-white/10 bg-[#14151e] flex items-stretch text-[11px] select-none">
             {/* Aba 1: Quadros (Layers) */}
@@ -3764,9 +4811,62 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
             {/* Manual Framing Controls - Shown in Manual Tab */}
             {inspectorTab === 'manual' && (
               <div className="flex-1 min-h-0 flex flex-col space-y-2">
+                {/* Primary Action Buttons (Always accessible without switching tabs) */}
+                <div className="space-y-1.5 shrink-0">
+                  <div className="flex gap-1.5">
+                    <button
+                      onClick={() => handleRunAutoDetection()}
+                      disabled={isDetecting || chapters.length === 0}
+                      className="flex-1 py-1.5 px-2 rounded-lg bg-card hover:bg-white/[0.08] text-white text-xs font-semibold transition-all flex items-center justify-center gap-1.5 border border-white/10 disabled:opacity-40 cursor-pointer shadow-xs"
+                      title="Detectar quadros apenas na página atual (Atalho: D)"
+                    >
+                      {isDetecting ? (
+                        <Loader2 className="h-3 w-3 animate-spin text-primary" />
+                      ) : (
+                        <Sparkles className="h-3 w-3 text-primary" />
+                      )}
+                      <span>Detectar (D)</span>
+                    </button>
+                    <button
+                      onClick={handleCropPagePanels}
+                      disabled={isDetecting || chapters.length === 0}
+                      className="flex-1 py-1.5 px-2 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-300 text-xs font-semibold transition-all flex items-center justify-center gap-1.5 disabled:opacity-40 cursor-pointer shadow-xs"
+                      title="Recorta os quadros selecionados desta página para a timeline (Atalho: Shift+Enter ou X)"
+                    >
+                      <Check className="h-3 w-3 stroke-[2.5]" />
+                      <span>Recortar ({detectedPanels.length})</span>
+                    </button>
+                  </div>
+
+                  <div className="flex gap-1.5">
+                    <button
+                      onClick={() => handleBatchDetectChapter()}
+                      disabled={isBatchProcessing || chapters.length === 0}
+                      className="flex-1 py-1.5 px-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 hover:bg-amber-500/20 text-[11px] font-bold transition-all flex items-center justify-center gap-1 disabled:opacity-40 shadow-xs cursor-pointer"
+                      title="Detecta e salva as seleções em todas as páginas do capítulo"
+                    >
+                      {isBatchProcessing && batchProgress.mode === 'detect' ? (
+                        <Loader2 className="h-3 w-3 animate-spin text-amber-400" />
+                      ) : (
+                        <Zap className="h-3 w-3 text-amber-400" />
+                      )}
+                      <span>⚡ Detectar Lote</span>
+                    </button>
+                    <button
+                      onClick={handleBatchProcessChapter}
+                      disabled={isBatchProcessing || chapters.length === 0}
+                      className="flex-1 py-1.5 px-2 rounded-lg bg-primary text-primary-foreground text-[11px] font-bold hover:brightness-110 active:scale-[0.98] transition-all flex items-center justify-center gap-1 disabled:opacity-40 shadow-xs cursor-pointer"
+                      title="Recorta todos os quadros do capítulo para a timeline"
+                    >
+                      <Layers className="h-3 w-3" />
+                      <span>Recortar Lote</span>
+                    </button>
+                  </div>
+                </div>
+
                 {/* Unified Container: Quadros da Página (Zonas + Recortes integrados num único item) */}
                 <div className="rounded-xl border border-white/10 bg-card/60 p-2.5 space-y-2 backdrop-blur-md shadow-md shadow-black/20 flex-1 flex flex-col min-h-0">
-                  {/* Header: Title + Recortar Todas + Nova Zona + Limpar */}
+                  {/* Header: Title + Nova Zona + Menu Limpar (sem estouro de container) */}
                   <div className="flex items-center justify-between pb-0.5">
                     <div className="flex items-center gap-1.5 min-w-0">
                       <Crop className="h-3.5 w-3.5 text-primary shrink-0" />
@@ -3778,51 +4878,65 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
                     <div className="flex items-center gap-1 shrink-0">
                       <button
                         type="button"
-                        onClick={() => handleRunAutoDetection()}
-                        disabled={isDetecting || chapters.length === 0}
-                        className="px-1.5 py-0.5 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 text-muted-foreground hover:text-white text-[10px] font-bold transition-colors flex items-center gap-1 cursor-pointer disabled:opacity-40"
-                        title="Detectar quadros desta página automaticamente (Atalho: D)"
-                      >
-                        <Sparkles className="h-3 w-3 text-primary" />
-                        <span>Detectar (D)</span>
-                      </button>
-
-                      {detectedPanels.length > 0 && (
-                        <button
-                          type="button"
-                          onClick={handleCropPagePanels}
-                          disabled={isDetecting || chapters.length === 0}
-                          className="px-1.5 py-0.5 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 hover:bg-emerald-500/25 text-[10px] font-bold transition-colors flex items-center gap-1 cursor-pointer"
-                          title="Recortar todos os quadros da página (Atalho: Shift+Enter ou X)"
-                        >
-                          <Check className="h-3 w-3 stroke-[2.5]" />
-                          <span>Recortar ({detectedPanels.length})</span>
-                        </button>
-                      )}
-
-                      <button
-                        type="button"
                         onClick={handleAddManualCropZone}
-                        className="px-2 py-0.5 rounded-lg bg-primary/20 text-primary hover:bg-primary/30 text-[10px] font-bold transition-colors flex items-center gap-1 cursor-pointer"
+                        className="px-2 py-0.5 rounded-lg bg-primary/20 border border-primary/30 text-primary hover:bg-primary/30 text-[10px] font-bold transition-colors flex items-center gap-1 cursor-pointer shadow-xs"
                         title="Criar nova zona de corte (+)"
                       >
                         <Plus className="h-3 w-3" />
                         <span>Nova Zona</span>
                       </button>
-                      {unifiedItems.length > 0 && (
+
+                      {/* Dropdown de Limpeza (Página Atual ou Todas) */}
+                      <div className="relative">
                         <button
                           type="button"
-                          onClick={() => {
-                            handleClearAllPanels();
-                            pageFrames.forEach((f) => onRemoveFrame(f.id));
-                            showToast('🗑️ Quadros e zonas desta página foram limpos');
-                          }}
+                          onClick={() => setIsClearMenuOpen((prev) => !prev)}
                           className="p-1 rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors cursor-pointer"
-                          title="Remover todos os quadros e zonas desta página"
+                          title="Opções de limpeza de quadros"
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
-                      )}
+
+                        {isClearMenuOpen && (
+                          <div className="absolute right-0 top-full mt-1 w-56 bg-[#181926] border border-white/15 rounded-lg shadow-2xl p-1 z-50 text-[11px] font-medium space-y-0.5 backdrop-blur-xl">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setIsClearMenuOpen(false);
+                                handleClearCurrentPage();
+                              }}
+                              className="w-full text-left px-2 py-1.5 rounded hover:bg-destructive/20 text-destructive flex items-center gap-2 cursor-pointer transition-colors"
+                            >
+                              <Trash2 className="h-3 w-3 shrink-0" />
+                              <span>Limpar Página {currentPageNumber}</span>
+                            </button>
+                            {visiblePageNumbers.length > 1 && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setIsClearMenuOpen(false);
+                                  handleClearVisiblePages();
+                                }}
+                                className="w-full text-left px-2 py-1.5 rounded hover:bg-destructive/20 text-destructive flex items-center gap-2 cursor-pointer transition-colors"
+                              >
+                                <Trash2 className="h-3 w-3 shrink-0" />
+                                <span>Limpar Páginas Visíveis ({visiblePageNumbers.length} págs)</span>
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setIsClearMenuOpen(false);
+                                handleClearAllChapterPanels();
+                              }}
+                              className="w-full text-left px-2 py-1.5 rounded hover:bg-destructive/20 text-destructive flex items-center gap-2 cursor-pointer transition-colors"
+                            >
+                              <Trash2 className="h-3 w-3 shrink-0" />
+                              <span>Limpar Todas as Páginas</span>
+                            </button>
+                          </div>
+                        )}
+                      </div>
                     </div>
                   </div>
 
@@ -3833,15 +4947,20 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
                         Nenhum quadro nesta página ainda. Arraste com <strong className="text-white">Corte (C)</strong> ou clique em <strong className="text-white">+ Nova Zona</strong>.
                       </div>
                     ) : (
-                      unifiedItems.map((item) => {
+                      unifiedItems.map((item, idx) => {
                         const isCurr = item.panelId ? item.panelId === selectedPanelId : false;
                         const cleanLabel = item.label.replace(/\s*\(Pág\.\s*\d+\)/i, '').trim();
 
                         const handleSelectThisItem = () => {
-                          const targetX = item.x || item.panel?.x || item.frame?.cropRect?.x || 0;
-                          const targetY = item.y || item.panel?.y || item.frame?.cropRect?.y || 0;
-                          const targetW = item.width || item.panel?.width || item.frame?.cropRect?.width || 620;
-                          const targetH = item.height || item.panel?.height || item.frame?.cropRect?.height || 349;
+                          const targetPage = item.pageNum || currentPageNumber;
+                          if (targetPage !== currentPageNumber) {
+                            onSelectPageNumber(targetPage);
+                          }
+
+                          const targetX = item.panel ? item.panel.x : (item.frame?.cropRect?.x ?? (typeof item.x === 'number' ? item.x : 0));
+                          const targetY = item.panel ? item.panel.y : (item.frame?.cropRect?.y ?? (typeof item.y === 'number' ? item.y : 0));
+                          const targetW = item.panel ? item.panel.width : (item.frame?.cropRect?.width ?? (typeof item.width === 'number' ? item.width : 620));
+                          const targetH = item.panel ? item.panel.height : (item.frame?.cropRect?.height ?? (typeof item.height === 'number' ? item.height : 349));
 
                           if (item.panelId) {
                             setSelectedPanelId(item.panelId);
@@ -3854,12 +4973,45 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
                             height: targetH,
                           };
                           setCropBox(targetBox);
-                          focusCropBox(targetBox);
+                          focusCropBox(targetBox, targetPage, isCropFocusActive);
                         };
 
                         return (
                           <div
                             key={item.id}
+                            draggable
+                            onDragStart={(e) => {
+                              setDraggedSidebarIndex(idx);
+                              e.dataTransfer.setData('text/plain', String(idx));
+                              e.dataTransfer.effectAllowed = 'move';
+                            }}
+                            onDragOver={(e) => {
+                              e.preventDefault();
+                              e.dataTransfer.dropEffect = 'move';
+                              if (dragOverSidebarIndex !== idx) {
+                                setDragOverSidebarIndex(idx);
+                              }
+                            }}
+                            onDragLeave={() => {
+                              if (dragOverSidebarIndex === idx) {
+                                setDragOverSidebarIndex(null);
+                              }
+                            }}
+                            onDrop={(e) => {
+                              e.preventDefault();
+                              const dataIdx = e.dataTransfer.getData('text/plain');
+                              const parsedIdx = dataIdx !== '' ? parseInt(dataIdx, 10) : null;
+                              const fromIdx = parsedIdx !== null && !isNaN(parsedIdx) ? parsedIdx : draggedSidebarIndex;
+                              if (fromIdx !== null && fromIdx !== idx) {
+                                handleReorderSidebarItems(fromIdx, idx);
+                              }
+                              setDraggedSidebarIndex(null);
+                              setDragOverSidebarIndex(null);
+                            }}
+                            onDragEnd={() => {
+                              setDraggedSidebarIndex(null);
+                              setDragOverSidebarIndex(null);
+                            }}
                             onClick={handleSelectThisItem}
                             onDoubleClick={() => {
                               if (item.frame) setPreviewFrame(item.frame);
@@ -3874,15 +5026,22 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
                                 item,
                               });
                             }}
-                            className={`group flex items-center justify-between gap-2.5 px-2.5 py-1.5 rounded-lg border transition-all cursor-pointer select-none ${
-                              isCurr
+                            className={`group flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg border transition-all cursor-pointer select-none ${
+                              dragOverSidebarIndex === idx
+                                ? 'ring-2 ring-primary border-primary bg-primary/25 scale-[1.01]'
+                                : isCurr
                                 ? 'bg-primary/20 border-primary/50 text-white shadow-xs'
                                 : 'bg-card/40 hover:bg-white/[0.04] border-white/5 hover:border-white/10 text-muted-foreground hover:text-white'
                             }`}
-                            title="Clique para selecionar · Botão direito para opções"
+                            title="Clique para selecionar · Arraste para reordenar · Botão direito para opções"
                           >
-                            {/* Left: Thumbnail & Name (Photoshop style) */}
-                            <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                            {/* Left: Drag Handle, Thumbnail & Name */}
+                            <div className="flex items-center gap-2 min-w-0 flex-1">
+                              {/* Drag Grip Handle */}
+                              <span title="Arraste para reordenar" className="cursor-grab shrink-0">
+                                <GripVertical className="h-3.5 w-3.5 text-muted-foreground/40 group-hover:text-muted-foreground hover:!text-white transition-colors" />
+                              </span>
+
                               {/* Thumbnail (Clean, compact layer thumbnail) */}
                               {item.isCropped && item.src ? (
                                 <div
@@ -3916,8 +5075,8 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
                               </span>
                             </div>
 
-                            {/* Right: Subtle Status Indicator & Context Menu Trigger */}
-                            <div className="flex items-center gap-1.5 shrink-0">
+                            {/* Right: Subtle Status Indicator, Trash & Context Menu Trigger */}
+                            <div className="flex items-center gap-1 shrink-0">
                               <span
                                 className={`h-1.5 w-1.5 rounded-full shrink-0 ${
                                   item.isCropped ? 'bg-emerald-400' : 'bg-amber-400/80'
@@ -3925,6 +5084,20 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
                                 title={item.isCropped ? 'Recortado' : 'Pendente de recorte'}
                               />
 
+                              {/* Quick Delete / Trash Button */}
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleDeleteSidebarItem(item);
+                                }}
+                                className="p-1 rounded text-muted-foreground hover:text-red-400 hover:bg-destructive/10 opacity-70 group-hover:opacity-100 transition-all cursor-pointer"
+                                title={`Excluir ${cleanLabel}`}
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+
+                              {/* More Options Button */}
                               <button
                                 type="button"
                                 onClick={(e) => {
@@ -4149,6 +5322,24 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
                     <span className="text-gray-300">Ferramenta Zoom</span>
                     <kbd className="font-mono text-white bg-black/60 px-2 py-0.5 rounded border border-white/20">
                       Z (Clique ampl. / Alt+Clique red.)
+                    </kbd>
+                  </div>
+                  <div className="flex items-center justify-between p-1.5 rounded bg-[#20232a]">
+                    <span className="text-gray-300">Auto-Foco no Quadro (Zoom de Ajuste Fino)</span>
+                    <kbd className="font-mono text-cyan-400 bg-black/60 px-2 py-0.5 rounded border border-cyan-400/30">
+                      F
+                    </kbd>
+                  </div>
+                  <div className="flex items-center justify-between p-1.5 rounded bg-[#20232a]">
+                    <span className="text-gray-300">Navegar entre Quadros da Página</span>
+                    <kbd className="font-mono text-cyan-400 bg-black/60 px-2 py-0.5 rounded border border-cyan-400/30">
+                      Seta Cima / Baixo
+                    </kbd>
+                  </div>
+                  <div className="flex items-center justify-between p-1.5 rounded bg-[#20232a]">
+                    <span className="text-gray-300">Mudar Foco entre Páginas</span>
+                    <kbd className="font-mono text-cyan-400 bg-black/60 px-2 py-0.5 rounded border border-cyan-400/30">
+                      Seta Esquerda / Direita
                     </kbd>
                   </div>
                 </div>
