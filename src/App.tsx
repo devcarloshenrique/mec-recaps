@@ -5,6 +5,7 @@ import { RoteiroView } from './components/RoteiroView';
 import { NarracaoView } from './components/NarracaoView';
 import { MontagemView } from './components/MontagemView';
 import { ExportModal } from './components/ExportModal';
+import { ChaptersDrawer } from './components/ChaptersDrawer';
 import {
   ChapterItem,
   FrameItem,
@@ -33,6 +34,7 @@ import {
   RotateCcw,
   Sparkles,
   CheckCircle2,
+  Check,
   AlertCircle,
   FileCode,
   Save,
@@ -52,6 +54,18 @@ const DEMO_CHAPTERS: ChapterItem[] = [
     done: 3,
     imageUrls: [
       '/assets/page-01.jpg',
+      '/assets/page-01.jpg',
+      '/assets/page-01.jpg',
+      '/assets/page-01.jpg',
+      '/assets/page-01.jpg',
+    ],
+  },
+  {
+    id: 'chap_demo_02',
+    label: 'Capítulo 02 — O Despertar do Monarca',
+    pages: 4,
+    done: 0,
+    imageUrls: [
       '/assets/page-01.jpg',
       '/assets/page-01.jpg',
       '/assets/page-01.jpg',
@@ -242,6 +256,7 @@ export default function App() {
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
   const [isConfirmClearModalOpen, setIsConfirmClearModalOpen] = useState<boolean>(false);
   const [isChaptersDrawerOpen, setIsChaptersDrawerOpen] = useState<boolean>(false);
+  const [isChapterMenuOpen, setIsChapterMenuOpen] = useState<boolean>(false);
   const folderInputRef = useRef<HTMLInputElement>(null);
 
   // Global Keyboard Shortcuts (Ctrl+S, Ctrl+O, Ctrl+E, Ctrl+N)
@@ -935,17 +950,89 @@ export default function App() {
         centerContent={
           (currentTab === 'recorte' || currentTab === 'roteiro') && currentChapter ? (
             <div className="flex items-center gap-2">
-              {/* Seletor de Capítulo (abre gaveta de capítulos) */}
-              <button
-                type="button"
-                onClick={() => setIsChaptersDrawerOpen(true)}
-                className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-card/70 hover:bg-white/10 text-xs font-semibold text-white transition-colors cursor-pointer border border-white/10 shadow-xs"
-                title="Abrir gaveta de capítulos"
-              >
-                <FolderUp className="h-3.5 w-3.5 text-primary shrink-0" />
-                <span className="truncate max-w-[130px] font-display text-[11px]">{currentChapter.label}</span>
-                <ChevronDown className="h-3 w-3 text-muted-foreground shrink-0" />
-              </button>
+              {/* Seletor de Capítulo com Dropdown Rápido */}
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setIsChapterMenuOpen((prev) => !prev)}
+                  className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-card/70 hover:bg-white/10 text-xs font-semibold text-white transition-colors cursor-pointer border border-white/10 shadow-xs"
+                  title="Alternar entre capítulos"
+                >
+                  <FolderUp className="h-3.5 w-3.5 text-primary shrink-0" />
+                  <span className="truncate max-w-[130px] font-display text-[11px]">{currentChapter.label}</span>
+                  <ChevronDown className="h-3 w-3 text-muted-foreground shrink-0" />
+                </button>
+
+                {isChapterMenuOpen && (
+                  <>
+                    <div
+                      className="fixed inset-0 z-40"
+                      onClick={() => setIsChapterMenuOpen(false)}
+                    />
+                    <div className="absolute left-0 top-full mt-1.5 z-50 w-64 rounded-xl bg-[#161720] border border-white/15 shadow-2xl p-1.5 animate-in fade-in zoom-in-95 backdrop-blur-xl">
+                      <div className="px-2 py-1.5 border-b border-white/10 flex items-center justify-between">
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                          Capítulos ({chapters.length})
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setIsChapterMenuOpen(false);
+                            setIsChaptersDrawerOpen(true);
+                          }}
+                          className="text-[10px] text-primary hover:underline font-semibold cursor-pointer"
+                        >
+                          Gerenciar
+                        </button>
+                      </div>
+
+                      <div className="max-h-64 overflow-y-auto py-1 space-y-0.5">
+                        {chapters.map((ch) => {
+                          const isSelected = ch.id === currentChapter.id;
+                          return (
+                            <button
+                              key={ch.id}
+                              type="button"
+                              onClick={() => {
+                                setCurrentChapterId(ch.id);
+                                setCurrentPageNumber(1);
+                                setIsChapterMenuOpen(false);
+                              }}
+                              className={`w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-xs transition-colors cursor-pointer text-left ${
+                                isSelected
+                                  ? 'bg-primary/20 text-primary font-bold border border-primary/30'
+                                  : 'text-foreground hover:bg-white/10 hover:text-white'
+                              }`}
+                            >
+                              <div className="flex items-center gap-2 truncate">
+                                <span className="truncate">{ch.label}</span>
+                              </div>
+                              <div className="flex items-center gap-1.5 shrink-0 text-[10px] font-mono opacity-80">
+                                <span>{ch.pages} pág{ch.pages !== 1 ? 's' : ''}</span>
+                                {isSelected && <Check className="h-3 w-3 text-primary" />}
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      <div className="border-t border-white/10 pt-1 mt-1 flex flex-col gap-1">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setIsChapterMenuOpen(false);
+                            folderInputRef.current?.click();
+                          }}
+                          className="w-full flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:bg-white/5 transition-colors cursor-pointer"
+                        >
+                          <FolderUp className="h-3.5 w-3.5 text-primary" />
+                          <span>Importar Pasta de Capítulos...</span>
+                        </button>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
 
               {/* Navegação de Página Compacta */}
               <div className="flex items-center gap-1 bg-black/50 border border-white/10 rounded-lg px-2 py-0.5 text-xs font-mono shadow-xs">
@@ -1004,7 +1091,7 @@ export default function App() {
           onClearAllChapters={handleClearAllChapters}
           onSortChapters={handleSortChapters}
           onAddChapter={handleAddChapter}
-          isChaptersDrawerOpen={isChaptersDrawerOpen}
+          isChaptersDrawerOpen={false}
           onToggleChaptersDrawer={setIsChaptersDrawerOpen}
         />
       </div>
@@ -1145,6 +1232,25 @@ export default function App() {
           </div>
         </div>
       )}
+      {/* Global Chapters Drawer */}
+      <ChaptersDrawer
+        isOpen={isChaptersDrawerOpen}
+        onClose={() => setIsChaptersDrawerOpen(false)}
+        chapters={chapters}
+        currentChapterId={effectiveChapterId}
+        onSelectChapter={(id) => {
+          setCurrentChapterId(id);
+          setCurrentPageNumber(1);
+          setIsChaptersDrawerOpen(false);
+        }}
+        onSelectPageNumber={setCurrentPageNumber}
+        onAddChapter={handleAddChapter}
+        onUploadFolder={handleUploadFolder}
+        onSortChapters={handleSortChapters}
+        onDeleteChapter={handleDeleteChapter}
+        onDeleteChapters={handleDeleteChapters}
+        onClearAllChapters={handleClearAllChapters}
+      />
     </StudioShell>
     </>
   );

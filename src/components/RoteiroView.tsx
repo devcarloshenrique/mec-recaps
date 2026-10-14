@@ -1057,6 +1057,29 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
 
           {/* Corpo com Scroll da Sidebar Esquerda */}
           <div className="flex-1 overflow-y-auto p-3 space-y-4">
+            {/* Bloco 0: Seletor de Capítulo Ativo */}
+            {chapters.length > 0 && (
+              <div className="space-y-1">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground px-1">
+                  Capítulo ({chapters.length})
+                </span>
+                <select
+                  value={currentChapterId}
+                  onChange={(e) => {
+                    onSelectChapter(e.target.value);
+                    onSelectPage(1);
+                  }}
+                  className="w-full bg-secondary/80 text-foreground text-xs font-semibold px-2.5 py-1.5 rounded-lg border border-border focus:outline-none focus:ring-1 focus:ring-primary cursor-pointer truncate"
+                >
+                  {chapters.map((ch) => (
+                    <option key={ch.id} value={ch.id}>
+                      {ch.label} ({ch.pages} pág{ch.pages !== 1 ? 's' : ''})
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
             {/* Bloco 1: Bíblia do Capítulo e Geração em Lote */}
             <div className="space-y-1.5">
               <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground px-1">
