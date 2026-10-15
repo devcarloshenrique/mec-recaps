@@ -64,6 +64,7 @@ import {
   testAiConnection,
   TestAiConnectionResult,
 } from '../utils/aiNarration';
+import { PageScriptViewerModal } from './PageScriptViewerModal';
 
 interface NarracaoViewProps {
   chapters: ChapterItem[];
@@ -516,6 +517,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
   const [generatingAudioPages, setGeneratingAudioPages] = useState<Record<number, boolean>>({});
   const [isBatchGeneratingAudio, setIsBatchGeneratingAudio] = useState<boolean>(false);
   const [playingAudioPage, setPlayingAudioPage] = useState<number | null>(null);
+  const [isScriptViewerOpen, setIsScriptViewerOpen] = useState<boolean>(false);
   const masterAudioRef = useRef<HTMLAudioElement | null>(null);
 
   // Initialize master audio element for neural playback
@@ -1598,6 +1600,22 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
 
           {/* Right: Quick Actions, 1-Touch Automation, Profile Selector & AI */}
           <div className="flex items-center gap-2">
+            {/* Visualizar Roteiro das Páginas */}
+            {pageRows.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setIsScriptViewerOpen(true)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-secondary hover:bg-secondary/80 text-foreground border border-border text-xs font-bold transition-all shadow-xs cursor-pointer"
+                title="Abrir visualizador limpo e editor de roteiro consolidado por página"
+              >
+                <ScrollText className="h-3.5 w-3.5 text-primary" />
+                <span className="hidden sm:inline">Visualizar Roteiro</span>
+                <span className="font-mono text-[10px] px-1.5 py-0.2 rounded-full bg-primary/15 text-primary border border-primary/25">
+                  {pageRows.filter((r) => (r.scene.text || '').trim().length > 0).length}/{pageRows.length}
+                </span>
+              </button>
+            )}
+
             {/* Global 1-Touch Automation Button: Apply Standard to All Pages of Chapter */}
             {pageRows.length > 0 && (
               <button
@@ -2788,6 +2806,21 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
           </div>
         </div>
       )}
+
+      {/* Modal de Leitura e Edição do Roteiro por Página */}
+      <PageScriptViewerModal
+        isOpen={isScriptViewerOpen}
+        onClose={() => setIsScriptViewerOpen(false)}
+        chapterLabel={
+          activeChapterId === 'all'
+            ? (chapters[0]?.label || 'Capítulo')
+            : (chapters.find((c) => c.id === activeChapterId)?.label || 'Capítulo')
+        }
+        pageRows={pageRows}
+        onUpdateScene={onUpdateScene}
+        onGeneratePageAudio={handleGeneratePageAudio}
+        generatingAudioPages={generatingAudioPages}
+      />
 
       {/* Floating Toast Notification */}
       {toastMessage && (
