@@ -1,4 +1,5 @@
-import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
+import { Muxer, StreamTarget } from 'mp4-muxer';
+import { ChunkedMemoryBuffer } from '../utils/chunkedMemoryBuffer';
 
 export interface WorkerFrameEntry {
   index: number;
@@ -71,10 +72,15 @@ async function runExportPipeline(payload: WorkerStartPayload) {
     throw new Error('WebCodecs (VideoEncoder) não é suportado neste ambiente.');
   }
 
-  // 1. Initialize mp4-muxer
+  // 1. Initialize mp4-muxer with zero-leak ChunkedMemoryBuffer (prevents "Array buffer allocation failed")
   const hasAudioTrack = Boolean(audio && audio.leftChannel && audio.leftChannel.length > 0);
+  const chunkedBuffer = new ChunkedMemoryBuffer(8 * 1024 * 1024); // blocos seguros de 8 MB
   const muxer = new Muxer({
-    target: new ArrayBufferTarget(),
+    target: new StreamTarget({
+      onData: (data, position) => {
+        chunkedBuffer.write(data, position);
+      },
+    }),
     video: {
       codec: 'avc',
       width,
@@ -88,7 +94,7 @@ async function runExportPipeline(payload: WorkerStartPayload) {
           sampleRate: audio!.sampleRate || 44100,
         }
       : undefined,
-    fastStart: 'in-memory',
+    fastStart: false,
     firstTimestampBehavior: 'strict',
   });
 
@@ -138,7 +144,7 @@ async function runExportPipeline(payload: WorkerStartPayload) {
         bitrate: 128_000,
       });
 
-      // Feed audio chunks
+      // Feed audio chunks with backpressure
       const chunkSize = 1024;
       const totalSamples = audio.leftChannel.length;
       const left = audio.leftChannel;
@@ -146,6 +152,19 @@ async function runExportPipeline(payload: WorkerStartPayload) {
 
       for (let offset = 0; offset < totalSamples; offset += chunkSize) {
         if (isCancelled) break;
+
+        // Backpressure para evitar acúmulo de AudioData na memória
+        if (audioEncoder.encodeQueueSize > 8) {
+          await new Promise<void>((resolve) => {
+            const check = setInterval(() => {
+              if (audioEncoder.encodeQueueSize <= 3 || isCancelled) {
+                clearInterval(check);
+                resolve();
+              }
+            }, 4);
+          });
+        }
+
         const framesInChunk = Math.min(chunkSize, totalSamples - offset);
         const planar = new Float32Array(framesInChunk * 2);
         planar.set(left.subarray(offset, offset + framesInChunk), 0);
@@ -398,8 +417,8 @@ async function runExportPipeline(payload: WorkerStartPayload) {
 
   muxer.finalize();
 
-  const buffer = (muxer.target as ArrayBufferTarget).buffer;
-  const mp4Blob = new Blob([buffer], { type: 'video/mp4' });
+  const mp4Blob = chunkedBuffer.toBlob('video/mp4');
+  chunkedBuffer.clear();
   const durationSeconds = totalFrames / fps;
 
   self.postMessage({

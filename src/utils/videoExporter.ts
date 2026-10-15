@@ -1,7 +1,19 @@
-import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
+import { Muxer, StreamTarget } from 'mp4-muxer';
 import JSZip from 'jszip';
-import { ChapterItem, FrameItem, SceneItem } from '../types';
+import {
+  ChapterItem,
+  FrameItem,
+  SceneItem,
+  ProjectMetadata,
+  ChapterMetadata,
+  SceneExtractedContext,
+  CharacterMetadata,
+  ChapterNarrativeMemory,
+  ChapterMacroContext,
+  CropRect,
+} from '../types';
 import { exportRecapWithWorker } from './videoExportService';
+import { ChunkedMemoryBuffer } from './chunkedMemoryBuffer';
 
 export type ExportFormat = 'mp4' | 'webm' | 'shotcut';
 export type ExportResolution = '16:9' | '9:16';
@@ -152,8 +164,13 @@ export interface TimelineSceneEntry {
   startTimeSrt: string;
   endTimeSrt: string;
   audioFile: string | null;
+  voice?: string;
   appliedStyleId?: string;
   sceneBeat?: string;
+  visualDescription?: string;
+  rawDialoguesAndText?: string;
+  charactersInScene?: string[];
+  extractedContext?: SceneExtractedContext;
   associatedFrames: Array<{
     id: string;
     label: string;
@@ -161,6 +178,9 @@ export interface TimelineSceneEntry {
     startTime: number;
     endTime: number;
     duration: number;
+    transition?: string;
+    narrationSnippet?: string;
+    cropRect?: CropRect;
   }>;
 }
 
@@ -184,6 +204,11 @@ export interface TimelineMetadataResult {
   timelineData: {
     project: {
       title: string;
+      workTitle?: string;
+      universeLore?: string;
+      glossary?: Record<string, string>;
+      characters?: CharacterMetadata[];
+      narrativeHistory?: ChapterNarrativeMemory[];
       exportedAt: string;
       resolution: string;
       aspectRatio: string;
@@ -194,22 +219,242 @@ export interface TimelineMetadataResult {
       totalScenes: number;
       audioTracksCount: number;
     };
-    chapters: Array<{ id: string; label: string; pages: number }>;
+    chapters: Array<{
+      id: string;
+      label: string;
+      pages: number;
+      synopsis?: string;
+      macroContext?: ChapterMacroContext;
+      endingHook?: string;
+      narrativeState?: string;
+      keyOutcomes?: string[];
+      activeStyleId?: string;
+    }>;
     scenes: TimelineSceneEntry[];
     frames: TimelineFrameEntry[];
   };
   srtContent: string;
   jsonContent: string;
+  txtContent: string;
+}
+
+/**
+ * Formata um documento de texto (.txt) completo e rico contendo todo o contexto
+ * do roteiro, da obra e da produção (Lore, Personagens, Glossário, Capítulos,
+ * Ações Visuais, Diálogos originais dos balões, Set-of-Mark e Narração).
+ */
+export function formatFullScriptText({
+  timelineData,
+  projectMetadata,
+  chapterMetadata,
+}: {
+  timelineData: TimelineMetadataResult['timelineData'];
+  projectMetadata?: ProjectMetadata;
+  chapterMetadata?: Record<string, ChapterMetadata>;
+}): string {
+  const lines: string[] = [];
+
+  const workTitle =
+    projectMetadata?.workTitle ||
+    timelineData.project.workTitle ||
+    timelineData.project.title ||
+    'Recap Manhwa Studio';
+
+  lines.push('================================================================================');
+  lines.push('ROTEIRO COMPLETO DE RECAPITULAÇÃO — CONTEXTO NARRATIVO & PRODUÇÃO');
+  lines.push('================================================================================');
+  lines.push(`Obra: ${workTitle}`);
+  lines.push(`Data de Exportação: ${new Date().toLocaleString('pt-BR')}`);
+  lines.push(`Duração Total: ~${timelineData.project.totalDurationSeconds}s (${timelineData.project.totalDurationFormatted})`);
+  lines.push(`Resolução: ${timelineData.project.resolution} (${timelineData.project.aspectRatio}) | FPS: ${timelineData.project.fps}`);
+  lines.push(`Total de Capítulos: ${timelineData.chapters.length} | Cenas: ${timelineData.scenes.length} | Quadros: ${timelineData.frames.length}`);
+  lines.push('');
+
+  // 1. Lore & Universo
+  const lore = projectMetadata?.universeLore || timelineData.project.universeLore;
+  if (lore && lore.trim()) {
+    lines.push('--------------------------------------------------------------------------------');
+    lines.push('LORE & SISTEMA DO UNIVERSO (AMBIENTAÇÃO)');
+    lines.push('--------------------------------------------------------------------------------');
+    lines.push(lore.trim());
+    lines.push('');
+  }
+
+  // 2. Personagens
+  const characters = projectMetadata?.characters || timelineData.project.characters;
+  if (characters && characters.length > 0) {
+    lines.push('--------------------------------------------------------------------------------');
+    lines.push('PERSONAGENS & DINÂMICA DE PODER');
+    lines.push('--------------------------------------------------------------------------------');
+    for (const c of characters) {
+      const aliasStr = c.aliases && c.aliases.length > 0 ? ` [Apelidos: ${c.aliases.join(', ')}]` : '';
+      lines.push(`• ${c.name} (${c.role.toUpperCase()})${aliasStr}`);
+      if (c.description) {
+        lines.push(`  ${c.description}`);
+      }
+    }
+    lines.push('');
+  }
+
+  // 3. Glossário
+  const glossary = projectMetadata?.glossary || timelineData.project.glossary;
+  if (glossary && Object.keys(glossary).length > 0) {
+    lines.push('--------------------------------------------------------------------------------');
+    lines.push('GLOSSÁRIO & TERMOS DA OBRA');
+    lines.push('--------------------------------------------------------------------------------');
+    for (const [term, desc] of Object.entries(glossary)) {
+      lines.push(`• ${term}: ${desc}`);
+    }
+    lines.push('');
+  }
+
+  // 4. Memória Narrativa (Capítulos Anteriores)
+  const history = projectMetadata?.narrativeHistory || timelineData.project.narrativeHistory;
+  if (history && history.length > 0) {
+    lines.push('--------------------------------------------------------------------------------');
+    lines.push('CONTINUIDADE NARRATIVA ENTRE CAPÍTULOS');
+    lines.push('--------------------------------------------------------------------------------');
+    for (const h of history) {
+      lines.push(`[${h.chapterLabel}]`);
+      if (h.synopsis) lines.push(`  Sinopse: ${h.synopsis}`);
+      if (h.narrativeState) lines.push(`  Estado Narrativo: ${h.narrativeState}`);
+      if (h.endingHook) lines.push(`  Gancho Final: ${h.endingHook}`);
+      if (h.keyOutcomes && h.keyOutcomes.length > 0) {
+        lines.push(`  Principais Desfechos: ${h.keyOutcomes.join('; ')}`);
+      }
+      lines.push('');
+    }
+  }
+
+  // 5. Cenas e Capítulos
+  const chapterIds = Array.from(new Set(timelineData.scenes.map((s) => s.chapterId || 'default')));
+
+  for (const chId of chapterIds) {
+    const chData = timelineData.chapters.find((c) => c.id === chId);
+    const chMeta = chapterMetadata ? chapterMetadata[chId] : undefined;
+    const chLabel = chData?.label || (chId !== 'default' ? chId : 'Capítulo Principal');
+    const chScenes = timelineData.scenes.filter((s) => (s.chapterId || 'default') === chId);
+
+    lines.push('================================================================================');
+    lines.push(`CAPÍTULO: ${chLabel.toUpperCase()}`);
+    lines.push('================================================================================');
+
+    const syn = chData?.synopsis || chMeta?.synopsis || chMeta?.macroContext?.synopsis;
+    if (syn) {
+      lines.push(`SINOPSE DO CAPÍTULO:`);
+      lines.push(syn);
+      lines.push('');
+    }
+
+    const dynamics = chData?.macroContext?.characterDynamics || chMeta?.macroContext?.characterDynamics;
+    if (dynamics) {
+      lines.push(`DINÂMICA DOS PERSONAGENS NESTE CAPÍTULO:`);
+      lines.push(dynamics);
+      lines.push('');
+    }
+
+    const rules = chData?.macroContext?.criticalRules || chMeta?.macroContext?.criticalRules;
+    if (rules && rules.length > 0) {
+      lines.push(`DIRETRIZES & REGRAS NARRATIVAS (ANTI-ALUCINAÇÃO):`);
+      for (const r of rules) {
+        lines.push(`• ${r}`);
+      }
+      lines.push('');
+    }
+
+    const hook = chData?.endingHook || chMeta?.endingHook;
+    if (hook) {
+      lines.push(`GANCHO FINAL DO CAPÍTULO:`);
+      lines.push(hook);
+      lines.push('');
+    }
+
+    lines.push(`TOTAL DE CENAS NESTE CAPÍTULO: ${chScenes.length}`);
+    lines.push('');
+
+    // Para cada cena
+    for (const sc of chScenes) {
+      lines.push('--------------------------------------------------------------------------------');
+      lines.push(`CENA ${String(sc.index).padStart(2, '0')}: Página ${sc.pageNumber} — ${sc.title}`);
+      lines.push('--------------------------------------------------------------------------------');
+      lines.push(`• Timeline: ${sc.startTimeSrt} -> ${sc.endTimeSrt} (${sc.duration}s | ${sc.wordCount} palavras)`);
+      if (sc.voice) lines.push(`• Voz TTS: ${sc.voice}`);
+      if (sc.appliedStyleId) lines.push(`• Estilo/Tom Aplicado: ${sc.appliedStyleId}`);
+      if (sc.sceneBeat) lines.push(`• Função Narrativa (Beat): ${sc.sceneBeat}`);
+      if (sc.charactersInScene && sc.charactersInScene.length > 0) {
+        lines.push(`• Personagens em Cena: ${sc.charactersInScene.join(', ')}`);
+      }
+      lines.push('');
+
+      // Ação e Narrativa Visual
+      if (sc.visualDescription) {
+        lines.push('[AÇÃO & NARRATIVA VISUAL]');
+        lines.push(sc.visualDescription);
+        lines.push('');
+      }
+
+      // Diálogos e Balões Brutos
+      if (sc.rawDialoguesAndText) {
+        lines.push('[DIÁLOGOS & BALÕES ORIGINAIS DA PÁGINA]');
+        lines.push(sc.rawDialoguesAndText);
+        lines.push('');
+      }
+
+      // Detalhamento de painéis (Set-of-Mark)
+      const panels = sc.extractedContext?.panels;
+      if (panels && panels.length > 0) {
+        lines.push('[DETALHAMENTO ESTRUTURADO POR QUADRO]');
+        for (const p of panels) {
+          const chars = p.characters && p.characters.length > 0 ? ` | Personagens: ${p.characters.join(', ')}` : '';
+          const mood = p.mood ? ` | Clima: ${p.mood}` : '';
+          lines.push(`• ${p.panelLabel}${chars}${mood}`);
+          if (p.visualAction) lines.push(`  - Ação: ${p.visualAction}`);
+          if (p.dialogues) lines.push(`  - Diálogo: ${p.dialogues}`);
+        }
+        lines.push('');
+      }
+
+      // Quadros Associados e Snippets de narração
+      if (sc.associatedFrames && sc.associatedFrames.length > 0) {
+        lines.push(`[QUADROS VISUAIS NA TIMELINE (${sc.associatedFrames.length} quadros)]`);
+        for (const f of sc.associatedFrames) {
+          const trans = f.transition ? ` · ${f.transition}` : '';
+          lines.push(`• ${f.label} (${f.duration}s${trans})`);
+          if (f.narrationSnippet) {
+            lines.push(`  Trecho narrado: "${f.narrationSnippet}"`);
+          }
+        }
+        lines.push('');
+      }
+
+      // Texto Final da Narração / Locução
+      lines.push('[TEXTO DA NARRAÇÃO / LOCUÇÃO]');
+      if (sc.text && sc.text.trim()) {
+        lines.push(`"${sc.text.trim()}"`);
+      } else {
+        lines.push('(Sem texto de narração gerado para esta página)');
+      }
+      lines.push('');
+    }
+  }
+
+  lines.push('================================================================================');
+  lines.push('FIM DO ROTEIRO DE RECAPITULAÇÃO');
+  lines.push('================================================================================');
+
+  return lines.join('\n');
 }
 
 /**
  * Constrói a estrutura completa de metadados da timeline (cenas, roteiro, timestamps e quadros)
- * e gera os formatos .json e .srt correspondentes.
+ * e gera os formatos .json, .srt e .txt correspondentes com todo o contexto narrativo.
  */
 export function buildTimelineMetadata({
   frames,
   scenes,
   chapters = [],
+  projectMetadata,
+  chapterMetadata,
   fps = 30,
   resolution = '16:9',
   scheduledClips = [],
@@ -218,6 +463,8 @@ export function buildTimelineMetadata({
   frames: FrameItem[];
   scenes: SceneItem[];
   chapters?: ChapterItem[];
+  projectMetadata?: ProjectMetadata;
+  chapterMetadata?: Record<string, ChapterMetadata>;
   fps?: number;
   resolution?: ExportResolution;
   scheduledClips?: ScheduledAudioClip[];
@@ -299,6 +546,8 @@ export function buildTimelineMetadata({
       }
 
       const duration = Math.max(0.5, endTime - startTime);
+      const extracted = scene.extractedContext;
+      const originalFrames = scene.frames || [];
 
       return {
         index: idx + 1,
@@ -315,46 +564,65 @@ export function buildTimelineMetadata({
         startTimeSrt: formatSrtTimecode(startTime),
         endTimeSrt: formatSrtTimecode(endTime),
         audioFile,
+        voice: scene.voice || undefined,
         appliedStyleId: scene.appliedStyleId || undefined,
-        sceneBeat: scene.extractedContext?.sceneBeat || undefined,
-        associatedFrames: matchedFrames.map((mf) => ({
-          id: mf.id,
-          label: mf.label,
-          imageFile: mf.imageFile,
-          startTime: mf.startTime,
-          endTime: mf.endTime,
-          duration: mf.duration,
-        })),
+        sceneBeat: extracted?.sceneBeat || undefined,
+        visualDescription: extracted?.visualDescription || undefined,
+        rawDialoguesAndText: extracted?.rawDialoguesAndText || undefined,
+        charactersInScene: extracted?.charactersInScene && extracted.charactersInScene.length > 0
+          ? extracted.charactersInScene
+          : undefined,
+        extractedContext: extracted || undefined,
+        associatedFrames: matchedFrames.map((mf) => {
+          const origFrame = originalFrames.find((of) => of.id === mf.id) || frames.find((f) => f.id === mf.id);
+          return {
+            id: mf.id,
+            label: mf.label,
+            imageFile: mf.imageFile,
+            startTime: mf.startTime,
+            endTime: mf.endTime,
+            duration: mf.duration,
+            transition: origFrame?.transition || 'cut',
+            narrationSnippet: origFrame?.narrationSnippet || mf.narrationSnippet || undefined,
+            cropRect: origFrame?.cropRect || undefined,
+          };
+        }),
       };
     });
   } else {
     // Se não houver cenas isoladas, sintetiza as entradas de cena a partir dos quadros
-    processedScenes = framesTimeline.map((ft, idx) => ({
-      index: idx + 1,
-      id: `scene_frame_${ft.id}`,
-      title: ft.label,
-      chapterId: ft.chapterId,
-      chapterLabel: ft.chapterLabel,
-      pageNumber: ft.pageNumber,
-      text: ft.narrationSnippet || '',
-      wordCount: ft.narrationSnippet ? ft.narrationSnippet.trim().split(/\s+/).length : 0,
-      startTime: ft.startTime,
-      endTime: ft.endTime,
-      duration: ft.duration,
-      startTimeSrt: ft.startTimeSrt,
-      endTimeSrt: ft.endTimeSrt,
-      audioFile: null,
-      associatedFrames: [
-        {
-          id: ft.id,
-          label: ft.label,
-          imageFile: ft.imageFile,
-          startTime: ft.startTime,
-          endTime: ft.endTime,
-          duration: ft.duration,
-        },
-      ],
-    }));
+    processedScenes = framesTimeline.map((ft, idx) => {
+      const origFrame = frames.find((f) => f.id === ft.id);
+      return {
+        index: idx + 1,
+        id: `scene_frame_${ft.id}`,
+        title: ft.label,
+        chapterId: ft.chapterId,
+        chapterLabel: ft.chapterLabel,
+        pageNumber: ft.pageNumber,
+        text: ft.narrationSnippet || '',
+        wordCount: ft.narrationSnippet ? ft.narrationSnippet.trim().split(/\s+/).length : 0,
+        startTime: ft.startTime,
+        endTime: ft.endTime,
+        duration: ft.duration,
+        startTimeSrt: ft.startTimeSrt,
+        endTimeSrt: ft.endTimeSrt,
+        audioFile: null,
+        associatedFrames: [
+          {
+            id: ft.id,
+            label: ft.label,
+            imageFile: ft.imageFile,
+            startTime: ft.startTime,
+            endTime: ft.endTime,
+            duration: ft.duration,
+            transition: origFrame?.transition || 'cut',
+            narrationSnippet: ft.narrationSnippet || undefined,
+            cropRect: origFrame?.cropRect || undefined,
+          },
+        ],
+      };
+    });
   }
 
   // Ordenação cronológica estrita por startTime
@@ -365,13 +633,26 @@ export function buildTimelineMetadata({
     processedScenes.reduce((max, s) => Math.max(max, s.endTime), 0)
   );
 
-  const projectTitle = chapters[0]?.label
-    ? `Recap - ${chapters[0].label}`
-    : 'Recap Manhwa Studio';
+  const projectTitle = projectMetadata?.workTitle
+    ? `Recap - ${projectMetadata.workTitle}`
+    : chapters[0]?.label
+      ? `Recap - ${chapters[0].label}`
+      : 'Recap Manhwa Studio';
 
   const timelineData = {
     project: {
       title: projectTitle,
+      workTitle: projectMetadata?.workTitle || undefined,
+      universeLore: projectMetadata?.universeLore || undefined,
+      glossary: projectMetadata?.glossary && Object.keys(projectMetadata.glossary).length > 0
+        ? projectMetadata.glossary
+        : undefined,
+      characters: projectMetadata?.characters && projectMetadata.characters.length > 0
+        ? projectMetadata.characters
+        : undefined,
+      narrativeHistory: projectMetadata?.narrativeHistory && projectMetadata.narrativeHistory.length > 0
+        ? projectMetadata.narrativeHistory
+        : undefined,
       exportedAt: new Date().toISOString(),
       resolution: `${width}x${height}`,
       aspectRatio: resolution,
@@ -382,11 +663,20 @@ export function buildTimelineMetadata({
       totalScenes: processedScenes.length,
       audioTracksCount: scheduledClips.length,
     },
-    chapters: chapters.map((c) => ({
-      id: c.id,
-      label: c.label,
-      pages: c.pages,
-    })),
+    chapters: chapters.map((c) => {
+      const meta = chapterMetadata ? chapterMetadata[c.id] : undefined;
+      return {
+        id: c.id,
+        label: c.label,
+        pages: c.pages,
+        synopsis: meta?.synopsis || meta?.macroContext?.synopsis || undefined,
+        macroContext: meta?.macroContext || undefined,
+        endingHook: meta?.endingHook || undefined,
+        narrativeState: meta?.narrativeState || undefined,
+        keyOutcomes: meta?.keyOutcomes && meta.keyOutcomes.length > 0 ? meta.keyOutcomes : undefined,
+        activeStyleId: meta?.activeStyleId || undefined,
+      };
+    }),
     scenes: processedScenes,
     frames: framesTimeline,
   };
@@ -402,10 +692,17 @@ export function buildTimelineMetadata({
 
   const jsonContent = JSON.stringify(timelineData, null, 2);
 
+  const txtContent = formatFullScriptText({
+    timelineData,
+    projectMetadata,
+    chapterMetadata,
+  });
+
   return {
     timelineData,
     srtContent,
     jsonContent,
+    txtContent,
   };
 }
 
@@ -979,9 +1276,14 @@ export async function renderMP4WithWebCodecs({
     }
   }
 
-  // Initialize mp4-muxer
+  // Initialize mp4-muxer with zero-leak ChunkedMemoryBuffer (prevents "Array buffer allocation failed")
+  const chunkedBuffer = new ChunkedMemoryBuffer(8 * 1024 * 1024);
   const muxer = new Muxer({
-    target: new ArrayBufferTarget(),
+    target: new StreamTarget({
+      onData: (data, position) => {
+        chunkedBuffer.write(data, position);
+      },
+    }),
     video: {
       codec: 'avc',
       width,
@@ -995,7 +1297,7 @@ export async function renderMP4WithWebCodecs({
           sampleRate: 44100,
         }
       : undefined,
-    fastStart: 'in-memory',
+    fastStart: false,
     firstTimestampBehavior: 'strict',
   });
 
@@ -1176,7 +1478,8 @@ export async function renderMP4WithWebCodecs({
     }
 
     muxer.finalize();
-    const finalBlob = new Blob([muxer.target.buffer], { type: 'video/mp4' });
+    const finalBlob = chunkedBuffer.toBlob('video/mp4');
+    chunkedBuffer.clear();
 
     const dateStr = new Date().toISOString().slice(0, 10);
     const filename = `Recap_MP4_${width}x${height}_${dateStr}.mp4`;
@@ -1403,6 +1706,8 @@ export async function generateShotcutMLT({
   frames,
   scenes,
   chapters = [],
+  projectMetadata,
+  chapterMetadata,
   resolution = '16:9',
   fps = 30,
   signal,
@@ -1411,6 +1716,8 @@ export async function generateShotcutMLT({
   frames: FrameItem[];
   scenes: SceneItem[];
   chapters?: ChapterItem[];
+  projectMetadata?: ProjectMetadata;
+  chapterMetadata?: Record<string, ChapterMetadata>;
 }): Promise<ExportResult> {
   if (frames.length === 0) {
     throw new Error('Nenhum quadro na timeline para gerar projeto Shotcut.');
@@ -1698,11 +2005,13 @@ ${(() => {
 
   zip.file('projeto.mlt', mltXml);
 
-  // 4. Generate SRT and JSON timeline metadata
-  const { timelineData, srtContent, jsonContent } = buildTimelineMetadata({
+  // 4. Generate SRT, JSON and TXT timeline metadata with full narrative context
+  const { timelineData, srtContent, jsonContent, txtContent } = buildTimelineMetadata({
     frames,
     scenes,
     chapters,
+    projectMetadata,
+    chapterMetadata,
     fps,
     resolution,
     scheduledClips: audioTimeline.scheduledClips,
@@ -1711,6 +2020,7 @@ ${(() => {
 
   zip.file('legendas.srt', srtContent);
   zip.file('roteiro_timeline.json', jsonContent);
+  zip.file('roteiro_completo.txt', txtContent);
 
   // Informative README
   const totalDurationSeconds = totalFramesCount / fps;
@@ -1739,12 +2049,17 @@ ARQUIVOS INCLUÍDOS NO PACOTE:
    - Perfeito para gerar legendas automáticas ou animações de texto.
 
 3. "roteiro_timeline.json":
-   - Metadados completos do roteiro, cenas, quadros associados e timestamps
-     (startTime, endTime, duration) em segundos e formato timecode.
+   - Metadados completos do roteiro, cenas, quadros associados, ações visuais,
+     diálogos dos balões e timestamps (startTime, endTime, duration) em segundos e timecode.
    - Ideal para reutilizar em scripts Python, automação FFmpeg, Remotion,
      criação de cortes verticais (Shorts/TikTok/Reels) ou outros vídeos.
 
-4. "media/":
+4. "roteiro_completo.txt":
+   - Roteiro master consolidado contendo todo o contexto de produção: Lore do universo,
+     fichas de personagens, termos do glossário, sinopses de capítulos, ação visual
+     do mangá/manhwa, diálogos originais dos balões e locução/narração sincronizada.
+
+5. "media/":
    - Pasta contendo todas as imagens numeradas dos quadros (quadro_001.jpg, etc.)
      e os arquivos de áudio de narração (narracao_001.mp3, etc.).
 
@@ -1802,6 +2117,8 @@ export async function exportRecap({
   frames,
   scenes,
   chapters = [],
+  projectMetadata,
+  chapterMetadata,
   resolution = '16:9',
   fps = 30,
   includeAudio = true,
@@ -1813,12 +2130,16 @@ export async function exportRecap({
   frames: FrameItem[];
   scenes: SceneItem[];
   chapters?: ChapterItem[];
+  projectMetadata?: ProjectMetadata;
+  chapterMetadata?: Record<string, ChapterMetadata>;
 }): Promise<ExportResult> {
   if (format === 'shotcut') {
     return generateShotcutMLT({
       frames,
       scenes,
       chapters,
+      projectMetadata,
+      chapterMetadata,
       resolution,
       fps,
       signal,

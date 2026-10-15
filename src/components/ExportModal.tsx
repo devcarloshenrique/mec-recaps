@@ -24,7 +24,7 @@ import {
   Sparkles,
 } from 'lucide-react';
 import JSZip from 'jszip';
-import { ChapterItem, FrameItem, SceneItem } from '../types';
+import { ChapterItem, FrameItem, SceneItem, ProjectMetadata, ChapterMetadata } from '../types';
 import {
   exportRecap,
   ExportFormat,
@@ -33,6 +33,7 @@ import {
   ExportProgress,
   ExportResult,
   buildTimelineMetadata,
+  formatFullScriptText,
 } from '../utils/videoExporter';
 import { checkWebCodecsSupport } from '../utils/videoExportService';
 
@@ -42,6 +43,8 @@ interface ExportModalProps {
   chapters: ChapterItem[];
   frames: FrameItem[];
   scenes: SceneItem[];
+  projectMetadata?: ProjectMetadata;
+  chapterMetadata?: Record<string, ChapterMetadata>;
   initialFormat?: ExportFormat | string;
   onImportProject?: (projectData: {
     chapters: ChapterItem[];
@@ -56,6 +59,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   chapters,
   frames,
   scenes,
+  projectMetadata,
+  chapterMetadata,
   initialFormat = 'mp4',
   onImportProject,
 }) => {
@@ -168,6 +173,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         frames: sortedFrames,
         scenes,
         chapters,
+        projectMetadata,
+        chapterMetadata,
         resolution: selectedResolution,
         fps: 30,
         includeAudio: includeAudio && scenesWithAudioCount > 0,
@@ -250,10 +257,16 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         setZipProgress(10 + Math.round(((i + 1) / frames.length) * 70));
       }
 
-      const scriptContent = scenes
-        .map((s) => `[${s.title}] (${s.duration})\nVoz: ${s.voice}\n${s.text}\n`)
-        .join('\n---\n\n');
-      zip.file('Roteiro_Narracao.txt', scriptContent);
+      const { txtContent } = buildTimelineMetadata({
+        frames,
+        scenes,
+        chapters,
+        projectMetadata,
+        chapterMetadata,
+        fps: 30,
+        resolution: selectedResolution,
+      });
+      zip.file('Roteiro_Completo_Narracao.txt', txtContent);
 
       const zipBlob = await zip.generateAsync({ type: 'blob' }, (meta) => {
         setZipProgress(80 + Math.round(meta.percent * 0.2));
@@ -268,14 +281,20 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     }
   };
 
-  // Download script text
+  // Download script text with full context
   const handleDownloadScript = () => {
-    const scriptContent = scenes
-      .map((s) => `[${s.title}] (${s.duration})\nVoz: ${s.voice}\n${s.text}\n`)
-      .join('\n---\n\n');
-    const blob = new Blob([scriptContent], { type: 'text/plain;charset=utf-8' });
-    triggerDownload(blob, `Roteiro_Recap_${new Date().toISOString().slice(0, 10)}.txt`);
-    setSuccessMessage('Roteiro de narração baixado em .txt!');
+    const { txtContent } = buildTimelineMetadata({
+      frames,
+      scenes,
+      chapters,
+      projectMetadata,
+      chapterMetadata,
+      fps: 30,
+      resolution: selectedResolution,
+    });
+    const blob = new Blob([txtContent], { type: 'text/plain;charset=utf-8' });
+    triggerDownload(blob, `Roteiro_Recap_Completo_${new Date().toISOString().slice(0, 10)}.txt`);
+    setSuccessMessage('Roteiro completo com todo o contexto narrativo baixado em .txt!');
   };
 
   // Download SRT subtitles with timestamps
@@ -284,6 +303,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
       frames,
       scenes,
       chapters,
+      projectMetadata,
+      chapterMetadata,
       fps: 30,
       resolution: selectedResolution,
     });
@@ -292,18 +313,20 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     setSuccessMessage('Legendas sincronizadas baixadas em .srt!');
   };
 
-  // Download Timeline JSON with timestamps and scenes
+  // Download Timeline JSON with timestamps, scenes and full narrative context
   const handleDownloadTimelineJson = () => {
     const { jsonContent } = buildTimelineMetadata({
       frames,
       scenes,
       chapters,
+      projectMetadata,
+      chapterMetadata,
       fps: 30,
       resolution: selectedResolution,
     });
     const blob = new Blob([jsonContent], { type: 'application/json;charset=utf-8' });
-    triggerDownload(blob, `Roteiro_Timeline_${new Date().toISOString().slice(0, 10)}.json`);
-    setSuccessMessage('Timeline com roteiro e timestamps baixada em .json!');
+    triggerDownload(blob, `Roteiro_Timeline_Completo_${new Date().toISOString().slice(0, 10)}.json`);
+    setSuccessMessage('Timeline com roteiro e contexto completo baixada em .json!');
   };
 
   // Export JSON project backup
@@ -311,6 +334,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     const data = {
       name: 'Mec-Recap Studio Backup',
       exportedAt: new Date().toISOString(),
+      projectMetadata,
+      chapterMetadata,
       chapters,
       frames,
       scenes,

@@ -1186,6 +1186,8 @@ export default function App() {
         chapters={chapters}
         frames={frames}
         scenes={scenes}
+        projectMetadata={projectMetadata}
+        chapterMetadata={chapterMetadata}
         initialFormat={exportModalFormat}
         onImportProject={(data) => {
           if (data.chapters) setChapters(data.chapters);

@@ -1,4 +1,5 @@
-import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
+import { Muxer, StreamTarget } from 'mp4-muxer';
+import { ChunkedMemoryBuffer } from './chunkedMemoryBuffer';
 import { FrameItem, SceneItem } from '../types';
 import { exportRecap, ExportResolution, renderMP4WithWebCodecs, renderWebM, generateShotcutMLT } from './videoExporter';
 
@@ -522,15 +523,20 @@ async function _legacyRenderDetailed(
   if (useWebCodecsWithoutAudio) {
     updateProgress(25, 'Iniciando multiplexador MP4 ultra-rápido (WebCodecs)...');
 
+    const chunkedBuffer = new ChunkedMemoryBuffer(8 * 1024 * 1024);
     const muxer = new Muxer({
-      target: new ArrayBufferTarget(),
+      target: new StreamTarget({
+        onData: (data, position) => {
+          chunkedBuffer.write(data, position);
+        },
+      }),
       video: {
         codec: 'avc',
         width,
         height,
         frameRate: fps,
       },
-      fastStart: 'in-memory',
+      fastStart: false,
       firstTimestampBehavior: 'strict',
     });
 
@@ -610,9 +616,10 @@ async function _legacyRenderDetailed(
     videoEncoder.close();
     muxer.finalize();
 
-    const finalBlob = new Blob([muxer.target.buffer], {
-      type: format === 'mov' ? 'video/quicktime' : 'video/mp4',
-    });
+    const finalBlob = chunkedBuffer.toBlob(
+      format === 'mov' ? 'video/quicktime' : 'video/mp4'
+    );
+    chunkedBuffer.clear();
 
     updateProgress(100, 'Vídeo MP4 gerado com sucesso!');
 
