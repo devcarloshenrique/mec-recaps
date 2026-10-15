@@ -242,6 +242,7 @@ export default function App() {
     universeLore: '',
     glossary: {},
     characters: [],
+    narrativeHistory: [],
   });
   const [chapterMetadata, setChapterMetadata] = useState<Record<string, ChapterMetadata>>({});
   const [pageScripts, setPageScripts] = useState<Record<string, PageScriptState>>({});
@@ -439,6 +440,7 @@ export default function App() {
         universeLore: '',
         glossary: {},
         characters: [],
+        narrativeHistory: [],
       });
       setChapterMetadata({});
       setPageScripts({});
@@ -1112,6 +1114,8 @@ export default function App() {
           onUpdateMultiplePageScripts={handleUpdateMultiplePageScripts}
           onUpdateFrameSnippets={handleUpdateMultipleFrames}
           onUpdateSceneText={handleUpdateSceneText}
+          onUpdateScene={handleUpdateScene}
+          onSetScenes={setScenes}
           onSelectChapter={setCurrentChapterId}
           onSelectPage={setCurrentPageNumber}
           onNavigateTab={setCurrentTab}

@@ -23,6 +23,11 @@ import {
   ChevronLeft,
   ChevronRight,
   Image as ImageIcon,
+  FileSearch,
+  Zap,
+  HelpCircle,
+  RefreshCw,
+  Link2,
 } from 'lucide-react';
 import {
   ChapterItem,
@@ -35,6 +40,8 @@ import {
   ScriptProfile,
   CharacterMetadata,
   CharacterRole,
+  SceneExtractedContext,
+  ChapterNarrativeMemory,
 } from '../types';
 import {
   NARRATION_PROFILES,
@@ -42,11 +49,19 @@ import {
   analyzeChapterMacroContext,
   generateChapterNarrationInMiniBatches,
   generatePageNarrationWithVision,
+  extractChapterVisualContext,
+  generateChapterNarrationFromContext,
+  generatePageNarrationFromContext,
   loadAiNarrationConfig,
   distributeTextToFrames,
   matchAiSceneToFrame,
   ChapterPageItem,
 } from '../utils/aiNarration';
+import {
+  resolvePreviousChapterMemory,
+  compileChapterMemoryEntry,
+  upsertProjectNarrativeHistory,
+} from '../utils/narrativeMemory';
 import {
   getChapterThumbnails,
   generateChapterThumbnailsSequentially,
@@ -67,6 +82,8 @@ interface RoteiroViewProps {
   onUpdateMultiplePageScripts?: (updates: Record<string, PageScriptState>) => void;
   onUpdateFrameSnippets: (updates: { id: string; narrationSnippet?: string; duration?: number; transition?: any }[]) => void;
   onUpdateSceneText: (sceneId: string, text: string) => void;
+  onUpdateScene?: (scene: SceneItem) => void;
+  onSetScenes?: (scenes: SceneItem[]) => void;
   onSelectChapter: (chapterId: string) => void;
   onSelectPage: (pageNumber: number) => void;
   onNavigateTab: (tab: 'recorte' | 'narracao') => void;
@@ -96,6 +113,8 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
   onUpdateMultiplePageScripts,
   onUpdateFrameSnippets,
   onUpdateSceneText,
+  onUpdateScene,
+  onSetScenes,
   onSelectChapter,
   onSelectPage,
   onNavigateTab,
@@ -118,6 +137,11 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
   const [isAddingCustomProfile, setIsAddingCustomProfile] = useState(false);
   const [customPrompt, setCustomPrompt] = useState('');
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  // Novos estados para Pipeline em 2 Etapas e Memória Narrativa
+  const [rightSidebarTab, setRightSidebarTab] = useState<'roteiro' | 'contexto'>('roteiro');
+  const [isContinuityExpanded, setIsContinuityExpanded] = useState(false);
+  const [isExtractingContext, setIsExtractingContext] = useState(false);
 
   // Progressive hydration of low-res proxy thumbnails for filmstrip
   const [chapterThumbnails, setChapterThumbnails] = useState<Record<number, string>>({});
@@ -251,6 +275,32 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
 
   // Chave de identificação no mapa de scripts: "chapterId_pageNumber"
   const pageScriptKey = `${activeChapterId}_${currentPageNumber}`;
+
+  // Continuidade narrativa com o capítulo imediatamente anterior (N - 1)
+  const previousChapterMemory = useMemo(() => {
+    return resolvePreviousChapterMemory({
+      chapters,
+      currentChapterId: activeChapterId,
+      narrativeHistory: projectMetadata.narrativeHistory,
+      scenes,
+      chapterMetadata,
+    });
+  }, [chapters, activeChapterId, projectMetadata.narrativeHistory, scenes, chapterMetadata]);
+
+  // Cenas do capítulo atual
+  const chapterScenes = useMemo(() => {
+    return scenes.filter((s) => matchesChapter(s.chapterId));
+  }, [scenes, activeChapterId, currentChapterId, currentChapter?.id]);
+
+  // Contagem de páginas com contexto visual extraído
+  const extractedScenesCount = useMemo(() => {
+    return chapterScenes.filter((s) => Boolean(s.extractedContext)).length;
+  }, [chapterScenes]);
+
+  const isChapterContextExtracted = Boolean(
+    chapterMetadata[currentChapterId]?.isContextExtracted ||
+    (totalPages > 0 && extractedScenesCount > 0 && extractedScenesCount >= totalPages)
+  );
 
   // Estado do script da página atual com todos os 4 perfis nativos pré-carregados
   const currentPageScriptState: PageScriptState = useMemo(() => {
@@ -485,29 +535,74 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
     showToast('✨ Texto distribuído proporcionalmente entre os quadros!');
   };
 
-  // Marca um perfil como ATIVO ("⭐ Usar na Narração")
-  const handleSetActiveProfile = (profileId: string) => {
+  // Alternar ou Selecionar perfil de estilo (com Cache Instantâneo se já houver texto gerado)
+  const handleSelectOrSwitchProfile = (profileId: string) => {
     const targetProfile = currentPageScriptState.profiles.find((p) => p.id === profileId);
     if (!targetProfile) return;
+
+    const hasCachedText = Boolean(
+      targetProfile.fullScriptText?.trim() ||
+      Object.values(targetProfile.snippetsByFrameId || {}).some((s) => s?.trim())
+    );
 
     updateCurrentScriptState({
       ...currentPageScriptState,
       activeProfileId: profileId,
     });
 
-    // Sincroniza os recortes e cena com o novo perfil ativo
-    const updates: { id: string; narrationSnippet: string }[] = [];
-    currentPageFrames.forEach((f) => {
-      const snippet = targetProfile.snippetsByFrameId[f.id] || '';
-      updates.push({ id: f.id, narrationSnippet: snippet });
-    });
+    if (hasCachedText) {
+      // Restauração instantânea do cache local sem chamada de API
+      const updates: { id: string; narrationSnippet: string }[] = [];
+      currentPageFrames.forEach((f) => {
+        const snippet = targetProfile.snippetsByFrameId[f.id] || '';
+        updates.push({ id: f.id, narrationSnippet: snippet });
+      });
 
-    onUpdateFrameSnippets(updates);
-    if (currentPageScene) {
-      onUpdateSceneText(currentPageScene.id, targetProfile.fullScriptText);
+      onUpdateFrameSnippets(updates);
+      if (currentPageScene) {
+        onUpdateSceneText(currentPageScene.id, targetProfile.fullScriptText);
+        if (onUpdateScene) {
+          onUpdateScene({
+            ...currentPageScene,
+            text: targetProfile.fullScriptText,
+            appliedStyleId: profileId,
+          });
+        }
+      }
+      showToast(`✨ Estilo "${targetProfile.name}" restaurado instantaneamente do cache!`);
+    } else {
+      showToast(`Estilo "${targetProfile.name}" selecionado.`);
     }
+  };
 
-    showToast(`Perfil "${targetProfile.name}" ativado para Narração!`);
+  const handleSetActiveProfile = handleSelectOrSwitchProfile;
+
+  // Edição manual do contexto extraído na Sidebar Direita
+  const handleUpdateExtractedContext = (
+    field: 'rawDialoguesAndText' | 'visualDescription' | 'sceneBeat',
+    val: string
+  ) => {
+    if (!currentPageScene) return;
+    const currentExtracted: SceneExtractedContext = currentPageScene.extractedContext || {
+      rawDialoguesAndText: '',
+      visualDescription: '',
+      charactersInScene: [],
+      sceneBeat: 'Desenvolvimento',
+      frameCount: currentPageFrames.length || 1,
+      extractedAt: Date.now(),
+    };
+
+    const updatedContext: SceneExtractedContext = {
+      ...currentExtracted,
+      [field]: val,
+    };
+
+    if (onUpdateScene) {
+      onUpdateScene({
+        ...currentPageScene,
+        extractedContext: updatedContext,
+      });
+    }
   };
 
   // GERAÇÃO MULTIMODAL DIRETA DA PÁGINA ATUAL (Fiel à arte, 12-22 palavras, 5-9.5s)
@@ -676,13 +771,9 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
     }
   };
 
-  // GERAÇÃO EM MINI-BLOCOS DO CAPÍTULO (Todas as páginas com visão direta SoM e Bíblia Macro)
-  const handleBatchGenerateScript = async (targetProfileId?: string) => {
-    if (isBatchScriptGenerating || isScriptGenerating) return;
-
-    const profileIdToGen = targetProfileId || activeProfile.id;
-    const currentProfile =
-      currentPageScriptState.profiles.find((p) => p.id === profileIdToGen) || activeProfile;
+  // ETAPA 1: Extração de Texto e Contexto Visual das Imagens (Multimodal)
+  const handleExtractChapterContext = async () => {
+    if (isExtractingContext || isBatchScriptGenerating || isScriptGenerating) return;
 
     const effectiveChapterId = currentChapterId || currentChapter?.id || 'default';
     const numPages = Math.max(
@@ -706,8 +797,6 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
 
       if (pImg) {
         let effectiveFrames = pFrames;
-        // Fallback: se o usuário ainda não recortou quadros específicos na página,
-        // cria um quadro representando a página inteira para que toda a página receba roteiro!
         if (effectiveFrames.length === 0) {
           effectiveFrames = [
             {
@@ -733,21 +822,20 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
     }
 
     if (pagesWithFrames.length === 0) {
-      showToast('Nenhuma imagem encontrada no capítulo para gerar o roteiro.');
+      showToast('Nenhuma imagem encontrada no capítulo para extração visual.');
       return;
     }
 
-    setIsBatchScriptGenerating(true);
+    setIsExtractingContext(true);
     try {
-      const res = await generateChapterNarrationInMiniBatches({
+      const res = await extractChapterVisualContext({
         chapterLabel: currentChapter?.label || 'Capítulo',
         pages: pagesWithFrames,
-        profileId: profileIdToGen,
-        customSystemPrompt: currentProfile.systemPromptPreset,
         projectMetadata,
         chapterMetadata: chapterMetadata[currentChapterId],
-        batchSize: 2, // 2 páginas por mini-bloco
-        concurrency: 2, // Processamento paralelo em dobro guiado pela Bíblia Macro
+        previousChapterMemory,
+        batchSize: 2,
+        concurrency: 2,
         onProgress: (info) => {
           setBatchProgress({
             current: info.current || 1,
@@ -771,33 +859,139 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
         },
       });
 
-      if (res.macroContext) {
-        onUpdateChapterMetadata(currentChapterId, {
-          ...(chapterMetadata[currentChapterId] || { chapterId: currentChapterId }),
-          chapterId: currentChapterId,
-          synopsis: res.macroContext.synopsis || chapterMetadata[currentChapterId]?.synopsis || '',
-          macroContext: res.macroContext,
-        });
+      // Atualiza cenas existentes com o contexto extraído
+      const updatedScenes = scenes.map((s) => {
+        if (matchesChapter(s.chapterId) && s.pageNumber && res.extractedPages[s.pageNumber]) {
+          return {
+            ...s,
+            extractedContext: res.extractedPages[s.pageNumber],
+          };
+        }
+        return s;
+      });
+
+      if (onSetScenes) {
+        onSetScenes(updatedScenes);
+      } else if (onUpdateScene) {
+        updatedScenes.filter((s) => matchesChapter(s.chapterId)).forEach(onUpdateScene);
       }
-      if (res.suggestedWorkTitle && !projectMetadata.workTitle) {
+
+      // Atualiza metadados do capítulo com status de extração
+      const updatedChapterMeta: ChapterMetadata = {
+        ...(chapterMetadata[currentChapterId] || { chapterId: currentChapterId }),
+        chapterId: currentChapterId,
+        synopsis: res.macroContext?.synopsis || chapterMetadata[currentChapterId]?.synopsis || '',
+        macroContext: res.macroContext || chapterMetadata[currentChapterId]?.macroContext,
+        endingHook: res.endingHook || chapterMetadata[currentChapterId]?.endingHook,
+        narrativeState: res.narrativeState || chapterMetadata[currentChapterId]?.narrativeState,
+        keyOutcomes: res.keyOutcomes || chapterMetadata[currentChapterId]?.keyOutcomes,
+        isContextExtracted: true,
+        lastExtractedAt: Date.now(),
+      };
+      onUpdateChapterMetadata(currentChapterId, updatedChapterMeta);
+
+      // Compila e persiste memória de continuidade do capítulo
+      if (currentChapter) {
+        const memEntry = compileChapterMemoryEntry({
+          chapter: currentChapter,
+          chapterIndex: chapters.findIndex((c) => c.id === currentChapter.id),
+          scenes: updatedScenes,
+          chapterMetadata: updatedChapterMeta,
+        });
+        const updatedHistory = upsertProjectNarrativeHistory(projectMetadata.narrativeHistory || [], memEntry);
         onUpdateProjectMetadata({
           ...projectMetadata,
-          workTitle: res.suggestedWorkTitle,
-        });
-      }
-      if (
-        res.detectedCharacters &&
-        res.detectedCharacters.length > 0 &&
-        projectMetadata.characters.length === 0
-      ) {
-        onUpdateProjectMetadata({
-          ...projectMetadata,
-          characters: res.detectedCharacters,
+          narrativeHistory: updatedHistory,
         });
       }
 
+      showToast(`✓ Contexto e diálogos extraídos de todas as ${Object.keys(res.extractedPages).length} páginas!`);
+    } catch (err: any) {
+      showToast(`Erro na extração visual: ${err?.message || 'Falha'}`);
+    } finally {
+      setIsExtractingContext(false);
+      setBatchProgress(null);
+    }
+  };
+
+  // ETAPA 2: Geração / Reescrita de Roteiro por Estilo (Somente Texto — Zero Imagens)
+  const handleBatchGenerateScriptFromContext = async (targetProfileId?: string) => {
+    if (isBatchScriptGenerating || isScriptGenerating) return;
+
+    const profileIdToGen = targetProfileId || activeProfile.id;
+    const currentProfile =
+      currentPageScriptState.profiles.find((p) => p.id === profileIdToGen) || activeProfile;
+
+    const effectiveChapterId = currentChapterId || currentChapter?.id || 'default';
+    const numPages = Math.max(
+      currentChapter?.imageUrls?.length || 0,
+      currentChapter?.pages || 0,
+      totalPages
+    );
+
+    const pagesForScript: {
+      pageNumber: number;
+      extractedContext: SceneExtractedContext;
+      frames?: FrameItem[];
+    }[] = [];
+
+    for (let pNum = 1; pNum <= numPages; pNum++) {
+      const scene = chapterScenes.find((s) => Number(s.pageNumber) === pNum);
+      const pFrames = frames
+        .filter(
+          (f) =>
+            (f.chapterId ? (f.chapterId === effectiveChapterId || (currentChapter?.id && f.chapterId === currentChapter.id)) : true) &&
+            Number(f.pageNumber) === pNum
+        )
+        .sort((a, b) =>
+          a.label.localeCompare(b.label, undefined, { numeric: true, sensitivity: 'base' })
+        );
+
+      const effectiveContext: SceneExtractedContext = scene?.extractedContext || {
+        rawDialoguesAndText: scene?.text || '(Sem diálogos transcritos)',
+        visualDescription: 'Cena visual da página.',
+        charactersInScene: [],
+        sceneBeat: 'Desenvolvimento',
+        frameCount: pFrames.length || 1,
+        extractedAt: Date.now(),
+      };
+
+      pagesForScript.push({
+        pageNumber: pNum,
+        extractedContext: effectiveContext,
+        frames: pFrames,
+      });
+    }
+
+    if (pagesForScript.length === 0) {
+      showToast('Nenhuma página disponível para geração de roteiro.');
+      return;
+    }
+
+    setIsBatchScriptGenerating(true);
+    try {
+      const res = await generateChapterNarrationFromContext({
+        chapterLabel: currentChapter?.label || 'Capítulo',
+        pages: pagesForScript,
+        profileId: profileIdToGen,
+        customSystemPrompt: currentProfile.systemPromptPreset,
+        projectMetadata,
+        chapterMetadata: chapterMetadata[currentChapterId],
+        previousChapterMemory,
+        batchSize: 2,
+        concurrency: 2,
+        onProgress: (info) => {
+          setBatchProgress({
+            current: info.current || 1,
+            total: info.total || 1,
+            stage: info.stage,
+          });
+        },
+      });
+
       const allFrameUpdates: { id: string; narrationSnippet: string; duration?: number; transition?: any }[] = [];
       const batchScriptUpdates: Record<string, PageScriptState> = {};
+      const updatedScenesList = [...scenes];
 
       res.paginas.forEach((pageRes) => {
         const pNum = pageRes.pagina_numero;
@@ -858,7 +1052,6 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
           profiles: updatedProfiles,
         };
 
-        // Salva com a chave canônica e todos os aliases conhecidos
         batchScriptUpdates[key] = updatedState;
         if (effectiveChapterId !== 'default') {
           batchScriptUpdates[`default_${pNum}`] = updatedState;
@@ -870,15 +1063,26 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
           batchScriptUpdates[`${currentChapter.id}_${pNum}`] = updatedState;
         }
 
-        const scene = scenes.find(
+        const sceneIdx = updatedScenesList.findIndex(
           (s) =>
             matchesChapter(s.chapterId) &&
             Number(s.pageNumber) === pNum
         );
-        if (scene) {
-          onUpdateSceneText(scene.id, pageRes.roteiro);
+        if (sceneIdx !== -1) {
+          updatedScenesList[sceneIdx] = {
+            ...updatedScenesList[sceneIdx],
+            text: pageRes.roteiro,
+            appliedStyleId: profileIdToGen,
+          };
+          onUpdateSceneText(updatedScenesList[sceneIdx].id, pageRes.roteiro);
         }
       });
+
+      if (onSetScenes) {
+        onSetScenes(updatedScenesList);
+      } else if (onUpdateScene) {
+        updatedScenesList.filter((s) => matchesChapter(s.chapterId)).forEach(onUpdateScene);
+      }
 
       if (onUpdateMultiplePageScripts) {
         onUpdateMultiplePageScripts(batchScriptUpdates);
@@ -890,12 +1094,37 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
         onUpdateFrameSnippets(allFrameUpdates);
       }
 
-      showToast(`Roteiro ("${currentProfile.name}") gerado com sucesso para todas as ${res.paginas.length} páginas!`);
+      // Atualiza memória do capítulo
+      if (currentChapter) {
+        const memEntry = compileChapterMemoryEntry({
+          chapter: currentChapter,
+          chapterIndex: chapters.findIndex((c) => c.id === currentChapter.id),
+          scenes: updatedScenesList,
+          chapterMetadata: chapterMetadata[currentChapterId],
+        });
+        const updatedHistory = upsertProjectNarrativeHistory(projectMetadata.narrativeHistory || [], memEntry);
+        onUpdateProjectMetadata({
+          ...projectMetadata,
+          narrativeHistory: updatedHistory,
+        });
+      }
+
+      showToast(`⚡ Roteiro ("${currentProfile.name}") gerado via SOMENTE TEXTO para todas as ${res.paginas.length} páginas!`);
     } catch (err: any) {
-      showToast(`Erro na geração em lote: ${err?.message || 'Falha'}`);
+      showToast(`Erro na estilização do roteiro: ${err?.message || 'Falha'}`);
     } finally {
       setIsBatchScriptGenerating(false);
       setBatchProgress(null);
+    }
+  };
+
+  // FLUXO INTEGRADO: Se já houver extração, roda Etapa 2 pura (somente texto); senão, extrai e gera
+  const handleBatchGenerateScript = async (targetProfileId?: string) => {
+    if (isChapterContextExtracted) {
+      await handleBatchGenerateScriptFromContext(targetProfileId);
+    } else {
+      await handleExtractChapterContext();
+      await handleBatchGenerateScriptFromContext(targetProfileId);
     }
   };
 
@@ -1080,15 +1309,63 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
               </div>
             )}
 
-            {/* Bloco 1: Bíblia do Capítulo e Geração em Lote */}
+            {/* Bloco 0.5: Continuidade Narrativa Entre Capítulos (se N > 1) */}
+            {previousChapterMemory && (
+              <div className="rounded-xl border border-primary/30 bg-primary/10 p-2.5 space-y-1.5 text-xs shadow-2xs">
+                <button
+                  type="button"
+                  onClick={() => setIsContinuityExpanded(!isContinuityExpanded)}
+                  className="w-full flex items-center justify-between text-left font-bold text-primary hover:underline cursor-pointer"
+                  title="Clique para inspecionar os ganchos do capítulo anterior passados para a IA"
+                >
+                  <div className="flex items-center gap-1.5 truncate">
+                    <Link2 className="h-3.5 w-3.5 shrink-0" />
+                    <span className="truncate">Continuidade: {previousChapterMemory.chapterLabel}</span>
+                  </div>
+                  <span className="text-[10px] font-mono opacity-80">{isContinuityExpanded ? '▲' : '▼'}</span>
+                </button>
+                {isContinuityExpanded && (
+                  <div className="pt-2 border-t border-primary/20 space-y-1.5 text-[11px] text-foreground animate-in fade-in">
+                    <div>
+                      <span className="font-bold text-primary">Gancho Pendente:</span>
+                      <p className="text-muted-foreground text-[10.5px] leading-relaxed mt-0.5">
+                        {previousChapterMemory.endingHook || '(Continuação direta da ação)'}
+                      </p>
+                    </div>
+                    {previousChapterMemory.lastSceneText && (
+                      <div>
+                        <span className="font-bold text-primary">Últimas Linhas:</span>
+                        <p className="text-muted-foreground text-[10.5px] italic leading-tight mt-0.5 line-clamp-3">
+                          "{previousChapterMemory.lastSceneText}"
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Bloco 1: Bíblia do Capítulo e Pipeline em Duas Etapas */}
             <div className="space-y-1.5">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground px-1">
-                Bíblia & Enredo
-              </span>
+              <div className="flex items-center justify-between px-1">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                  Extração & Bíblia
+                </span>
+                {isChapterContextExtracted ? (
+                  <span className="text-[9.5px] font-bold font-mono text-emerald-400 bg-emerald-500/15 border border-emerald-500/30 px-1.5 py-0.2 rounded-full">
+                    ✓ {extractedScenesCount}/{totalPages} Extraídas
+                  </span>
+                ) : (
+                  <span className="text-[9.5px] font-bold font-mono text-amber-400 bg-amber-500/15 border border-amber-500/30 px-1.5 py-0.2 rounded-full">
+                    Pendente
+                  </span>
+                )}
+              </div>
+
               <div className="flex flex-col gap-1.5">
                 <button
                   onClick={handleAnalyzeChapterMacro}
-                  disabled={isMacroAnalyzing || isBatchScriptGenerating || isScriptGenerating}
+                  disabled={isMacroAnalyzing || isBatchScriptGenerating || isScriptGenerating || isExtractingContext}
                   className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-all cursor-pointer ${
                     chapterMetadata[currentChapterId]?.macroContext
                       ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/20 shadow-2xs'
@@ -1105,24 +1382,88 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
                   {isMacroAnalyzing && <Loader2 className="h-3 w-3 animate-spin text-primary" />}
                 </button>
 
-                <button
-                  onClick={() => handleBatchGenerateScript(activeProfile.id)}
-                  disabled={isBatchScriptGenerating || isScriptGenerating}
-                  className="w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-primary hover:bg-primary/90 text-primary-foreground text-xs font-bold shadow-xs transition-colors disabled:opacity-40 cursor-pointer"
-                  title="Gerar o roteiro de todas as páginas do capítulo guiado pela Bíblia Macro"
-                >
-                  {isBatchScriptGenerating ? (
-                    <>
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      <span>Gerando Capítulo...</span>
-                    </>
-                  ) : (
-                    <>
-                      <Sparkles className="h-3.5 w-3.5" />
-                      <span>Gerar Roteiro do Capítulo</span>
-                    </>
-                  )}
-                </button>
+                {/* Se o capítulo já tem contexto extraído das imagens: oferece estilo rápido text-only */}
+                {isChapterContextExtracted ? (
+                  <>
+                    <button
+                      onClick={() => handleBatchGenerateScriptFromContext(activeProfile.id)}
+                      disabled={isBatchScriptGenerating || isScriptGenerating || isExtractingContext}
+                      className="w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-primary hover:bg-primary/90 text-primary-foreground text-xs font-bold shadow-xs transition-colors disabled:opacity-40 cursor-pointer"
+                      title="Gera/Reescreve o roteiro enviando SOMENTE TEXTO para a IA (Zero Imagens — Rápido e Barato)"
+                    >
+                      {isBatchScriptGenerating ? (
+                        <>
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          <span>Estilizando Roteiro...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Zap className="h-3.5 w-3.5" />
+                          <span>⚡ Aplicar Estilo (Somente Texto)</span>
+                        </>
+                      )}
+                    </button>
+
+                    <button
+                      onClick={handleExtractChapterContext}
+                      disabled={isBatchScriptGenerating || isScriptGenerating || isExtractingContext}
+                      className="w-full flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-border bg-secondary/50 hover:bg-secondary text-muted-foreground hover:text-foreground text-[11px] font-semibold transition-colors disabled:opacity-40 cursor-pointer"
+                      title="Reanalisar as imagens do capítulo para atualizar diálogos e ações visuais"
+                    >
+                      {isExtractingContext ? (
+                        <>
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                          <span>Reextraindo Imagens...</span>
+                        </>
+                      ) : (
+                        <>
+                          <RefreshCw className="h-3 w-3" />
+                          <span>Reextrair das Imagens</span>
+                        </>
+                      )}
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      onClick={() => handleBatchGenerateScript(activeProfile.id)}
+                      disabled={isBatchScriptGenerating || isScriptGenerating || isExtractingContext}
+                      className="w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-primary hover:bg-primary/90 text-primary-foreground text-xs font-bold shadow-xs transition-colors disabled:opacity-40 cursor-pointer"
+                      title="Executa a extração visual e gera o roteiro com o estilo selecionado"
+                    >
+                      {isBatchScriptGenerating || isExtractingContext ? (
+                        <>
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          <span>Processando Capítulo...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles className="h-3.5 w-3.5" />
+                          <span>Extrair & Gerar Roteiro</span>
+                        </>
+                      )}
+                    </button>
+
+                    <button
+                      onClick={handleExtractChapterContext}
+                      disabled={isBatchScriptGenerating || isScriptGenerating || isExtractingContext}
+                      className="w-full flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-border bg-secondary/50 hover:bg-secondary text-muted-foreground hover:text-foreground text-[11px] font-semibold transition-colors disabled:opacity-40 cursor-pointer"
+                      title="Extrai os diálogos e ações das imagens sem aplicar nenhum estilo"
+                    >
+                      {isExtractingContext ? (
+                        <>
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                          <span>Extraindo Contexto...</span>
+                        </>
+                      ) : (
+                        <>
+                          <FileSearch className="h-3 w-3" />
+                          <span>Apenas Extrair Contexto Visual</span>
+                        </>
+                      )}
+                    </button>
+                  </>
+                )}
               </div>
             </div>
 
@@ -1146,16 +1487,15 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
                   const isActive = profile.id === activeProfile.id;
                   const isSelectedForNarration = profile.id === currentPageScriptState.activeProfileId;
                   const icon = PROFILE_ICONS[profile.id] || '🎙️';
+                  const hasCache = Boolean(
+                    profile.fullScriptText?.trim() ||
+                    Object.values(profile.snippetsByFrameId || {}).some((s) => s?.trim())
+                  );
 
                   return (
                     <button
                       key={profile.id}
-                      onClick={() => {
-                        updateCurrentScriptState({
-                          ...currentPageScriptState,
-                          activeProfileId: profile.id,
-                        });
-                      }}
+                      onClick={() => handleSelectOrSwitchProfile(profile.id)}
                       className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer border ${
                         isActive
                           ? 'bg-primary/20 text-primary border-primary/40 shadow-xs'
@@ -1165,6 +1505,9 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
                       <div className="flex items-center gap-2 truncate">
                         <span className="text-sm shrink-0">{icon}</span>
                         <span className="truncate">{profile.name}</span>
+                        {hasCache && (
+                          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shrink-0" title="Roteiro em cache pronto para restauração instantânea" />
+                        )}
                       </div>
                       {isSelectedForNarration && (
                         <Star className="h-3 w-3 text-amber-400 fill-amber-400 shrink-0 ml-1" />
@@ -1445,39 +1788,151 @@ export const RoteiroView: React.FC<RoteiroViewProps> = ({
             <div className="flex items-center gap-2 min-w-0">
               <ScrollText className="h-4 w-4 text-primary shrink-0" />
               <span className="text-xs font-bold text-foreground truncate">
-                Roteiro (Pág. {currentPageNumber})
+                Página {currentPageNumber}
               </span>
             </div>
             <span className="text-[10px] font-medium px-2 py-0.5 rounded-full border bg-primary/10 text-primary border-primary/30 truncate shrink-0 max-w-[120px]">
-              {activeProfile.name}
+              {rightSidebarTab === 'roteiro' ? activeProfile.name : 'Contexto Visual'}
             </span>
           </div>
 
-          {/* Subheader / Ações de Distribuição e Métricas */}
-          <div className="px-3 py-2 border-b border-border/40 bg-secondary/20 flex items-center justify-between shrink-0 text-[11px]">
-            <span className="font-mono text-muted-foreground">
-              {pageWordCount} pal. · ~{pageEstimatedSec}s
-            </span>
+          {/* Alternador de Abas: Roteiro Narrado vs. Contexto Extraído */}
+          <div className="flex border-b border-border bg-card/70 p-1 gap-1 shrink-0">
             <button
               type="button"
-              onClick={() => handleDistributeToFrames()}
-              className="font-semibold text-primary hover:underline cursor-pointer flex items-center gap-1 transition-colors"
-              title="Distribuir o texto geral proporcionalmente entre os quadros da página"
+              onClick={() => setRightSidebarTab('roteiro')}
+              className={`flex-1 py-1.5 px-2 text-xs font-bold rounded-lg flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+                rightSidebarTab === 'roteiro'
+                  ? 'bg-primary text-primary-foreground shadow-xs'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-secondary/60'
+              }`}
             >
-              <Sparkles className="h-3 w-3" />
-              <span>Distribuir</span>
+              <ScrollText className="h-3.5 w-3.5" />
+              <span>Roteiro</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setRightSidebarTab('contexto')}
+              className={`flex-1 py-1.5 px-2 text-xs font-bold rounded-lg flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+                rightSidebarTab === 'contexto'
+                  ? 'bg-primary text-primary-foreground shadow-xs'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-secondary/60'
+              }`}
+            >
+              <FileSearch className="h-3.5 w-3.5" />
+              <span>Contexto Extraído</span>
+              {currentPageScene?.extractedContext && (
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shrink-0" title="Contexto extraído pronto" />
+              )}
             </button>
           </div>
 
-          {/* Editor do Roteiro Geral Contínuo da Página */}
-          <div className="flex-1 p-3 flex flex-col gap-2 overflow-hidden">
-            <textarea
-              value={activeProfile.fullScriptText || ''}
-              onChange={(e) => handleFullScriptTextChange(e.target.value)}
-              placeholder={`Digite a narração contínua da Página ${currentPageNumber}...\n\nOu use 'Gerar Pág. ${currentPageNumber}' na barra lateral esquerda para roteirizar via IA.`}
-              className="w-full flex-1 bg-background/80 text-foreground text-xs p-3 rounded-xl border border-border focus:outline-none focus:ring-1 focus:ring-primary resize-none leading-relaxed font-sans placeholder:text-muted-foreground/50 shadow-inner"
-            />
-          </div>
+          {rightSidebarTab === 'roteiro' ? (
+            <>
+              {/* Subheader / Ações de Distribuição e Métricas */}
+              <div className="px-3 py-2 border-b border-border/40 bg-secondary/20 flex items-center justify-between shrink-0 text-[11px]">
+                <span className="font-mono text-muted-foreground">
+                  {pageWordCount} pal. · ~{pageEstimatedSec}s
+                </span>
+                <button
+                  type="button"
+                  onClick={() => handleDistributeToFrames()}
+                  className="font-semibold text-primary hover:underline cursor-pointer flex items-center gap-1 transition-colors"
+                  title="Distribuir o texto geral proporcionalmente entre os quadros da página"
+                >
+                  <Sparkles className="h-3 w-3" />
+                  <span>Distribuir</span>
+                </button>
+              </div>
+
+              {/* Editor do Roteiro Geral Contínuo da Página */}
+              <div className="flex-1 p-3 flex flex-col gap-2 overflow-hidden">
+                <textarea
+                  value={activeProfile.fullScriptText || ''}
+                  onChange={(e) => handleFullScriptTextChange(e.target.value)}
+                  placeholder={`Digite a narração contínua da Página ${currentPageNumber}...\n\nOu use 'Gerar Roteiro do Capítulo' na barra lateral esquerda para roteirizar via IA.`}
+                  className="w-full flex-1 bg-background/80 text-foreground text-xs p-3 rounded-xl border border-border focus:outline-none focus:ring-1 focus:ring-primary resize-none leading-relaxed font-sans placeholder:text-muted-foreground/50 shadow-inner"
+                />
+              </div>
+            </>
+          ) : (
+            /* ABA 2: Contexto Extraído da Imagem (Fatos, Diálogos e Visual) */
+            <div className="flex-1 p-3 flex flex-col gap-3 overflow-y-auto">
+              {/* Aviso se houver divergência no número de quadros recortados */}
+              {currentPageScene?.extractedContext?.frameCount &&
+                currentPageFrames.length !== currentPageScene.extractedContext.frameCount && (
+                  <div className="p-2.5 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-300 text-[11px] leading-relaxed">
+                    ⚠️ <strong>Divergência de Quadros:</strong> Há {currentPageFrames.length} quadros no Recorte, mas a extração visual possui {currentPageScene.extractedContext.frameCount}. Recomenda-se reextrair.
+                  </div>
+                )}
+
+              {/* Informações da Cena */}
+              <div className="space-y-1">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                  Papel da Cena (Scene Beat)
+                </span>
+                <input
+                  type="text"
+                  value={currentPageScene?.extractedContext?.sceneBeat || ''}
+                  onChange={(e) => handleUpdateExtractedContext('sceneBeat', e.target.value)}
+                  placeholder="Ex: Abertura / Escalada de tensão / Clímax"
+                  className="w-full bg-background/80 text-foreground text-xs px-2.5 py-1.5 rounded-lg border border-border focus:outline-none focus:ring-1 focus:ring-primary"
+                />
+              </div>
+
+              {/* Personagens Presentes */}
+              {currentPageScene?.extractedContext?.charactersInScene &&
+                currentPageScene.extractedContext.charactersInScene.length > 0 && (
+                  <div className="space-y-1">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                      Personagens em Cena
+                    </span>
+                    <div className="flex flex-wrap gap-1">
+                      {currentPageScene.extractedContext.charactersInScene.map((charName, cIdx) => (
+                        <span
+                          key={cIdx}
+                          className="px-2 py-0.5 rounded-md bg-secondary text-foreground text-[10.5px] font-semibold border border-border"
+                        >
+                          {charName}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+              {/* Diálogos e Textos Brutos */}
+              <div className="flex-1 flex flex-col gap-1 min-h-[140px]">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                    Diálogos e Textos Visíveis
+                  </span>
+                  <span className="text-[9.5px] text-muted-foreground font-mono">Editável</span>
+                </div>
+                <textarea
+                  value={currentPageScene?.extractedContext?.rawDialoguesAndText || ''}
+                  onChange={(e) => handleUpdateExtractedContext('rawDialoguesAndText', e.target.value)}
+                  placeholder={`Diálogos e textos extraídos dos balões...\nEstruturado por [Quadro 01], [Quadro 02]...`}
+                  className="w-full flex-1 bg-background/80 text-foreground text-xs p-2.5 rounded-xl border border-border focus:outline-none focus:ring-1 focus:ring-primary resize-none leading-relaxed font-sans placeholder:text-muted-foreground/50 shadow-inner"
+                />
+              </div>
+
+              {/* Descrição Visual Objetiva */}
+              <div className="flex-1 flex flex-col gap-1 min-h-[140px]">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                    Ação Visual & Expressões
+                  </span>
+                  <span className="text-[9.5px] text-muted-foreground font-mono">Editável</span>
+                </div>
+                <textarea
+                  value={currentPageScene?.extractedContext?.visualDescription || ''}
+                  onChange={(e) => handleUpdateExtractedContext('visualDescription', e.target.value)}
+                  placeholder={`Descrição visual objetiva dos acontecimentos...\nEstruturado por [Quadro 01], [Quadro 02]...`}
+                  className="w-full flex-1 bg-background/80 text-foreground text-xs p-2.5 rounded-xl border border-border focus:outline-none focus:ring-1 focus:ring-primary resize-none leading-relaxed font-sans placeholder:text-muted-foreground/50 shadow-inner"
+                />
+              </div>
+            </div>
+          )}
 
           {/* Rodapé da Sidebar Direita */}
           <div className="p-2.5 border-t border-border/50 bg-card/40 text-[10px] text-muted-foreground flex items-center justify-between shrink-0">
