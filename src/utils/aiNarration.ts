@@ -12,8 +12,12 @@ import {
   ChapterMetadata,
   ChapterMacroContext,
   CharacterMetadata,
+  ChapterNarrativeMemory,
+  SceneExtractedContext,
+  SceneExtractedPanel,
 } from '../types';
 import { generateSoMAnnotatedPage } from './somAnnotator';
+import { formatContinuityPromptBlock } from './narrativeMemory';
 
 export function normalizeTransitionType(rawTrans: string, index: number = 0): TransitionType {
   const t = String(rawTrans || '').toLowerCase().trim();
@@ -1060,7 +1064,8 @@ export function buildChapterNarrationSystemPrompt(
   profileId: string = 'sarcastico',
   customTonePrompt?: string,
   projectMetadata?: ProjectMetadata,
-  chapterMetadata?: ChapterMetadata
+  chapterMetadata?: ChapterMetadata,
+  previousChapterMemory?: ChapterNarrativeMemory | null
 ): string {
   const profile = NARRATION_PROFILES.find((p) => p.id === profileId) || NARRATION_PROFILES[0];
   const activeTone = customTonePrompt?.trim() || profile.systemDescription;
@@ -1086,6 +1091,10 @@ export function buildChapterNarrationSystemPrompt(
   const workTitleBlock = projectMetadata?.workTitle ? ` da obra "${projectMetadata.workTitle}"` : '';
   const synopsisBlock = chapterMetadata?.synopsis
     ? `\nCONTEXTO DO ARCO/CAPÍTULO ATUAL: ${chapterMetadata.synopsis}\n`
+    : '';
+
+  const continuityBlock = previousChapterMemory
+    ? `\n${formatContinuityPromptBlock(previousChapterMemory)}\n`
     : '';
 
   let macroBlock = '';
@@ -1117,6 +1126,7 @@ PERFIL ATIVO DO NARRADOR: ${profile.name}
 ${activeTone}
 
 ${workTitleBlock ? `OBRA: ${projectMetadata?.workTitle}` : ''}
+${continuityBlock}
 ${macroBlock || synopsisBlock}${charactersBlock}${glossaryBlock}
 ANCORAGEM VISUAL OBRIGATÓRIA (PIPELINE SET-OF-MARK / SoM):
 1. MOLDURAS DEMARCADAS NA IMAGEM:
@@ -1675,6 +1685,7 @@ export interface AnalyzeMacroContextParams {
   pages: ChapterPageItem[];
   projectMetadata?: ProjectMetadata;
   chapterMetadata?: ChapterMetadata;
+  previousChapterMemory?: ChapterNarrativeMemory | null;
   config?: AiNarrationConfig;
   onProgress?: (info: { stage: string; current?: number; total?: number }) => void;
 }
@@ -1685,6 +1696,9 @@ export interface ChapterMacroContextResult {
   criticalRules: string[];
   suggestedWorkTitle?: string;
   detectedCharacters?: CharacterMetadata[];
+  endingHook?: string;
+  narrativeState?: string;
+  keyOutcomes?: string[];
 }
 
 /**
@@ -1760,6 +1774,10 @@ export async function analyzeChapterMacroContext(
 
   const workTitle = params.projectMetadata?.workTitle ? ` da obra "${params.projectMetadata.workTitle}"` : '';
 
+  const continuityPrompt = params.previousChapterMemory
+    ? `\n${formatContinuityPromptBlock(params.previousChapterMemory)}\n`
+    : '';
+
   const systemPrompt = `Você é um Diretor Narrativo e Supervisor Sênior de Roteiros para canais de Recap de Manhwa no YouTube${workTitle}.
 Sua missão é extrair a BÍBLIA FÁTICA do capítulo ${params.chapterLabel}.
 
@@ -1767,6 +1785,7 @@ OBJETIVO CRÍTICO (ANTI-ALUCINAÇÃO):
 O roteirista posterior receberá recortes de 2 em 2 páginas. Se ele não souber quem são os personagens de verdade, ele cometerá erros grosseiros — como julgar guerreiros veteranos suicidas e insanos como 'novatos preguiçosos' só porque estavam sentados, sujos ou zombando no início da batalha.
 Você DEVE enxergar a história macro e estabelecer as verdades inegociáveis.
 
+${continuityPrompt}
 ${knownCharactersPrompt}
 
 DIRETRIZES DA ANÁLISE:
@@ -1778,6 +1797,9 @@ DIRETRIZES DA ANÁLISE:
    - Qual a situação de abertura, o desenrolar das ações e o clímax/desfecho deste capítulo?
 3. REGRAS OBRIGATÓRIAS ANTI-ALUCINAÇÃO:
    - Crie 3 a 5 regras enfáticas para guiar o narrador.
+4. GANCHO E CONTINUIDADE:
+   - O que acontece no desfecho/cliffhanger deste capítulo?
+   - Qual o estado consolidado da trama ao final?
 
 Retorne ESTRITAMENTE em formato JSON:
 {
@@ -1788,6 +1810,9 @@ Retorne ESTRITAMENTE em formato JSON:
     "Regra 2: ...",
     "Regra 3: ..."
   ],
+  "endingHook": "O que acontece exatamente no cliffhanger da última página do capítulo",
+  "narrativeState": "Estado dos personagens e da trama ao término (vitória, derrota, fuga, revelação)",
+  "keyOutcomes": ["Consequência 1", "Consequência 2"],
   "suggestedWorkTitle": "Nome provável da obra se visível na arte ou logotipo",
   "detectedCharacters": [
     {
@@ -1898,6 +1923,11 @@ Retorne ESTRITAMENTE em formato JSON:
           description: String(c.description || ''),
         }))
       : undefined,
+    endingHook: parsed.endingHook ? String(parsed.endingHook).trim() : undefined,
+    narrativeState: parsed.narrativeState ? String(parsed.narrativeState).trim() : undefined,
+    keyOutcomes: Array.isArray(parsed.keyOutcomes)
+      ? parsed.keyOutcomes.map((k: any) => String(k).trim()).filter(Boolean)
+      : undefined,
   };
 }
 
@@ -1913,6 +1943,7 @@ export async function generateChapterNarrationInMiniBatches(params: {
   customSystemPrompt?: string;
   projectMetadata?: ProjectMetadata;
   chapterMetadata?: ChapterMetadata;
+  previousChapterMemory?: ChapterNarrativeMemory | null;
   config?: AiNarrationConfig;
   batchSize?: number;
   concurrency?: number;
@@ -1943,6 +1974,7 @@ export async function generateChapterNarrationInMiniBatches(params: {
         pages: validPages,
         projectMetadata: params.projectMetadata,
         chapterMetadata: activeChapterMetadata,
+        previousChapterMemory: params.previousChapterMemory,
         config,
         onProgress: (p) => params.onProgress?.({ stage: p.stage }),
       });
@@ -2055,7 +2087,8 @@ Analise os quadros demarcados com Set-of-Mark nas páginas abaixo e retorne o JS
           params.profileId,
           params.customSystemPrompt,
           params.projectMetadata,
-          activeChapterMetadata
+          activeChapterMetadata,
+          params.previousChapterMemory
         );
 
         const base = (config.baseURL || DEFAULT_AI_CONFIG.baseURL).replace(/\/+$/, '');
@@ -2195,6 +2228,655 @@ Analise os quadros demarcados com Set-of-Mark nas páginas abaixo e retorne o JS
     suggestedWorkTitle,
     detectedCharacters,
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PIPELINE DE ROTEIRO EM DUAS ETAPAS (EXTRAÇÃO VISUAL VS. ESTILO SOMENTE TEXTO)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface ExtractChapterVisualContextParams {
+  chapterLabel: string;
+  pages: ChapterPageItem[];
+  projectMetadata?: ProjectMetadata;
+  chapterMetadata?: ChapterMetadata;
+  previousChapterMemory?: ChapterNarrativeMemory | null;
+  config?: AiNarrationConfig;
+  batchSize?: number;
+  concurrency?: number;
+  onProgress?: (info: { stage: string; current?: number; total?: number }) => void;
+  onMacroContextReady?: (
+    macro: ChapterMacroContext,
+    detectedChars?: CharacterMetadata[],
+    suggestedTitle?: string
+  ) => void;
+}
+
+export interface ExtractChapterVisualContextResult {
+  extractedPages: Record<number, SceneExtractedContext>;
+  macroContext?: ChapterMacroContext;
+  endingHook?: string;
+  narrativeState?: string;
+  keyOutcomes?: string[];
+  detectedCharacters?: CharacterMetadata[];
+  suggestedWorkTitle?: string;
+}
+
+/**
+ * ETAPA 1 (Multimodal): Extrai texto, diálogos e contexto visual objetivo das páginas.
+ * As imagens são analisadas UMA ÚNICA VEZ e o resultado estruturado por quadro ([Quadro 1], [Quadro 2]...)
+ * é salvo em `scene.extractedContext`, permitindo trocar estilos posteriores sem reenviar imagens.
+ */
+export async function extractChapterVisualContext(
+  params: ExtractChapterVisualContextParams
+): Promise<ExtractChapterVisualContextResult> {
+  const config = params.config || loadAiNarrationConfig();
+  const validPages = params.pages.filter((p) => p.rawImageUrl);
+  if (validPages.length === 0) {
+    throw new Error('Nenhuma página com imagem disponível para extração de contexto visual.');
+  }
+
+  let activeChapterMetadata = { ...(params.chapterMetadata || { chapterId: 'current' }) };
+  let detectedCharacters: CharacterMetadata[] | undefined;
+  let suggestedWorkTitle: string | undefined;
+
+  // 1. Garante que a análise macro do capítulo exista
+  if (!activeChapterMetadata.macroContext) {
+    params.onProgress?.({
+      stage: 'Etapa 1: Analisando macro-contexto e verdade dos personagens...',
+      current: 0,
+      total: 100,
+    });
+
+    try {
+      const macroRes = await analyzeChapterMacroContext({
+        chapterLabel: params.chapterLabel,
+        pages: validPages,
+        projectMetadata: params.projectMetadata,
+        chapterMetadata: activeChapterMetadata,
+        previousChapterMemory: params.previousChapterMemory,
+        config,
+        onProgress: (p) => params.onProgress?.({ stage: p.stage }),
+      });
+
+      const newMacro: ChapterMacroContext = {
+        synopsis: macroRes.synopsis,
+        characterDynamics: macroRes.characterDynamics,
+        criticalRules: macroRes.criticalRules,
+        suggestedWorkTitle: macroRes.suggestedWorkTitle,
+        analyzedAt: Date.now(),
+      };
+
+      activeChapterMetadata = {
+        ...activeChapterMetadata,
+        synopsis: macroRes.synopsis || activeChapterMetadata.synopsis,
+        macroContext: newMacro,
+        endingHook: macroRes.endingHook || activeChapterMetadata.endingHook,
+        narrativeState: macroRes.narrativeState || activeChapterMetadata.narrativeState,
+        keyOutcomes: macroRes.keyOutcomes || activeChapterMetadata.keyOutcomes,
+      };
+
+      detectedCharacters = macroRes.detectedCharacters;
+      suggestedWorkTitle = macroRes.suggestedWorkTitle;
+      params.onMacroContextReady?.(newMacro, detectedCharacters, suggestedWorkTitle);
+    } catch (err: any) {
+      console.warn('Aviso: Análise macro inicial falhou, prosseguindo com dados locais:', err);
+    }
+  }
+
+  // 2. Processa as páginas em mini-blocos (2 páginas por padrão)
+  const batchSize = Math.max(1, Math.min(3, params.batchSize || 2));
+  const chunks: ChapterPageItem[][] = [];
+  for (let i = 0; i < validPages.length; i += batchSize) {
+    chunks.push(validPages.slice(i, i + batchSize));
+  }
+
+  const concurrency = Math.max(1, Math.min(3, params.concurrency ?? 2));
+  const extractedMap: Record<number, SceneExtractedContext> = {};
+  let chapterEndingHook = activeChapterMetadata.endingHook;
+  let chapterNarrativeState = activeChapterMetadata.narrativeState;
+  let chapterKeyOutcomes = activeChapterMetadata.keyOutcomes;
+  let completedChunks = 0;
+
+  for (let i = 0; i < chunks.length; i += concurrency) {
+    const batchGroup = chunks.slice(i, i + concurrency);
+
+    await Promise.all(
+      batchGroup.map(async (chunk, relIdx) => {
+        const chunkIdx = i + relIdx;
+        const pageNums = chunk.map((p) => p.pageNumber).join(', ');
+
+        params.onProgress?.({
+          stage: `Extraindo visual e diálogos (Págs ${pageNums} - Bloco ${chunkIdx + 1}/${chunks.length})...`,
+          current: completedChunks + 1,
+          total: chunks.length,
+        });
+
+        // Prepara imagens SoM ou raw
+        const preparedPages = await Promise.all(
+          chunk.map(async (page) => {
+            let b64 = '';
+            try {
+              if (page.frames && page.frames.length > 0) {
+                b64 = await generateSoMAnnotatedPage({
+                  rawImageUrl: page.rawImageUrl,
+                  frames: page.frames,
+                  maxWidth: 960,
+                  maxHeight: 1600,
+                  quality: 0.72,
+                });
+              } else {
+                b64 = await prepareImageForAi(page.rawImageUrl, 960, 1600);
+              }
+            } catch (err: any) {
+              b64 = await prepareImageForAi(page.rawImageUrl, 960, 1600);
+            }
+            return { page, b64 };
+          })
+        );
+
+        const userContent: any[] = [
+          {
+            type: 'text',
+            text: `Capítulo: ${params.chapterLabel}. Extraia com fidelidade absoluta os diálogos, textos visíveis e a descrição objetiva dos acontecimentos demarcados por Set-of-Mark nas páginas abaixo:`,
+          },
+        ];
+
+        for (const { page, b64 } of preparedPages) {
+          const labelsList = (
+            page.croppedFramesLabels && page.croppedFramesLabels.length > 0
+              ? page.croppedFramesLabels
+              : ['Quadro 01']
+          ).join(', ');
+
+          userContent.push({
+            type: 'text',
+            text: `--- PÁGINA ${page.pageNumber} (${page.croppedFramesCount} quadros: [${labelsList}]) ---`,
+          });
+          userContent.push({
+            type: 'image_url',
+            image_url: { url: b64 },
+          });
+        }
+
+        const workTitle = params.projectMetadata?.workTitle ? ` da obra "${params.projectMetadata.workTitle}"` : '';
+        const systemPrompt = `Você é um Analista Visual Sênior e Transcritor Especializado de Manhwas/Mangás${workTitle}.
+Sua missão na Etapa 1 é ESTRITAMENTE FÁTICA, OBJETIVA E NEUTRA.
+NÃO aplique tom de narrador nem piadas. Seu objetivo é criar um dossiê rico e estruturado que permita que outros roteiristas escrevam a história sem precisar consultar as imagens novamente.
+
+DIRETRIZES DA EXTRAÇÃO:
+1. TRANSCRIÇÃO FIEL DE TEXTOS E DIÁLOGOS:
+   - Transcreva todos os balões de fala, caixas de narração, caixas de sistema de status e onomatopeias relevantes.
+   - Indique quem está falando sempre que identificável.
+   - Estruture por quadro demarcado ([Quadro 01], [Quadro 02]...).
+2. DESCRIÇÃO VISUAL OBJETIVA:
+   - Descreva com precisão a ação física, armas, poderes, expressões faciais e o clima da cena dentro de cada quadro demarcado.
+3. PAPEL DA PÁGINA (SCENE BEAT):
+   - Indique o papel narrativo da página (ex: abertura, escalada de tensão, clímax, revelação, gancho).
+4. CONTINUIDADE FINAL (se este bloco contiver as últimas páginas do capítulo):
+   - Identifique o gancho final (endingHook), estado consolidado da trama (narrativeState) e consequências diretas (keyOutcomes).
+
+Retorne ESTRITAMENTE em formato JSON:
+{
+  "paginas": [
+    {
+      "pagina_numero": 1,
+      "sceneBeat": "Abertura / Tensão inicial",
+      "charactersInScene": ["Nome 1", "Nome 2"],
+      "quadros": [
+        {
+          "quadro_label": "[Quadro 01]",
+          "dialogos_e_textos": "Transcrição fiel dos balões e textos visíveis neste quadro",
+          "acao_visual": "Descrição objetiva da pose, ação e expressões dos personagens",
+          "personagens": ["Nome 1"],
+          "mood": "tensão"
+        }
+      ],
+      "rawDialoguesAndText": "[Quadro 01]: Fala ou texto...",
+      "visualDescription": "[Quadro 01]: Descrição visual da cena..."
+    }
+  ],
+  "endingHook": "O que acontece exatamente no cliffhanger final do capítulo (se aplicável)",
+  "narrativeState": "Estado dos personagens e da trama ao término",
+  "keyOutcomes": ["Consequência 1", "Consequência 2"]
+}`;
+
+        const base = (config.baseURL || DEFAULT_AI_CONFIG.baseURL).replace(/\/+$/, '');
+        const endpoint = base.endsWith('/v1') ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
+
+        const payload = {
+          model: config.model || DEFAULT_AI_CONFIG.model,
+          stream: false,
+          response_format: { type: 'json_object' },
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userContent },
+          ],
+          temperature: 0.35,
+          max_tokens: 3000,
+        };
+
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream, */*',
+        };
+        const apiKey = (config.apiKey ?? DEFAULT_AI_CONFIG.apiKey).trim();
+        if (apiKey) {
+          headers['Authorization'] = `Bearer ${apiKey}`;
+        }
+
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(payload),
+        });
+
+        if (!response.ok) {
+          const errText = await response.text().catch(() => '');
+          throw new Error(`Erro na API ao extrair contexto visual das páginas ${pageNums} (${response.status}): ${errText.slice(0, 250)}`);
+        }
+
+        const rawRes = await response.text();
+        const decoded = decodeSseOrJson(rawRes);
+
+        let cleanJson = decoded.trim();
+        if (cleanJson.startsWith('```')) {
+          cleanJson = cleanJson.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
+        }
+        const firstBrace = cleanJson.indexOf('{');
+        const lastBrace = cleanJson.lastIndexOf('}');
+        if (firstBrace !== -1 && lastBrace !== -1) {
+          cleanJson = cleanJson.slice(firstBrace, lastBrace + 1);
+        }
+
+        try {
+          const parsed = JSON.parse(cleanJson);
+          if (parsed.endingHook) chapterEndingHook = String(parsed.endingHook).trim();
+          if (parsed.narrativeState) chapterNarrativeState = String(parsed.narrativeState).trim();
+          if (Array.isArray(parsed.keyOutcomes) && parsed.keyOutcomes.length > 0) {
+            chapterKeyOutcomes = parsed.keyOutcomes.map((k: any) => String(k).trim()).filter(Boolean);
+          }
+
+          const parsedPages = Array.isArray(parsed.paginas) ? parsed.paginas : [];
+
+          chunk.forEach((pageItem) => {
+            const pNum = pageItem.pageNumber;
+            const found = parsedPages.find((p: any) => Number(p.pagina_numero || p.pagina) === pNum);
+            const rawPanels = found && Array.isArray(found.quadros) ? found.quadros : [];
+
+            const framesList = pageItem.frames || [];
+            const panels: SceneExtractedPanel[] = [];
+
+            if (rawPanels.length > 0) {
+              rawPanels.forEach((rp: any, idx: number) => {
+                panels.push({
+                  frameIndex: idx,
+                  panelLabel: String(rp.quadro_label || `[Quadro ${idx + 1}]`).trim(),
+                  dialogues: String(rp.dialogos_e_textos || rp.dialogos || rp.text || '').trim(),
+                  visualAction: String(rp.acao_visual || rp.visual || '').trim(),
+                  characters: Array.isArray(rp.personagens) ? rp.personagens.map(String) : [],
+                  mood: rp.mood ? String(rp.mood) : undefined,
+                });
+              });
+            } else if (framesList.length > 0) {
+              framesList.forEach((f, idx) => {
+                panels.push({
+                  frameIndex: idx,
+                  panelLabel: f.label || `[Quadro ${idx + 1}]`,
+                  dialogues: f.narrationSnippet || '',
+                  visualAction: 'Quadro recortado da página.',
+                  characters: [],
+                });
+              });
+            }
+
+            // Garante strings estruturadas formatadas com [Quadro 01], [Quadro 02]...
+            let rawDialogues = String(found?.rawDialoguesAndText || '').trim();
+            if (!rawDialogues && panels.length > 0) {
+              rawDialogues = panels
+                .map((p) => `${p.panelLabel}: ${p.dialogues || '(Sem diálogo falado)'}`)
+                .join('\n');
+            }
+
+            let visualDesc = String(found?.visualDescription || '').trim();
+            if (!visualDesc && panels.length > 0) {
+              visualDesc = panels
+                .map((p) => `${p.panelLabel}: ${p.visualAction || '(Ação visual em andamento)'}`)
+                .join('\n');
+            }
+
+            const charsList: string[] = Array.isArray(found?.charactersInScene)
+              ? found.charactersInScene.map(String).filter(Boolean)
+              : Array.from(new Set(panels.flatMap((p) => p.characters || []))).filter(Boolean);
+
+            extractedMap[pNum] = {
+              rawDialoguesAndText: rawDialogues || '(Sem diálogos visíveis identificados)',
+              visualDescription: visualDesc || 'Ação visual da página.',
+              charactersInScene: charsList,
+              sceneBeat: found?.sceneBeat ? String(found.sceneBeat).trim() : 'Desenvolvimento da cena',
+              frameCount: framesList.length > 0 ? framesList.length : pageItem.croppedFramesCount || 1,
+              panels: panels.length > 0 ? panels : undefined,
+              extractedAt: Date.now(),
+            };
+          });
+        } catch (err: any) {
+          throw new Error(`Falha ao decodificar JSON de extração visual das páginas ${pageNums}: ${err.message}`);
+        }
+
+        completedChunks++;
+      })
+    );
+  }
+
+  return {
+    extractedPages: extractedMap,
+    macroContext: activeChapterMetadata.macroContext,
+    endingHook: chapterEndingHook,
+    narrativeState: chapterNarrativeState,
+    keyOutcomes: chapterKeyOutcomes,
+    detectedCharacters,
+    suggestedWorkTitle,
+  };
+}
+
+export interface GenerateChapterNarrationFromContextParams {
+  chapterLabel: string;
+  pages: {
+    pageNumber: number;
+    extractedContext: SceneExtractedContext;
+    frames?: FrameItem[];
+  }[];
+  profileId: string;
+  customSystemPrompt?: string;
+  projectMetadata?: ProjectMetadata;
+  chapterMetadata?: ChapterMetadata;
+  previousChapterMemory?: ChapterNarrativeMemory | null;
+  config?: AiNarrationConfig;
+  batchSize?: number;
+  concurrency?: number;
+  onProgress?: (info: { stage: string; current?: number; total?: number }) => void;
+}
+
+/**
+ * ETAPA 2 (Somente Texto — Zero Imagens):
+ * Recebe o contexto factual extraído das páginas na Etapa 1 e gera o roteiro estilizado
+ * correspondente ao perfil de narração escolhido.
+ * NENHUMA imagem é enviada à API nesta etapa.
+ */
+export async function generateChapterNarrationFromContext(
+  params: GenerateChapterNarrationFromContextParams
+): Promise<ChapterNarrationResult> {
+  const config = params.config || loadAiNarrationConfig();
+  const validPages = params.pages;
+  if (validPages.length === 0) {
+    throw new Error('Nenhuma página com contexto extraído disponível para geração de roteiro.');
+  }
+
+  const profile = NARRATION_PROFILES.find((p) => p.id === params.profileId) || NARRATION_PROFILES[0];
+  const activeChapterMetadata = { ...(params.chapterMetadata || { chapterId: 'current' }) };
+
+  // Sistema de prompts incluindo memória de continuidade e regras fáticas
+  const systemPrompt = buildChapterNarrationSystemPrompt(
+    params.profileId,
+    params.customSystemPrompt,
+    params.projectMetadata,
+    activeChapterMetadata,
+    params.previousChapterMemory
+  );
+
+  // Divide em mini-blocos (2 a 3 páginas)
+  const batchSize = Math.max(1, Math.min(3, params.batchSize || 2));
+  const chunks: (typeof validPages)[] = [];
+  for (let i = 0; i < validPages.length; i += batchSize) {
+    chunks.push(validPages.slice(i, i + batchSize));
+  }
+
+  const concurrency = Math.max(1, Math.min(3, params.concurrency ?? 2));
+  const chunkResults: (ChapterNarrationResult['paginas'] | null)[] = new Array(chunks.length).fill(null);
+  let chapterSummary = activeChapterMetadata.macroContext?.synopsis || activeChapterMetadata.synopsis || '';
+  let completedChunks = 0;
+
+  for (let i = 0; i < chunks.length; i += concurrency) {
+    const batchGroup = chunks.slice(i, i + concurrency);
+
+    await Promise.all(
+      batchGroup.map(async (chunk, relIdx) => {
+        const chunkIdx = i + relIdx;
+        const pageNums = chunk.map((p) => p.pageNumber).join(', ');
+
+        params.onProgress?.({
+          stage: `Estilizando roteiro "${profile.name}" (Págs ${pageNums} - Bloco ${chunkIdx + 1}/${chunks.length})...`,
+          current: completedChunks + 1,
+          total: chunks.length,
+        });
+
+        // Monta o dossiê textual de entrada (SEM NENHUMA IMAGEM)
+        let pagesDossier = '';
+        chunk.forEach((p) => {
+          const ctx = p.extractedContext;
+          const frameLabels = p.frames?.map((f) => f.label) || [`[Quadro 01]`];
+
+          pagesDossier += `\n══════════════════════════════════════════════════════════════════\n`;
+          pagesDossier += `--- PÁGINA ${p.pageNumber} (${frameLabels.length} quadros: [${frameLabels.join(', ')}]) ---\n`;
+          pagesDossier += `Papel da Cena (Beat): ${ctx.sceneBeat || 'Ação e desenvolvimento'}\n`;
+          if (ctx.charactersInScene && ctx.charactersInScene.length > 0) {
+            pagesDossier += `Personagens na página: ${ctx.charactersInScene.join(', ')}\n`;
+          }
+
+          if (ctx.panels && ctx.panels.length > 0) {
+            pagesDossier += `Detalhamento por quadro demarcado:\n`;
+            ctx.panels.forEach((pan) => {
+              pagesDossier += `  • ${pan.panelLabel}:\n`;
+              pagesDossier += `    - Diálogos/Textos: ${pan.dialogues || '(Sem falas)'}\n`;
+              pagesDossier += `    - Ação Visual: ${pan.visualAction || '(Conforme a cena)'}\n`;
+              if (pan.mood) pagesDossier += `    - Clima: ${pan.mood}\n`;
+            });
+          } else {
+            pagesDossier += `Diálogos e Textos Brutos:\n${ctx.rawDialoguesAndText}\n\n`;
+            pagesDossier += `Descrição Visual:\n${ctx.visualDescription}\n`;
+          }
+        });
+
+        const promptText = `Capítulo: ${params.chapterLabel}
+Mini-bloco a narrar: Páginas ${pageNums} (Bloco ${chunkIdx + 1} de ${chunks.length}).
+Perfil Solicitado: ${profile.name} (${profile.description})
+
+DOSSIÊ FACTUAL DAS PÁGINAS (USE ESTES DADOS REAIS PARA ESCREVER O ROTEIRO):
+${pagesDossier}
+
+DIRETRIZES DE REDAÇÃO DO ROTEIRO:
+1. Escreva uma narração empolgante, fluida e contínua no estilo "${profile.name}".
+2. Crie uma entrada para cada quadro demarcado com exatamente entre 12 e 22 palavras faladas ("roteiro_cena").
+3. As falas devem se conectar naturalmente com conjunções, soando como um único parágrafo fluido de locução para YouTube.
+4. NUNCA faça audiodescrição mecânica do que já é óbvio; conte a emoção, a intenção e a tensão.
+
+Retorne ESTRITAMENTE em formato JSON:
+{
+  "resumo_capitulo": "Resumo em 2 frases...",
+  "paginas": [
+    {
+      "pagina_numero": ${chunk[0].pageNumber},
+      "cenas": [
+        {
+          "quadro_id": "Quadro 01",
+          "roteiro_cena": "Fala narrada do quadro...",
+          "duracao_segundos": 6.5,
+          "transicao": "zoom_in"
+        }
+      ]
+    }
+  ]
+}`;
+
+        const base = (config.baseURL || DEFAULT_AI_CONFIG.baseURL).replace(/\/+$/, '');
+        const endpoint = base.endsWith('/v1') ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
+
+        // Zero images: payload purely text
+        const payload = {
+          model: config.model || DEFAULT_AI_CONFIG.model,
+          stream: false,
+          response_format: { type: 'json_object' },
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: promptText },
+          ],
+          temperature: config.temperature ?? 0.72,
+          max_tokens: 3000,
+        };
+
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream, */*',
+        };
+        const apiKey = (config.apiKey ?? DEFAULT_AI_CONFIG.apiKey).trim();
+        if (apiKey) {
+          headers['Authorization'] = `Bearer ${apiKey}`;
+        }
+
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(payload),
+        });
+
+        if (!response.ok) {
+          const errText = await response.text().catch(() => '');
+          throw new Error(`Erro na API ao gerar roteiro das páginas ${pageNums} (${response.status}): ${errText.slice(0, 250)}`);
+        }
+
+        const rawRes = await response.text();
+        const decoded = decodeSseOrJson(rawRes);
+
+        let cleanJson = decoded.trim();
+        if (cleanJson.startsWith('```')) {
+          cleanJson = cleanJson.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
+        }
+        const firstBrace = cleanJson.indexOf('{');
+        const lastBrace = cleanJson.lastIndexOf('}');
+        if (firstBrace !== -1 && lastBrace !== -1) {
+          cleanJson = cleanJson.slice(firstBrace, lastBrace + 1);
+        }
+
+        const chunkPaginas: ChapterNarrationResult['paginas'] = [];
+        try {
+          const parsed = JSON.parse(cleanJson);
+          if (parsed.resumo_capitulo && !chapterSummary) {
+            chapterSummary = parsed.resumo_capitulo;
+          }
+
+          const chunkPages = Array.isArray(parsed.paginas) ? parsed.paginas : [];
+
+          chunk.forEach((pageItem) => {
+            const found = chunkPages.find((p: any) => Number(p.pagina_numero || p.pagina) === pageItem.pageNumber);
+            let rawCenas = found && Array.isArray(found.cenas) ? found.cenas : [];
+
+            if (rawCenas.length === 0 && found?.roteiro) {
+              rawCenas = [{ quadro_id: 'Quadro 01', roteiro_cena: found.roteiro, duracao_segundos: 6.5 }];
+            }
+
+            const usedIndices = new Set<number>();
+            const pageFrames = pageItem.frames || [];
+            const cenas: AiSceneResultItem[] = pageFrames.map((frame, cIdx) => {
+              const matched: any = matchAiSceneToFrame(frame, cIdx, rawCenas, usedIndices);
+              const rawScript = String(matched?.roteiro_cena || matched?.roteiro || matched?.text || '').trim();
+
+              const clampedScript = clampFrameWords(rawScript, 24);
+              const rawDur = parseFloat(matched?.duracao_segundos || 6.5);
+              const speechMin = calculateRequiredSpeechDuration(clampedScript);
+              const dur = Math.min(9.5, Math.max(5.0, !isNaN(rawDur) ? Math.min(rawDur, 9.5) : speechMin));
+
+              return {
+                quadro_id: frame.label || `Quadro ${cIdx + 1}`,
+                roteiro_cena: clampedScript,
+                duracao_segundos: Number(dur.toFixed(1)),
+                transicao: normalizeTransitionType(matched?.transicao || matched?.transition, cIdx),
+              };
+            });
+
+            // DEDUP: Garante que nenhuma página fique com falas repetidas entre quadros
+            const scriptsList = cenas.map((c) => c.roteiro_cena.trim());
+            const uniqueScripts = new Set(scriptsList.filter(Boolean));
+            const hasDuplicateText = scriptsList.length > 1 && uniqueScripts.size < scriptsList.length;
+
+            if (hasDuplicateText && pageFrames.length > 1) {
+              const pageFullText = (
+                String(found?.roteiro || '') ||
+                cenas.map((c) => c.roteiro_cena).join(' ')
+              ).trim();
+              if (pageFullText) {
+                const distributed = distributeTextToFrames(pageFullText, pageFrames);
+                cenas.forEach((c, idx) => {
+                  if (distributed[idx]) {
+                    c.roteiro_cena = clampFrameWords(distributed[idx], 24);
+                  }
+                });
+              }
+            }
+
+            const combined = cenas.map((c) => c.roteiro_cena).filter(Boolean).join(' ');
+            chunkPaginas.push({
+              pagina_numero: pageItem.pageNumber,
+              cenas,
+              roteiro: combined,
+            });
+          });
+        } catch (err: any) {
+          throw new Error(`Falha ao decodificar JSON do roteiro das páginas ${pageNums}: ${err.message}`);
+        }
+
+        chunkResults[chunkIdx] = chunkPaginas;
+        completedChunks++;
+      })
+    );
+  }
+
+  const allPaginas: ChapterNarrationResult['paginas'] = [];
+  chunkResults.forEach((cPages) => {
+    if (cPages) {
+      allPaginas.push(...cPages);
+    }
+  });
+
+  return {
+    resumo_capitulo: chapterSummary,
+    paginas: allPaginas,
+    macroContext: activeChapterMetadata.macroContext,
+  };
+}
+
+/**
+ * Reestiliza uma página individualmente usando SOMENTE TEXTO a partir de seu `extractedContext`.
+ */
+export async function generatePageNarrationFromContext(params: {
+  pageNumber: number;
+  extractedContext: SceneExtractedContext;
+  frames: FrameItem[];
+  profileId: string;
+  customSystemPrompt?: string;
+  projectMetadata?: ProjectMetadata;
+  chapterMetadata?: ChapterMetadata;
+  previousChapterMemory?: ChapterNarrativeMemory | null;
+  config?: AiNarrationConfig;
+}): Promise<AiSceneResultItem[]> {
+  const result = await generateChapterNarrationFromContext({
+    chapterLabel: `Página ${params.pageNumber}`,
+    pages: [
+      {
+        pageNumber: params.pageNumber,
+        extractedContext: params.extractedContext,
+        frames: params.frames,
+      },
+    ],
+    profileId: params.profileId,
+    customSystemPrompt: params.customSystemPrompt,
+    projectMetadata: params.projectMetadata,
+    chapterMetadata: params.chapterMetadata,
+    previousChapterMemory: params.previousChapterMemory,
+    config: params.config,
+    batchSize: 1,
+    concurrency: 1,
+  });
+
+  return result.paginas[0]?.cenas || [];
 }
 
 export function generateScriptSuggestion(presetId: string, currentText?: string): string {
