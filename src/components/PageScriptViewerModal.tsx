@@ -38,7 +38,7 @@ interface PageScriptViewerModalProps {
   pageRows: PageRowData[];
   onUpdateScene: (scene: SceneItem) => void;
   onGeneratePageAudio?: (row: PageRowData) => void;
-  generatingAudioPages?: Record<number, boolean>;
+  generatingAudioPages?: Record<string, boolean>;
 }
 
 export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
@@ -51,20 +51,20 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
   generatingAudioPages = {},
 }) => {
   const [viewMode, setViewMode] = useState<'foco' | 'continuo'>('foco');
-  const [selectedPageNum, setSelectedPageNum] = useState<number>(() => pageRows[0]?.pageNumber || 1);
+  const [selectedSceneId, setSelectedSceneId] = useState<string>(() => pageRows[0]?.scene.id || '');
   const [copiedFull, setCopiedFull] = useState(false);
-  const [copiedPage, setCopiedPage] = useState<number | null>(null);
-  const [playingPageNum, setPlayingPageNum] = useState<number | null>(null);
+  const [copiedSceneId, setCopiedSceneId] = useState<string | null>(null);
+  const [playingSceneId, setPlayingSceneId] = useState<string | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const activeBlobUrlRef = useRef<string | null>(null);
 
-  // Garante página válida selecionada
+  // Garante linha válida selecionada
   useEffect(() => {
-    if (pageRows.length > 0 && !pageRows.some((r) => r.pageNumber === selectedPageNum)) {
-      setSelectedPageNum(pageRows[0].pageNumber);
+    if (pageRows.length > 0 && !pageRows.some((r) => r.scene.id === selectedSceneId)) {
+      setSelectedSceneId(pageRows[0].scene.id);
     }
-  }, [pageRows, selectedPageNum]);
+  }, [pageRows, selectedSceneId]);
 
   // Interrompe áudio ao fechar
   const stopAudio = () => {
@@ -77,7 +77,7 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
       revokeCreatedUrl(activeBlobUrlRef.current);
       activeBlobUrlRef.current = null;
     }
-    setPlayingPageNum(null);
+    setPlayingSceneId(null);
   };
 
   useEffect(() => {
@@ -96,18 +96,17 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
         return;
       }
 
+      const currentIdx = pageRows.findIndex((r) => r.scene.id === selectedSceneId);
       if (e.key === 'ArrowLeft') {
         e.preventDefault();
-        const currentIdx = pageRows.findIndex((r) => r.pageNumber === selectedPageNum);
         if (currentIdx > 0) {
-          setSelectedPageNum(pageRows[currentIdx - 1].pageNumber);
+          setSelectedSceneId(pageRows[currentIdx - 1].scene.id);
           stopAudio();
         }
       } else if (e.key === 'ArrowRight') {
         e.preventDefault();
-        const currentIdx = pageRows.findIndex((r) => r.pageNumber === selectedPageNum);
-        if (currentIdx < pageRows.length - 1) {
-          setSelectedPageNum(pageRows[currentIdx + 1].pageNumber);
+        if (currentIdx >= 0 && currentIdx < pageRows.length - 1) {
+          setSelectedSceneId(pageRows[currentIdx + 1].scene.id);
           stopAudio();
         }
       } else if (e.key === 'Escape') {
@@ -117,7 +116,7 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, viewMode, selectedPageNum, pageRows, onClose]);
+  }, [isOpen, viewMode, selectedSceneId, pageRows, onClose]);
 
   // Estatísticas consolidadas do capítulo
   const stats = useMemo(() => {
@@ -155,7 +154,8 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
   if (!isOpen) return null;
 
   // Linha da página selecionada
-  const activeRow = pageRows.find((r) => r.pageNumber === selectedPageNum) || pageRows[0];
+  const activeRow = pageRows.find((r) => r.scene.id === selectedSceneId) || pageRows[0];
+  const activeIdx = activeRow ? pageRows.findIndex((r) => r.scene.id === activeRow.scene.id) : 0;
 
   // Copiar roteiro completo do capítulo
   const handleCopyFullScript = async () => {
@@ -163,7 +163,7 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
       .map((r) => {
         const pNum = String(r.pageNumber).padStart(2, '0');
         const text = (r.scene.text || '').trim() || '(Sem roteiro narrado nesta página)';
-        return `=== PÁGINA ${pNum} ===\n${text}`;
+        return `=== ${r.chapterLabel} — PÁGINA ${pNum} ===\n${text}`;
       })
       .join('\n\n');
 
@@ -177,11 +177,11 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
   };
 
   // Copiar texto da página individual
-  const handleCopyPageScript = async (pNum: number, text: string) => {
+  const handleCopyPageScript = async (sceneId: string, text: string) => {
     try {
       await navigator.clipboard.writeText(text);
-      setCopiedPage(pNum);
-      setTimeout(() => setCopiedPage(null), 2000);
+      setCopiedSceneId(sceneId);
+      setTimeout(() => setCopiedSceneId(null), 2000);
     } catch (err) {
       console.error('Falha ao copiar página:', err);
     }
@@ -189,7 +189,7 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
 
   // Tocar ou pausar áudio de uma página
   const handleTogglePlayAudio = (row: PageRowData) => {
-    if (playingPageNum === row.pageNumber) {
+    if (playingSceneId === row.scene.id) {
       stopAudio();
       return;
     }
@@ -206,7 +206,7 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
 
     const audio = new Audio(playUrl);
     audioRef.current = audio;
-    setPlayingPageNum(row.pageNumber);
+    setPlayingSceneId(row.scene.id);
 
     audio.onended = () => {
       stopAudio();
@@ -334,18 +334,18 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
               </div>
               <div className="flex-1 overflow-y-auto p-2 space-y-1">
                 {pageRows.map((r, idx) => {
-                  const isSel = r.pageNumber === selectedPageNum;
+                  const isSel = r.scene.id === selectedSceneId;
                   const text = (r.scene.text || '').trim();
                   const words = text ? text.split(/\s+/).filter(Boolean).length : 0;
                   const hasAudio = Boolean(r.scene.audioDuration && r.scene.audioDuration > 0);
-                  const isGenAudio = Boolean(generatingAudioPages[r.pageNumber]);
+                  const isGenAudio = Boolean(generatingAudioPages[r.scene.id]);
 
                   return (
                     <button
-                      key={r.pageNumber}
+                      key={r.scene.id}
                       type="button"
                       onClick={() => {
-                        setSelectedPageNum(r.pageNumber);
+                        setSelectedSceneId(r.scene.id);
                         stopAudio();
                       }}
                       className={`w-full flex items-center justify-between p-2 rounded-xl text-left transition-all cursor-pointer border ${
@@ -358,9 +358,14 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
                         <span className="font-mono text-xs text-primary font-bold">
                           {String(r.pageNumber).padStart(2, '0')}
                         </span>
-                        <span className="truncate text-xs">
-                          {words > 0 ? `${words} pal.` : '(Vazio)'}
-                        </span>
+                        <div className="flex flex-col truncate">
+                          <span className="truncate text-xs font-semibold">
+                            {r.chapterLabel}
+                          </span>
+                          <span className="truncate text-[10.5px] text-muted-foreground">
+                            {words > 0 ? `${words} pal.` : '(Vazio)'}
+                          </span>
+                        </div>
                       </div>
 
                       <div className="flex items-center gap-1.5 shrink-0">
@@ -387,10 +392,12 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    disabled={selectedPageNum <= 1}
+                    disabled={activeIdx <= 0}
                     onClick={() => {
-                      setSelectedPageNum((prev) => Math.max(1, prev - 1));
-                      stopAudio();
+                      if (activeIdx > 0) {
+                        setSelectedSceneId(pageRows[activeIdx - 1].scene.id);
+                        stopAudio();
+                      }
                     }}
                     className="p-1.5 rounded-lg border border-border bg-secondary hover:bg-secondary/80 text-foreground disabled:opacity-30 cursor-pointer transition-colors"
                     title="Página Anterior (Seta Esquerda)"
@@ -399,15 +406,17 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
                   </button>
 
                   <span className="text-xs font-bold font-mono px-2.5 py-1 rounded-lg bg-primary/10 border border-primary/20 text-primary">
-                    Página {String(activeRow.pageNumber).padStart(2, '0')} de {String(stats.totalPages).padStart(2, '0')}
+                    Pág. {String(activeRow.pageNumber).padStart(2, '0')} ({activeRow.chapterLabel}) · {activeIdx + 1} de {stats.totalPages}
                   </span>
 
                   <button
                     type="button"
-                    disabled={selectedPageNum >= stats.totalPages}
+                    disabled={activeIdx >= stats.totalPages - 1}
                     onClick={() => {
-                      setSelectedPageNum((prev) => Math.min(stats.totalPages, prev + 1));
-                      stopAudio();
+                      if (activeIdx < stats.totalPages - 1) {
+                        setSelectedSceneId(pageRows[activeIdx + 1].scene.id);
+                        stopAudio();
+                      }
                     }}
                     className="p-1.5 rounded-lg border border-border bg-secondary hover:bg-secondary/80 text-foreground disabled:opacity-30 cursor-pointer transition-colors"
                     title="Próxima Página (Seta Direita)"
@@ -418,7 +427,7 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
 
                 <div className="flex items-center gap-2">
                   {/* Status e Controle de Áudio */}
-                  {generatingAudioPages[activeRow.pageNumber] ? (
+                  {generatingAudioPages[activeRow.scene.id] ? (
                     <div className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-primary/15 text-primary border border-primary/30 text-xs font-bold animate-pulse">
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
                       <span>Gerando TTS...</span>
@@ -429,12 +438,12 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
                         type="button"
                         onClick={() => handleTogglePlayAudio(activeRow)}
                         className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer shadow-xs border ${
-                          playingPageNum === activeRow.pageNumber
+                          playingSceneId === activeRow.scene.id
                             ? 'bg-amber-500 text-black border-amber-400'
                             : 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/25'
                         }`}
                       >
-                        {playingPageNum === activeRow.pageNumber ? (
+                        {playingSceneId === activeRow.scene.id ? (
                           <>
                             <Square className="h-3.5 w-3.5 fill-current" />
                             <span>Parar Áudio</span>
@@ -475,11 +484,11 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
                   {/* Copiar Página */}
                   <button
                     type="button"
-                    onClick={() => handleCopyPageScript(activeRow.pageNumber, activeRow.scene.text || '')}
+                    onClick={() => handleCopyPageScript(activeRow.scene.id, activeRow.scene.text || '')}
                     className="p-1.5 rounded-lg border border-border bg-secondary hover:bg-secondary/80 text-foreground transition-colors cursor-pointer"
                     title="Copiar texto desta página"
                   >
-                    {copiedPage === activeRow.pageNumber ? (
+                    {copiedSceneId === activeRow.scene.id ? (
                       <Check className="h-4 w-4 text-emerald-400" />
                     ) : (
                       <Copy className="h-4 w-4" />
@@ -529,17 +538,17 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
               const text = (r.scene.text || '').trim();
               const words = text ? text.split(/\s+/).filter(Boolean).length : 0;
               const hasAudio = Boolean(r.scene.audioDuration && r.scene.audioDuration > 0);
-              const isGenAudio = Boolean(generatingAudioPages[r.pageNumber]);
+              const isGenAudio = Boolean(generatingAudioPages[r.scene.id]);
 
               return (
                 <div
-                  key={r.pageNumber}
+                  key={r.scene.id}
                   className="rounded-2xl border border-border bg-card/60 p-5 space-y-3 shadow-xs hover:border-border/80 transition-colors"
                 >
                   <div className="flex items-center justify-between border-b border-border/60 pb-3">
                     <div className="flex items-center gap-2.5">
                       <span className="font-mono font-bold text-xs px-2.5 py-1 rounded-lg bg-primary/10 border border-primary/20 text-primary">
-                        Página {String(r.pageNumber).padStart(2, '0')}
+                        Página {String(r.pageNumber).padStart(2, '0')} ({r.chapterLabel})
                       </span>
                       <span className="text-xs font-mono text-muted-foreground">
                         {words} palavras · ~{Math.round((words / 140) * 60)}s
@@ -557,12 +566,12 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
                           type="button"
                           onClick={() => handleTogglePlayAudio(r)}
                           className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer border ${
-                            playingPageNum === r.pageNumber
+                            playingSceneId === r.scene.id
                               ? 'bg-amber-500 text-black border-amber-400'
                               : 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/25'
                           }`}
                         >
-                          {playingPageNum === r.pageNumber ? (
+                          {playingSceneId === r.scene.id ? (
                             <>
                               <Square className="h-3 w-3 fill-current" />
                               <span>Parar</span>
@@ -589,11 +598,11 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
 
                       <button
                         type="button"
-                        onClick={() => handleCopyPageScript(r.pageNumber, r.scene.text || '')}
+                        onClick={() => handleCopyPageScript(r.scene.id, r.scene.text || '')}
                         className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-secondary"
                         title="Copiar texto desta página"
                       >
-                        {copiedPage === r.pageNumber ? (
+                        {copiedSceneId === r.scene.id ? (
                           <Check className="h-3.5 w-3.5 text-emerald-400" />
                         ) : (
                           <Copy className="h-3.5 w-3.5" />
@@ -612,7 +621,7 @@ export const PageScriptViewerModal: React.FC<PageScriptViewerModalProps> = ({
                         text: newText,
                       });
                     }}
-                    placeholder={`Texto da página ${r.pageNumber}...`}
+                    placeholder={`Texto da página ${r.pageNumber} (${r.chapterLabel})...`}
                     className="w-full bg-background/60 text-foreground text-sm p-3.5 rounded-xl border border-border/80 focus:outline-none focus:ring-1 focus:ring-primary leading-relaxed font-sans shadow-inner resize-y"
                   />
                 </div>

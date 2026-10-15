@@ -502,10 +502,15 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
   const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [selectedVoiceURI, setSelectedVoiceURI] = useState<string>('');
 
-  // 9router Consolidated Master Neural Audio per page
+  // Helper para gerar chave única para áudio e seleção de linha (evita colisão de pageNumber entre capítulos)
+  const getRowAudioKey = (chapterId?: string, pageNumber?: number, sceneId?: string): string => {
+    return sceneId || `${chapterId || ''}_p${pageNumber || 1}`;
+  };
+
+  // 9router Consolidated Master Neural Audio per page/scene
   const [pageAudioMap, setPageAudioMap] = useState<
     Record<
-      number,
+      string,
       {
         audioUrl: string;
         blob: Blob;
@@ -514,9 +519,9 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
       }
     >
   >({});
-  const [generatingAudioPages, setGeneratingAudioPages] = useState<Record<number, boolean>>({});
+  const [generatingAudioKeys, setGeneratingAudioKeys] = useState<Record<string, boolean>>({});
   const [isBatchGeneratingAudio, setIsBatchGeneratingAudio] = useState<boolean>(false);
-  const [playingAudioPage, setPlayingAudioPage] = useState<number | null>(null);
+  const [playingAudioKey, setPlayingAudioKey] = useState<string | null>(null);
   const [isScriptViewerOpen, setIsScriptViewerOpen] = useState<boolean>(false);
   const masterAudioRef = useRef<HTMLAudioElement | null>(null);
 
@@ -527,7 +532,8 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
 
     const handleEnded = () => {
       setIsPlayingPreview(false);
-      setPlayingAudioPage(null);
+      setPlayingAudioKey(null);
+      setPlayingSceneId(null);
       setPreviewCurrentTime(0);
     };
 
@@ -546,14 +552,17 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
       let changed = false;
       const next = { ...prev };
       for (const scene of scenes) {
-        if (scene.pageNumber && scene.audioUrl && (!next[scene.pageNumber] || next[scene.pageNumber].audioUrl !== scene.audioUrl)) {
-          next[scene.pageNumber] = {
-            audioUrl: scene.audioUrl,
-            blob: new Blob([]),
-            duration: scene.audioDuration || 3.5,
-            generatedAt: Date.now(),
-          };
-          changed = true;
+        if (scene.audioUrl) {
+          const key = getRowAudioKey(scene.chapterId, scene.pageNumber, scene.id);
+          if (!next[key] || next[key].audioUrl !== scene.audioUrl) {
+            next[key] = {
+              audioUrl: scene.audioUrl,
+              blob: scene.audioBlob || new Blob([]),
+              duration: scene.audioDuration || 3.5,
+              generatedAt: Date.now(),
+            };
+            changed = true;
+          }
         }
       }
       return changed ? next : prev;
@@ -779,18 +788,59 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
   // ==========================================
   // RIGHT COLUMN: REAL-TIME PREVIEW PLAYER ENGINE
   // ==========================================
-  const [activePageNumber, setActivePageNumber] = useState<number>(() => {
-    return pageRows[0]?.pageNumber || 1;
+  const resolveRowAudio = React.useCallback(
+    (rowOrScene: PageRowData | SceneItem | null) => {
+      if (!rowOrScene) return null;
+      const scene = 'scene' in rowOrScene ? rowOrScene.scene : rowOrScene;
+      const chId = 'chapterId' in rowOrScene ? rowOrScene.chapterId : scene.chapterId || '';
+      const pNum = 'pageNumber' in rowOrScene ? rowOrScene.pageNumber : scene.pageNumber || 1;
+      const key = getRowAudioKey(chId, pNum, scene.id);
+
+      // 1. Áudio gerado na sessão atual para esta chave exata
+      if (pageAudioMap[key]?.audioUrl) {
+        return pageAudioMap[key];
+      }
+      // 2. Áudio já persistido na cena
+      if (scene.audioUrl) {
+        return {
+          audioUrl: scene.audioUrl,
+          blob: scene.audioBlob || new Blob([]),
+          duration: scene.audioDuration || 3.5,
+          generatedAt: 0,
+        };
+      }
+      return null;
+    },
+    [pageAudioMap]
+  );
+
+  const [activeRowKey, setActiveRowKey] = useState<string>(() => {
+    const first = pageRows[0];
+    return first ? getRowAudioKey(first.chapterId, first.pageNumber, first.scene.id) : '';
   });
+
+  const activeRow = React.useMemo(() => {
+    if (pageRows.length === 0) return null;
+    return (
+      pageRows.find(
+        (r) => getRowAudioKey(r.chapterId, r.pageNumber, r.scene.id) === activeRowKey
+      ) || pageRows[0]
+    );
+  }, [pageRows, activeRowKey]);
+
+  const activePageNumber = activeRow?.pageNumber || 1;
 
   useEffect(() => {
     if (pageRows.length > 0) {
-      const exists = pageRows.some((r) => r.pageNumber === activePageNumber);
+      const exists = pageRows.some(
+        (r) => getRowAudioKey(r.chapterId, r.pageNumber, r.scene.id) === activeRowKey
+      );
       if (!exists) {
-        setActivePageNumber(pageRows[0].pageNumber);
+        const first = pageRows[0];
+        setActiveRowKey(getRowAudioKey(first.chapterId, first.pageNumber, first.scene.id));
       }
     }
-  }, [pageRows, activePageNumber]);
+  }, [pageRows, activeRowKey]);
 
   const [previewAspect, setPreviewAspect] = useState<'16:9' | '9:16'>('16:9');
   const [previewScope, setPreviewScope] = useState<'page' | 'chapter'>('page');
@@ -801,9 +851,6 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
   const isTtsPausedRef = useRef<boolean>(false);
   const isSpeechSpeakingRef = useRef<boolean>(false);
   const speechHoldTimeoutRef = useRef<number>(0);
-
-  const activeRow =
-    pageRows.find((r) => r.pageNumber === activePageNumber) || pageRows[0] || null;
 
   const activePreviewFrames: FrameItem[] = React.useMemo(() => {
     if (previewScope === 'page') {
@@ -819,7 +866,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
 
   // Sync master audio src when page or its audio changes
   useEffect(() => {
-    const pageAudio = pageAudioMap[activePageNumber] || (activeRow?.scene.audioUrl ? { audioUrl: activeRow.scene.audioUrl, duration: activeRow.scene.audioDuration || 0 } : null);
+    const pageAudio = resolveRowAudio(activeRow);
     const audio = masterAudioRef.current;
     if (audio) {
       if (pageAudio && pageAudio.audioUrl) {
@@ -834,7 +881,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
         }
       }
     }
-  }, [activePageNumber, pageAudioMap, activeRow?.scene.audioUrl, isPlayingPreview]);
+  }, [activeRow, resolveRowAudio, isPlayingPreview]);
 
   // Reset preview time ONLY when the preview scope changes ('page' vs 'chapter'),
   // NEVER on activePageNumber change or frame clicks so playback position is preserved!
@@ -855,7 +902,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
   useEffect(() => {
     let interval: any = null;
     const audio = masterAudioRef.current;
-    const pageAudio = pageAudioMap[activePageNumber] || (activeRow?.scene.audioUrl ? { audioUrl: activeRow.scene.audioUrl, duration: activeRow.scene.audioDuration || 0 } : null);
+    const pageAudio = resolveRowAudio(activeRow);
 
     if (isPlayingPreview) {
       interval = setInterval(() => {
@@ -925,7 +972,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
     }
 
     return () => clearInterval(interval);
-  }, [isPlayingPreview, previewTotalDuration, enablePreviewTts, activePreviewFrames, pageAudioMap, activePageNumber, activeRow?.scene.audioUrl, activeRow?.scene.audioDuration]);
+  }, [isPlayingPreview, previewTotalDuration, enablePreviewTts, activePreviewFrames, resolveRowAudio, activeRow]);
 
   // Find active preview frame and animation progress
   const currentPreviewState = React.useMemo(() => {
@@ -961,7 +1008,10 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
     const progress = Math.min(1, frameDur > 0 ? frameElapsed / frameDur : 0);
 
     const currentFramePage = curFrame.pageNumber || activePageNumber;
-    const curRow = pageRows.find((r) => r.pageNumber === currentFramePage) || activeRow;
+    const curRow =
+      pageRows.find((r) => r.frames.some((f) => f.id === curFrame.id)) ||
+      pageRows.find((r) => r.chapterId === curFrame.chapterId && r.pageNumber === currentFramePage) ||
+      activeRow;
     const sceneText = curRow ? curRow.scene.text : '';
 
     return {
@@ -975,7 +1025,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
 
   // TTS audio playback in preview: synchronized PER FRAME with pause/resume support
   useEffect(() => {
-    const pageAudio = pageAudioMap[activePageNumber] || (activeRow?.scene.audioUrl ? { audioUrl: activeRow.scene.audioUrl } : null);
+    const pageAudio = resolveRowAudio(activeRow);
     if (pageAudio && pageAudio.audioUrl) {
       // Neural audio from API is loaded: cancel any local Web Speech so it doesn't speak over it
       if ('speechSynthesis' in window && window.speechSynthesis.speaking) {
@@ -1048,20 +1098,24 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
     selectedVoiceURI,
     availableVoices,
     activePreviewFrames,
-    activeRow?.scene.text,
-    activeRow?.scene.audioUrl,
-    pageAudioMap,
-    activePageNumber,
+    activeRow,
+    resolveRowAudio,
   ]);
 
   // Jump to specific frame on click from cards in the left column
   const handleJumpToFrame = (frame: FrameItem, pageNumber: number) => {
-    // If in page scope and switching page, set activePageNumber
-    if (activePageNumber !== pageNumber) {
-      setActivePageNumber(pageNumber);
+    const targetRow =
+      pageRows.find((r) => r.chapterId === frame.chapterId && r.pageNumber === pageNumber) ||
+      pageRows.find((r) => r.frames.some((f) => f.id === frame.id)) ||
+      pageRows.find((r) => r.pageNumber === pageNumber);
+
+    if (targetRow) {
+      const rowKey = getRowAudioKey(targetRow.chapterId, targetRow.pageNumber, targetRow.scene.id);
+      if (activeRowKey !== rowKey) {
+        setActiveRowKey(rowKey);
+      }
     }
 
-    const targetRow = pageRows.find((r) => r.pageNumber === pageNumber);
     const framesList =
       previewScope === 'page'
         ? (targetRow?.frames || [])
@@ -1078,7 +1132,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
     lastSpokenFrameIdRef.current = frame.id;
     isTtsPausedRef.current = false;
 
-    const pageAudio = pageAudioMap[pageNumber] || (targetRow?.scene.audioUrl ? { audioUrl: targetRow.scene.audioUrl } : null);
+    const pageAudio = resolveRowAudio(targetRow || activeRow);
     if (masterAudioRef.current && pageAudio) {
       masterAudioRef.current.currentTime = targetTime;
     }
@@ -1113,7 +1167,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
 
   // Play / Pause preview toggle with reliable resume
   const handleTogglePlayPausePreview = () => {
-    const pageAudio = pageAudioMap[activePageNumber] || (activeRow?.scene.audioUrl ? { audioUrl: activeRow.scene.audioUrl, duration: activeRow.scene.audioDuration || 0 } : null);
+    const pageAudio = resolveRowAudio(activeRow);
     const audio = masterAudioRef.current;
 
     if (isPlayingPreview) {
@@ -1301,8 +1355,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
 
   // TTS audio playback for individual scene with pause/resume support & neural audio priority
   const handleTogglePlayTts = (scene: SceneItem) => {
-    const pageNum = scene.pageNumber || activePageNumber;
-    const pageAudio = pageAudioMap[pageNum] || (scene.audioUrl ? { audioUrl: scene.audioUrl } : null);
+    const pageAudio = resolveRowAudio(scene);
     const audio = masterAudioRef.current;
 
     // If neural audio from API is available, play it directly!
@@ -1312,7 +1365,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
       if (playingSceneId === scene.id && !audio.paused) {
         audio.pause();
         setPlayingSceneId(null);
-        setPlayingAudioPage(null);
+        setPlayingAudioKey(null);
       } else {
         if (audio.src !== pageAudio.audioUrl) {
           audio.src = pageAudio.audioUrl;
@@ -1320,7 +1373,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
         audio.currentTime = 0;
         audio.play().then(() => {
           setPlayingSceneId(scene.id);
-          setPlayingAudioPage(pageNum);
+          setPlayingAudioKey(scene.id);
         }).catch((err) => {
           console.warn('Erro ao tocar áudio neural da API:', err);
         });
@@ -1383,18 +1436,18 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
 
   // Generate neural audio via API for a single page row
   const handleGeneratePageAudio = async (row: PageRowData) => {
-    const pageNum = row.pageNumber;
+    const rowKey = getRowAudioKey(row.chapterId, row.pageNumber, row.scene.id);
     const currentScene = scenes.find((s) => s.id === row.scene.id) || row.scene;
     const text = (currentScene.text || row.scene.text || '').trim();
 
     if (!text) {
-      showToast(`A página ${pageNum} não possui texto de roteiro para gerar áudio.`, 'info');
+      showToast(`A página ${row.pageNumber} (${row.chapterLabel}) não possui texto de roteiro para gerar áudio.`, 'info');
       return;
     }
 
-    setGeneratingAudioPages((prev) => ({ ...prev, [pageNum]: true }));
+    setGeneratingAudioKeys((prev) => ({ ...prev, [rowKey]: true }));
     try {
-      showToast(`Gerando áudio neural via API para a Página ${String(pageNum).padStart(2, '0')}...`, 'info');
+      showToast(`Gerando áudio neural via API para ${row.chapterLabel} · Página ${String(row.pageNumber).padStart(2, '0')}...`, 'info');
       const speechRes = await generate9routerSpeech({
         text,
         config: aiConfig,
@@ -1403,7 +1456,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
 
       setPageAudioMap((prev) => ({
         ...prev,
-        [pageNum]: {
+        [rowKey]: {
           audioUrl: speechRes.audioUrl,
           blob: speechRes.blob,
           duration: speechRes.duration,
@@ -1437,18 +1490,18 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
       };
       onUpdateScene(updatedScene);
 
-      // If currently previewing this page, update masterAudio
-      if (activePageNumber === pageNum && masterAudioRef.current) {
+      // If currently previewing this page/row, update masterAudio
+      if (activeRowKey === rowKey && masterAudioRef.current) {
         masterAudioRef.current.src = speechRes.audioUrl;
         masterAudioRef.current.currentTime = 0;
       }
 
-      showToast(`Áudio neural gerado para a Página ${String(pageNum).padStart(2, '0')} (${speechRes.duration.toFixed(1)}s)!`, 'success');
+      showToast(`Áudio neural gerado para ${row.chapterLabel} · Página ${String(row.pageNumber).padStart(2, '0')} (${speechRes.duration.toFixed(1)}s)!`, 'success');
     } catch (err: any) {
       console.error('Erro ao gerar áudio da página:', err);
       showToast(`Erro no TTS da API: ${err?.message || 'Falha na requisição'}`, 'error');
     } finally {
-      setGeneratingAudioPages((prev) => ({ ...prev, [pageNum]: false }));
+      setGeneratingAudioKeys((prev) => ({ ...prev, [rowKey]: false }));
     }
   };
 
@@ -1463,13 +1516,14 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
     try {
       for (let i = 0; i < pageRows.length; i++) {
         const row = pageRows[i];
+        const rowKey = getRowAudioKey(row.chapterId, row.pageNumber, row.scene.id);
         const scene = scenes.find((s) => s.id === row.scene.id) || row.scene;
         const text = scene.text?.trim();
 
         if (!text) continue;
 
         setBatchProgress({
-          stage: `Gerando áudio neural da Pág ${row.pageNumber} (${i + 1}/${pageRows.length})...`,
+          stage: `Gerando áudio (${i + 1}/${pageRows.length}) · ${row.chapterLabel} Pág ${row.pageNumber}...`,
           current: i + 1,
           total: pageRows.length,
         });
@@ -1483,7 +1537,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
 
           setPageAudioMap((prev) => ({
             ...prev,
-            [row.pageNumber]: {
+            [rowKey]: {
               audioUrl: res.audioUrl,
               blob: res.blob,
               duration: res.duration,
@@ -1567,33 +1621,28 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
               </div>
             </div>
 
-            {/* Chapter Filter Pill Tabs */}
-            {chaptersWithCuts.length > 1 && (
-              <div className="flex items-center gap-1 bg-secondary/80 p-0.5 rounded-lg border border-border ml-2">
-                <button
-                  onClick={() => setActiveChapterId('all')}
-                  className={`px-2 py-1 text-xs font-semibold rounded-md transition-all cursor-pointer ${
-                    activeChapterId === 'all'
-                      ? 'bg-primary text-primary-foreground shadow'
-                      : 'text-muted-foreground hover:text-foreground'
-                  }`}
+            {/* Seletor Padronizado de Capítulos */}
+            {chaptersWithCuts.length > 0 && (
+              <div className="flex items-center gap-1.5 bg-secondary/80 px-2.5 py-1.5 rounded-lg border border-border ml-2 shadow-2xs">
+                <BookOpen className="h-3.5 w-3.5 text-primary shrink-0" />
+                <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground hidden sm:inline">
+                  Capítulo:
+                </span>
+                <select
+                  value={activeChapterId}
+                  onChange={(e) => setActiveChapterId(e.target.value)}
+                  className="bg-transparent text-foreground text-xs font-semibold focus:outline-none cursor-pointer truncate max-w-[200px] sm:max-w-[280px]"
+                  title="Filtrar por capítulo específico ou exibir Todos"
                 >
-                  Todos ({chaptersWithCuts.length})
-                </button>
-                {chaptersWithCuts.map((ch) => (
-                  <button
-                    key={ch.id}
-                    onClick={() => setActiveChapterId(ch.id)}
-                    className={`px-2 py-1 text-xs font-semibold rounded-md transition-all truncate max-w-[130px] cursor-pointer ${
-                      activeChapterId === ch.id
-                        ? 'bg-primary text-primary-foreground shadow'
-                        : 'text-muted-foreground hover:text-foreground'
-                    }`}
-                    title={ch.label}
-                  >
-                    {ch.label}
-                  </button>
-                ))}
+                  <option value="all" className="bg-card text-foreground">
+                    Todos os Capítulos ({chaptersWithCuts.length} caps · {pageRows.length} págs)
+                  </option>
+                  {chaptersWithCuts.map((ch) => (
+                    <option key={ch.id} value={ch.id} className="bg-card text-foreground">
+                      {ch.label} ({ch.pages || 0} pág{(ch.pages || 0) !== 1 ? 's' : ''})
+                    </option>
+                  ))}
+                </select>
               </div>
             )}
           </div>
@@ -1777,18 +1826,21 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
             /* Page Cards List */
             <div className="space-y-5">
               {pageRows.map((row) => {
+                const rowKey = getRowAudioKey(row.chapterId, row.pageNumber, row.scene.id);
                 const isGenerating = !!generatingSceneIds[row.scene.id];
                 const isPlaying = playingSceneId === row.scene.id;
                 const hasText = row.scene.text.trim().length > 0;
                 const durationEst = estimateNarrationDuration(row.scene.text);
                 const error = sceneErrors[row.scene.id];
-                const isCurrentlyActiveInPreview = activePageNumber === row.pageNumber;
+                const isCurrentlyActiveInPreview = activeRowKey === rowKey;
                 const pageTotalTime = row.frames.reduce((acc, f) => acc + (f.duration || 3.5), 0);
+                const rowAudio = resolveRowAudio(row);
+                const isGeneratingAudio = Boolean(generatingAudioKeys[rowKey]);
 
                 return (
                   <div
-                    key={row.scene.id}
-                    onClick={() => setActivePageNumber(row.pageNumber)}
+                    key={rowKey}
+                    onClick={() => setActiveRowKey(rowKey)}
                     className={`rounded-xl border bg-card transition-all shadow-xs overflow-hidden cursor-pointer ${
                       isCurrentlyActiveInPreview
                         ? 'border-primary ring-2 ring-primary/30 shadow-md'
@@ -1863,7 +1915,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
                           type="button"
                           onClick={(e) => {
                             e.stopPropagation();
-                            setActivePageNumber(row.pageNumber);
+                            setActiveRowKey(rowKey);
                             setIsPlayingPreview(true);
                           }}
                           className={`inline-flex items-center gap-1 px-2 py-1 rounded text-[11px] font-semibold transition-all cursor-pointer ${
@@ -1913,13 +1965,13 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
                         )}
 
                         {/* Neural API Audio Badge */}
-                        {(pageAudioMap[row.pageNumber] || row.scene.audioUrl) && (
+                        {rowAudio && (
                           <span
                             className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-600 dark:text-emerald-400 font-mono text-[10px] font-bold"
                             title="Áudio neural pronto via API TTS"
                           >
                             <Volume2 className="h-3 w-3" />
-                            <span>API ({(pageAudioMap[row.pageNumber]?.duration || row.scene.audioDuration || 0).toFixed(1)}s)</span>
+                            <span>API ({rowAudio.duration.toFixed(1)}s)</span>
                           </span>
                         )}
 
@@ -1947,15 +1999,15 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
                               e.stopPropagation();
                               handleGeneratePageAudio(row);
                             }}
-                            disabled={generatingAudioPages[row.pageNumber]}
+                            disabled={isGeneratingAudio}
                             className={`inline-flex items-center gap-1 px-3 py-1.5 rounded-md text-xs font-semibold transition-all shadow cursor-pointer ${
-                              pageAudioMap[row.pageNumber] || row.scene.audioUrl
+                              rowAudio
                                 ? 'bg-emerald-600/90 text-white hover:bg-emerald-600'
                                 : 'bg-primary text-primary-foreground hover:bg-primary/90'
                             } disabled:opacity-50`}
                             title="Gerar áudio neural da narração via API TTS (OpenAI-compatible / 9router)"
                           >
-                            {generatingAudioPages[row.pageNumber] ? (
+                            {isGeneratingAudio ? (
                               <>
                                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
                                 <span>Gerando Áudio...</span>
@@ -1963,7 +2015,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
                             ) : (
                               <>
                                 <Mic className="h-3.5 w-3.5" />
-                                <span>{pageAudioMap[row.pageNumber] || row.scene.audioUrl ? 'Regenerar Áudio' : 'Sintetizar Áudio (TTS)'}</span>
+                                <span>{rowAudio ? 'Regenerar Áudio' : 'Sintetizar Áudio (TTS)'}</span>
                               </>
                             )}
                           </button>
@@ -2049,7 +2101,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
                           )}
 
                           <div className="relative flex-1 min-h-[85px]">
-                            {generatingAudioPages[row.pageNumber] && (
+                            {isGeneratingAudio && (
                               <div className="absolute inset-0 bg-card/85 backdrop-blur-xs z-10 rounded-lg border border-primary/40 flex flex-col items-center justify-center gap-1.5 text-xs font-semibold text-primary">
                                 <Loader2 className="h-4 w-4 animate-spin text-primary" />
                                 <p>Sintetizando áudio neural via TTS...</p>
@@ -2247,8 +2299,8 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
               <div>
                 <h3 className="text-xs font-bold text-foreground flex items-center gap-1.5">
                   <span>Player de Preview em Tempo Real</span>
-                  <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-primary/15 text-primary font-bold">
-                    Pág {activePageNumber}
+                  <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-primary/15 text-primary font-bold truncate max-w-[200px]">
+                    {activeRow ? `${activeRow.chapterLabel} · Pág ${activePageNumber}` : `Pág ${activePageNumber}`}
                   </span>
                 </h3>
               </div>
@@ -2318,14 +2370,14 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
           {/* Audio Source Status Banner for Preview */}
           <div className="w-full max-w-xl flex items-center justify-between px-3 py-1.5 rounded-lg border border-border bg-card text-xs">
             <div className="flex items-center gap-2">
-              {pageAudioMap[activePageNumber] || activeRow?.scene.audioUrl ? (
+              {resolveRowAudio(activeRow) ? (
                 <span className="flex items-center gap-1.5 text-emerald-600 dark:text-emerald-400 font-semibold text-[11px]">
                   <span className="relative flex h-2 w-2">
                     <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
                     <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
                   </span>
                   <Volume2 className="h-3.5 w-3.5" />
-                  <span>Áudio da API ({aiConfig.ttsModel?.split('/').pop() || 'pt-BR-AntonioNeural'} · {(pageAudioMap[activePageNumber]?.duration || activeRow?.scene.audioDuration || 0).toFixed(1)}s)</span>
+                  <span>Áudio da API ({aiConfig.ttsModel?.split('/').pop() || 'pt-BR-AntonioNeural'} · {resolveRowAudio(activeRow)?.duration.toFixed(1)}s)</span>
                 </span>
               ) : (
                 <span className="flex items-center gap-1.5 text-amber-600 dark:text-amber-400 text-[11px]">
@@ -2335,14 +2387,14 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
               )}
             </div>
 
-            {!(pageAudioMap[activePageNumber] || activeRow?.scene.audioUrl) && activeRow && activeRow.scene.text.trim() && (
+            {!resolveRowAudio(activeRow) && activeRow && activeRow.scene.text.trim() && (
               <button
                 type="button"
                 onClick={() => handleGeneratePageAudio(activeRow)}
-                disabled={generatingAudioPages[activePageNumber]}
+                disabled={Boolean(generatingAudioKeys[activeRowKey])}
                 className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded bg-primary text-primary-foreground text-[10px] font-bold hover:opacity-90 cursor-pointer shadow-2xs"
               >
-                {generatingAudioPages[activePageNumber] ? (
+                {generatingAudioKeys[activeRowKey] ? (
                   <>
                     <Loader2 className="h-3 w-3 animate-spin" />
                     <span>Gerando Áudio...</span>
@@ -2450,7 +2502,7 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
                 frames={activePreviewFrames}
                 onSeek={(newTime) => {
                   setPreviewCurrentTime(newTime);
-                  const pageAudio = pageAudioMap[activePageNumber] || (activeRow?.scene.audioUrl ? { audioUrl: activeRow.scene.audioUrl } : null);
+                  const pageAudio = resolveRowAudio(activeRow);
                   if (masterAudioRef.current && pageAudio) {
                     masterAudioRef.current.currentTime = newTime;
                   }
@@ -2813,13 +2865,13 @@ export const NarracaoView: React.FC<NarracaoViewProps> = ({
         onClose={() => setIsScriptViewerOpen(false)}
         chapterLabel={
           activeChapterId === 'all'
-            ? (chapters[0]?.label || 'Capítulo')
+            ? (chapters[0]?.label || 'Todos os Capítulos')
             : (chapters.find((c) => c.id === activeChapterId)?.label || 'Capítulo')
         }
         pageRows={pageRows}
         onUpdateScene={onUpdateScene}
         onGeneratePageAudio={handleGeneratePageAudio}
-        generatingAudioPages={generatingAudioPages}
+        generatingAudioPages={generatingAudioKeys}
       />
 
       {/* Floating Toast Notification */}
