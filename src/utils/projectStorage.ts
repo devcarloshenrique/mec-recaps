@@ -9,6 +9,7 @@ import {
   ProjectMetadata,
   ChapterMetadata,
   PageScriptState,
+  SceneExtractedContext,
 } from '../types';
 import { DetectedPanel } from './panelDetection';
 import { deleteChapterThumbnails } from './thumbnailCache';
@@ -84,6 +85,8 @@ export interface StoredScene {
   audioDuration?: number;
   audioModel?: string;
   audioBlob?: Blob;
+  extractedContext?: SceneExtractedContext;
+  appliedStyleId?: string;
 }
 
 export interface StoredProjectState {
@@ -301,6 +304,8 @@ export async function saveProject(state: ProjectStateToSave): Promise<boolean> {
         audioDuration: s.audioDuration,
         audioModel: s.audioModel,
         audioBlob,
+        extractedContext: s.extractedContext,
+        appliedStyleId: s.appliedStyleId,
       });
     }
 
@@ -444,6 +449,8 @@ export async function loadProject(): Promise<HydratedProjectState | null> {
         audioBlob: ss.audioBlob,
         audioDuration: ss.audioDuration,
         audioModel: ss.audioModel,
+        extractedContext: ss.extractedContext,
+        appliedStyleId: ss.appliedStyleId,
       });
     }
 
@@ -456,11 +463,12 @@ export async function loadProject(): Promise<HydratedProjectState | null> {
       currentPageNumber: data.currentPageNumber || 1,
       currentTab: data.currentTab || 'recorte',
       title: data.title || 'Projeto Manhwa Recap',
-      projectMetadata: data.projectMetadata || {
-        workTitle: data.title || '',
-        universeLore: '',
-        glossary: {},
-        characters: [],
+      projectMetadata: {
+        workTitle: data.projectMetadata?.workTitle || data.title || '',
+        universeLore: data.projectMetadata?.universeLore || '',
+        glossary: data.projectMetadata?.glossary || {},
+        characters: data.projectMetadata?.characters || [],
+        narrativeHistory: data.projectMetadata?.narrativeHistory || [],
       },
       chapterMetadata: data.chapterMetadata || {},
       pageScripts: data.pageScripts || {},

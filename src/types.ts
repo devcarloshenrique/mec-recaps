@@ -48,6 +48,8 @@ export interface SceneItem {
   audioBlob?: Blob;
   audioDuration?: number;
   audioModel?: string;
+  extractedContext?: SceneExtractedContext;
+  appliedStyleId?: string;
 }
 
 export interface ChapterItem {
@@ -73,11 +75,24 @@ export interface CharacterMetadata {
   description?: string;
 }
 
+export interface ChapterNarrativeMemory {
+  chapterId: string;
+  chapterIndex: number;
+  chapterLabel: string;
+  synopsis: string;
+  endingHook: string;
+  narrativeState: string;
+  lastSceneText?: string;
+  keyOutcomes: string[];
+  updatedAt: number;
+}
+
 export interface ProjectMetadata {
   workTitle: string;        // Nome da obra (ex: "Solo Leveling")
   universeLore?: string;    // Resumo do cenário/sistema de poder
   glossary: Record<string, string>; // { "Dungeon Rank C": "Masmorra perigosa", "Mana": "Energia mágica" }
   characters: CharacterMetadata[];
+  narrativeHistory?: ChapterNarrativeMemory[];
 }
 
 export interface ChapterMacroContext {
@@ -93,6 +108,32 @@ export interface ChapterMetadata {
   synopsis?: string;
   macroContext?: ChapterMacroContext;
   guestCharacters?: CharacterMetadata[];
+  endingHook?: string;
+  narrativeState?: string;
+  keyOutcomes?: string[];
+  isContextExtracted?: boolean;
+  lastExtractedAt?: number;
+  activeStyleId?: string;
+}
+
+// 0. Extração de Contexto Visual e Textual por Cena/Página (Etapa 1)
+export interface SceneExtractedPanel {
+  frameIndex: number;
+  panelLabel: string;             // ex: "[Quadro 1]"
+  dialogues: string;              // Balões de fala/pensamento transcritos
+  visualAction: string;           // Descrição visual objetiva da ação
+  characters?: string[];
+  mood?: string;
+}
+
+export interface SceneExtractedContext {
+  rawDialoguesAndText: string;    // Texto/diálogos brutos da página
+  visualDescription: string;      // Ação e narrativa visual da página
+  charactersInScene: string[];    // Personagens identificados
+  sceneBeat?: string;             // Função narrativa (ex: abertura, escalada, clímax)
+  frameCount: number;             // Quantidade de quadros no momento da extração
+  panels?: SceneExtractedPanel[]; // Detalhamento estruturado por quadro [Quadro 1], [Quadro 2]
+  extractedAt: number;            // Timestamp da extração
 }
 
 // 1. Extração bruta via visão computacional (Multimodal)
