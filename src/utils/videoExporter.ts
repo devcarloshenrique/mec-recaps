@@ -85,6 +85,331 @@ export interface PreparedAudioTimeline {
 }
 
 /**
+ * Converte segundos para o formato padrão de timestamp SRT: HH:MM:SS,mmm
+ */
+export function formatSrtTimecode(seconds: number): string {
+  const totalMs = Math.max(0, Math.round(seconds * 1000));
+  const ms = totalMs % 1000;
+  const totalSec = Math.floor(totalMs / 1000);
+  const s = totalSec % 60;
+  const totalMin = Math.floor(totalSec / 60);
+  const m = totalMin % 60;
+  const h = Math.floor(totalMin / 60);
+
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
+}
+
+/**
+ * Gera o conteúdo em texto plano no formato padrão .SRT (SubRip Subtitle)
+ */
+export function generateSrtContent(
+  items: Array<{
+    title?: string;
+    text?: string;
+    startTime: number;
+    endTime: number;
+  }>
+): string {
+  const blocks: string[] = [];
+  let srtIndex = 1;
+
+  for (const item of items) {
+    const text = (item.text || '').trim();
+    if (!text) continue;
+
+    const startSrt = formatSrtTimecode(item.startTime);
+    const endSrt = formatSrtTimecode(Math.max(item.startTime + 0.5, item.endTime));
+
+    blocks.push(`${srtIndex}\n${startSrt} --> ${endSrt}\n${text}`);
+    srtIndex++;
+  }
+
+  // Fallback se nenhuma cena possuir texto: gera marcadores de cena/quadro com timestamps
+  if (blocks.length === 0) {
+    for (const item of items) {
+      const startSrt = formatSrtTimecode(item.startTime);
+      const endSrt = formatSrtTimecode(Math.max(item.startTime + 0.5, item.endTime));
+      blocks.push(`${srtIndex}\n${startSrt} --> ${endSrt}\n[${item.title || `Cena ${srtIndex}`}]`);
+      srtIndex++;
+    }
+  }
+
+  return blocks.join('\n\n') + (blocks.length > 0 ? '\n' : '');
+}
+
+export interface TimelineSceneEntry {
+  index: number;
+  id: string;
+  title: string;
+  chapterId: string;
+  chapterLabel: string;
+  pageNumber: number;
+  text: string;
+  wordCount: number;
+  startTime: number;
+  endTime: number;
+  duration: number;
+  startTimeSrt: string;
+  endTimeSrt: string;
+  audioFile: string | null;
+  appliedStyleId?: string;
+  sceneBeat?: string;
+  associatedFrames: Array<{
+    id: string;
+    label: string;
+    imageFile: string;
+    startTime: number;
+    endTime: number;
+    duration: number;
+  }>;
+}
+
+export interface TimelineFrameEntry {
+  index: number;
+  id: string;
+  label: string;
+  chapterId: string;
+  chapterLabel: string;
+  pageNumber: number;
+  imageFile: string;
+  startTime: number;
+  endTime: number;
+  duration: number;
+  startTimeSrt: string;
+  endTimeSrt: string;
+  narrationSnippet: string;
+}
+
+export interface TimelineMetadataResult {
+  timelineData: {
+    project: {
+      title: string;
+      exportedAt: string;
+      resolution: string;
+      aspectRatio: string;
+      fps: number;
+      totalDurationSeconds: number;
+      totalDurationFormatted: string;
+      totalFrames: number;
+      totalScenes: number;
+      audioTracksCount: number;
+    };
+    chapters: Array<{ id: string; label: string; pages: number }>;
+    scenes: TimelineSceneEntry[];
+    frames: TimelineFrameEntry[];
+  };
+  srtContent: string;
+  jsonContent: string;
+}
+
+/**
+ * Constrói a estrutura completa de metadados da timeline (cenas, roteiro, timestamps e quadros)
+ * e gera os formatos .json e .srt correspondentes.
+ */
+export function buildTimelineMetadata({
+  frames,
+  scenes,
+  chapters = [],
+  fps = 30,
+  resolution = '16:9',
+  scheduledClips = [],
+  frameDurations,
+}: {
+  frames: FrameItem[];
+  scenes: SceneItem[];
+  chapters?: ChapterItem[];
+  fps?: number;
+  resolution?: ExportResolution;
+  scheduledClips?: ScheduledAudioClip[];
+  frameDurations?: number[];
+}): TimelineMetadataResult {
+  const res = EXPORT_RESOLUTIONS[resolution] || EXPORT_RESOLUTIONS['16:9'];
+  const width = res.width;
+  const height = res.height;
+
+  // 1. Linha do tempo dos quadros visuais
+  let frameTimeCursor = 0;
+  const framesTimeline: TimelineFrameEntry[] = frames.map((frame, i) => {
+    const dur = frameDurations && frameDurations[i] !== undefined
+      ? frameDurations[i]
+      : Math.max(1, frame.duration || 3.5);
+    const start = frameTimeCursor;
+    const end = start + dur;
+    frameTimeCursor = end;
+    const ch = chapters.find((c) => c.id === frame.chapterId);
+    const filename = `media/quadro_${String(i + 1).padStart(3, '0')}.jpg`;
+
+    return {
+      index: i + 1,
+      id: frame.id,
+      label: frame.label || `Quadro ${i + 1}`,
+      chapterId: frame.chapterId || '',
+      chapterLabel: ch?.label || '',
+      pageNumber: Number(frame.pageNumber) || 1,
+      imageFile: filename,
+      startTime: Number(start.toFixed(3)),
+      endTime: Number(end.toFixed(3)),
+      duration: Number(dur.toFixed(3)),
+      startTimeSrt: formatSrtTimecode(start),
+      endTimeSrt: formatSrtTimecode(end),
+      narrationSnippet: frame.narrationSnippet || '',
+    };
+  });
+
+  const totalFramesDuration = frameTimeCursor;
+
+  // 2. Mapeamento de arquivos de áudio por cena
+  const audioFileMap = new Map<string, string>();
+  for (let idx = 0; idx < scheduledClips.length; idx++) {
+    const clip = scheduledClips[idx];
+    audioFileMap.set(clip.sceneId, `media/narracao_${String(idx + 1).padStart(3, '0')}.mp3`);
+  }
+
+  // 3. Processamento das cenas e trechos de narração
+  let processedScenes: TimelineSceneEntry[] = [];
+
+  if (scenes.length > 0) {
+    processedScenes = scenes.map((scene, idx) => {
+      const scheduledClip = scheduledClips.find((c) => c.sceneId === scene.id);
+      const ch = chapters.find((c) => c.id === scene.chapterId);
+      const text = (scene.text || '').trim();
+      const wordCount = text ? text.split(/\s+/).length : 0;
+      const audioFile = audioFileMap.get(scene.id) || null;
+
+      // Localiza quadros vinculados a esta cena
+      const matchedFrames = framesTimeline.filter(
+        (ft) =>
+          scene.frames?.some((sf) => sf.id === ft.id) ||
+          (scene.chapterId && scene.pageNumber && ft.chapterId === scene.chapterId && ft.pageNumber === scene.pageNumber)
+      );
+
+      let startTime = 0;
+      let endTime = 0;
+
+      if (scheduledClip) {
+        startTime = scheduledClip.startTime;
+        endTime = scheduledClip.endTime;
+      } else if (matchedFrames.length > 0) {
+        startTime = matchedFrames[0].startTime;
+        endTime = matchedFrames[matchedFrames.length - 1].endTime;
+      } else {
+        const estSec = Math.max(2, wordCount > 0 ? wordCount / 2.5 : 3.5);
+        startTime = (idx / Math.max(1, scenes.length)) * totalFramesDuration;
+        endTime = startTime + estSec;
+      }
+
+      const duration = Math.max(0.5, endTime - startTime);
+
+      return {
+        index: idx + 1,
+        id: scene.id,
+        title: scene.title || `Cena ${idx + 1}`,
+        chapterId: scene.chapterId || '',
+        chapterLabel: ch?.label || '',
+        pageNumber: Number(scene.pageNumber) || 1,
+        text,
+        wordCount,
+        startTime: Number(startTime.toFixed(3)),
+        endTime: Number(endTime.toFixed(3)),
+        duration: Number(duration.toFixed(3)),
+        startTimeSrt: formatSrtTimecode(startTime),
+        endTimeSrt: formatSrtTimecode(endTime),
+        audioFile,
+        appliedStyleId: scene.appliedStyleId || undefined,
+        sceneBeat: scene.extractedContext?.sceneBeat || undefined,
+        associatedFrames: matchedFrames.map((mf) => ({
+          id: mf.id,
+          label: mf.label,
+          imageFile: mf.imageFile,
+          startTime: mf.startTime,
+          endTime: mf.endTime,
+          duration: mf.duration,
+        })),
+      };
+    });
+  } else {
+    // Se não houver cenas isoladas, sintetiza as entradas de cena a partir dos quadros
+    processedScenes = framesTimeline.map((ft, idx) => ({
+      index: idx + 1,
+      id: `scene_frame_${ft.id}`,
+      title: ft.label,
+      chapterId: ft.chapterId,
+      chapterLabel: ft.chapterLabel,
+      pageNumber: ft.pageNumber,
+      text: ft.narrationSnippet || '',
+      wordCount: ft.narrationSnippet ? ft.narrationSnippet.trim().split(/\s+/).length : 0,
+      startTime: ft.startTime,
+      endTime: ft.endTime,
+      duration: ft.duration,
+      startTimeSrt: ft.startTimeSrt,
+      endTimeSrt: ft.endTimeSrt,
+      audioFile: null,
+      associatedFrames: [
+        {
+          id: ft.id,
+          label: ft.label,
+          imageFile: ft.imageFile,
+          startTime: ft.startTime,
+          endTime: ft.endTime,
+          duration: ft.duration,
+        },
+      ],
+    }));
+  }
+
+  // Ordenação cronológica estrita por startTime
+  processedScenes.sort((a, b) => a.startTime - b.startTime);
+
+  const lastAudioOrFrameEnd = Math.max(
+    totalFramesDuration,
+    processedScenes.reduce((max, s) => Math.max(max, s.endTime), 0)
+  );
+
+  const projectTitle = chapters[0]?.label
+    ? `Recap - ${chapters[0].label}`
+    : 'Recap Manhwa Studio';
+
+  const timelineData = {
+    project: {
+      title: projectTitle,
+      exportedAt: new Date().toISOString(),
+      resolution: `${width}x${height}`,
+      aspectRatio: resolution,
+      fps,
+      totalDurationSeconds: Number(lastAudioOrFrameEnd.toFixed(3)),
+      totalDurationFormatted: formatSrtTimecode(lastAudioOrFrameEnd),
+      totalFrames: frames.length,
+      totalScenes: processedScenes.length,
+      audioTracksCount: scheduledClips.length,
+    },
+    chapters: chapters.map((c) => ({
+      id: c.id,
+      label: c.label,
+      pages: c.pages,
+    })),
+    scenes: processedScenes,
+    frames: framesTimeline,
+  };
+
+  const srtContent = generateSrtContent(
+    processedScenes.map((s) => ({
+      title: s.title,
+      text: s.text,
+      startTime: s.startTime,
+      endTime: s.endTime,
+    }))
+  );
+
+  const jsonContent = JSON.stringify(timelineData, null, 2);
+
+  return {
+    timelineData,
+    srtContent,
+    jsonContent,
+  };
+}
+
+/**
  * Sequential Frame Loader with sliding window cache (max 2 frames in memory).
  * Releases previous ImageBitmaps and revokes ObjectURLs to avoid memory bloat / leaks.
  */
@@ -1373,25 +1698,62 @@ ${(() => {
 
   zip.file('projeto.mlt', mltXml);
 
+  // 4. Generate SRT and JSON timeline metadata
+  const { timelineData, srtContent, jsonContent } = buildTimelineMetadata({
+    frames,
+    scenes,
+    chapters,
+    fps,
+    resolution,
+    scheduledClips: audioTimeline.scheduledClips,
+    frameDurations: frameMediaEntries.map((f) => f.durationSeconds),
+  });
+
+  zip.file('legendas.srt', srtContent);
+  zip.file('roteiro_timeline.json', jsonContent);
+
   // Informative README
-  const readme = `PROJETO SHOTCUT (.mlt) - RECAP DE MANHWA
-==========================================
+  const totalDurationSeconds = totalFramesCount / fps;
+  const readme = `PROJETO SHOTCUT (.mlt) + METADADOS DE ROTEIRO - RECAP DE MANHWA
+========================================================================
 Data de Exportação: ${new Date().toLocaleString('pt-BR')}
 Resolução: ${width}x${height} (${resolution})
 Taxa de Quadros: ${fps} FPS
-Total de Quadros: ${frames.length}
-Total de Cenas de Áudio: ${audioMediaEntries.length}
+Duração Total: ~${totalDurationSeconds.toFixed(1)} segundos (${formatSrtTimecode(totalDurationSeconds)})
+Total de Quadros de Imagem: ${frames.length}
+Total de Cenas / Falas: ${timelineData.scenes.length}
+Faixas de Áudio MP3: ${audioMediaEntries.length}
+
+ARQUIVOS INCLUÍDOS NO PACOTE:
+------------------------------------------------------------------------
+1. "projeto.mlt":
+   - Arquivo de projeto nativo para abrir no Shotcut (versão 22 ou superior).
+   - Faixa V1: Fundo com efeito de desfoque cinematográfico e cobertura 16:9.
+   - Faixa V2: Quadros centrados com as durações exatas definidas e zoom sutil.
+   - Faixa A1: Áudio de narração sequencial sincronizado (sem sobreposição).
+
+2. "legendas.srt":
+   - Legendas sincronizadas com timestamps precisos (HH:MM:SS,mmm).
+   - Compatível com qualquer editor: Shotcut, CapCut, Premiere Pro,
+     DaVinci Resolve, Final Cut Pro, VLC e YouTube.
+   - Perfeito para gerar legendas automáticas ou animações de texto.
+
+3. "roteiro_timeline.json":
+   - Metadados completos do roteiro, cenas, quadros associados e timestamps
+     (startTime, endTime, duration) em segundos e formato timecode.
+   - Ideal para reutilizar em scripts Python, automação FFmpeg, Remotion,
+     criação de cortes verticais (Shorts/TikTok/Reels) ou outros vídeos.
+
+4. "media/":
+   - Pasta contendo todas as imagens numeradas dos quadros (quadro_001.jpg, etc.)
+     e os arquivos de áudio de narração (narracao_001.mp3, etc.).
 
 COMO ABRIR NO SHOTCUT:
-------------------------------------------
+------------------------------------------------------------------------
 1. Extraia TODO o conteúdo deste arquivo ZIP para uma pasta em seu computador.
-2. Certifique-se de que a pasta "media/" e o arquivo "projeto.mlt" fiquem juntos na mesma pasta.
-3. Abra o Shotcut (versão 22 ou superior recomendada).
-4. Clique em "Abrir Arquivo" e selecione "projeto.mlt".
-5. O projeto abrirá com toda a montagem pronta na timeline:
-   - Faixa V1: Fundo com efeito de desfoque cinematográfico
-   - Faixa V2: Quadros centrados com as durações exatas definidas
-   - Faixa A1: Áudio de narração sincronizado e sequencial (sem sobreposição)
+2. Certifique-se de que a pasta "media/", "projeto.mlt" e "legendas.srt" fiquem na mesma pasta.
+3. Abra o Shotcut, clique em "Abrir Arquivo" e selecione "projeto.mlt".
+4. Caso deseje exibir legendas no Shotcut, use a faixa de legendas ou importe "legendas.srt".
 `;
   zip.file('LEIA-ME.txt', readme);
 

@@ -20,6 +20,7 @@ import {
   Clock,
   StopCircle,
   FileSpreadsheet,
+  FileCode,
   Sparkles,
 } from 'lucide-react';
 import JSZip from 'jszip';
@@ -31,6 +32,7 @@ import {
   EXPORT_RESOLUTIONS,
   ExportProgress,
   ExportResult,
+  buildTimelineMetadata,
 } from '../utils/videoExporter';
 import { checkWebCodecsSupport } from '../utils/videoExportService';
 
@@ -188,7 +190,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
       setSuccessMessage(
         result.format === 'shotcut'
-          ? 'Pacote de projeto Shotcut (.mlt + mídias em ZIP) gerado e baixado com sucesso!'
+          ? 'Pacote Shotcut (.mlt + ZIP com legendas.srt e roteiro_timeline.json) gerado e baixado com sucesso!'
           : `Vídeo ${result.format.toUpperCase()} renderizado e baixado com sucesso!`
       );
     } catch (err: any) {
@@ -276,6 +278,34 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     setSuccessMessage('Roteiro de narração baixado em .txt!');
   };
 
+  // Download SRT subtitles with timestamps
+  const handleDownloadSrt = () => {
+    const { srtContent } = buildTimelineMetadata({
+      frames,
+      scenes,
+      chapters,
+      fps: 30,
+      resolution: selectedResolution,
+    });
+    const blob = new Blob([srtContent], { type: 'text/plain;charset=utf-8' });
+    triggerDownload(blob, `Legendas_Recap_${new Date().toISOString().slice(0, 10)}.srt`);
+    setSuccessMessage('Legendas sincronizadas baixadas em .srt!');
+  };
+
+  // Download Timeline JSON with timestamps and scenes
+  const handleDownloadTimelineJson = () => {
+    const { jsonContent } = buildTimelineMetadata({
+      frames,
+      scenes,
+      chapters,
+      fps: 30,
+      resolution: selectedResolution,
+    });
+    const blob = new Blob([jsonContent], { type: 'application/json;charset=utf-8' });
+    triggerDownload(blob, `Roteiro_Timeline_${new Date().toISOString().slice(0, 10)}.json`);
+    setSuccessMessage('Timeline com roteiro e timestamps baixada em .json!');
+  };
+
   // Export JSON project backup
   const handleExportProjectJson = () => {
     const data = {
@@ -358,7 +388,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             }`}
           >
             <FileText className="h-4 w-4" />
-            <span>Roteiro TXT</span>
+            <span>Roteiro, SRT & JSON</span>
           </button>
 
           <button
@@ -478,7 +508,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                       </span>
                     </div>
                     <p className="text-xs text-muted-foreground leading-relaxed">
-                      Gera projeto XML com faixas <strong>V1 (fundo desfocado)</strong>, <strong>V2 (quadros)</strong> e <strong>A1 (áudio)</strong> empacotado em ZIP com as mídias.
+                      Gera projeto XML com faixas <strong>V1 (fundo)</strong>, <strong>V2 (quadros)</strong> e <strong>A1 (áudio)</strong> empacotado em ZIP. Inclui automaticamente <strong>legendas.srt</strong> e <strong>roteiro_timeline.json</strong> sincronizados.
                     </p>
                   </div>
                 </div>
@@ -727,7 +757,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             </div>
           )}
 
-          {/* TAB 3: SCRIPT TXT */}
+          {/* TAB 3: SCRIPT, SRT & JSON */}
           {activeTab === 'script' && (
             <div className="space-y-4">
               <div className="rounded-xl border border-border bg-card p-5 space-y-4">
@@ -736,14 +766,14 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                     <FileText className="h-5 w-5" />
                   </div>
                   <div>
-                    <h3 className="text-sm font-bold text-foreground">Roteiro Consolidado de Narração</h3>
+                    <h3 className="text-sm font-bold text-foreground">Roteiro, Legendas & Dados de Timeline</h3>
                     <p className="text-xs text-muted-foreground">
-                      Baixe o texto e tempo de todas as cenas formatados para leitura ou locução externa.
+                      Exporte o roteiro com timestamps sincronizados em formatos ideais para edição ou criação de novos vídeos.
                     </p>
                   </div>
                 </div>
 
-                <div className="max-h-60 overflow-y-auto rounded-lg border border-border bg-black/40 p-3 text-xs font-mono text-muted-foreground space-y-2">
+                <div className="max-h-56 overflow-y-auto rounded-lg border border-border bg-black/40 p-3 text-xs font-mono text-muted-foreground space-y-2">
                   {scenes.map((s, idx) => (
                     <div key={s.id} className="border-b border-border/40 pb-2 last:border-b-0">
                       <p className="font-bold text-primary">
@@ -754,13 +784,74 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                   ))}
                 </div>
 
-                <button
-                  onClick={handleDownloadScript}
-                  className="w-full flex items-center justify-center gap-2 rounded-xl bg-primary py-3 text-xs font-bold text-primary-foreground hover:opacity-90 transition-opacity cursor-pointer shadow-md"
-                >
-                  <Download className="h-4 w-4" />
-                  <span>Baixar Roteiro (.TXT)</span>
-                </button>
+                {/* 3 Export Action Cards */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 border-t border-border/60">
+                  {/* Option 1: SRT */}
+                  <button
+                    type="button"
+                    onClick={handleDownloadSrt}
+                    className="flex flex-col items-center justify-between p-3.5 rounded-xl border border-primary/30 bg-primary/10 hover:bg-primary/20 transition-all text-center gap-2 group cursor-pointer shadow-xs"
+                    title="Baixar arquivo de legendas .SRT sincronizado com timestamps exatos"
+                  >
+                    <div className="flex flex-col items-center gap-1.5">
+                      <div className="p-2 rounded-lg bg-primary/20 text-primary group-hover:scale-105 transition-transform">
+                        <Type className="h-4 w-4" />
+                      </div>
+                      <span className="text-xs font-bold text-foreground">Legendas (.SRT)</span>
+                      <span className="text-[10px] text-muted-foreground leading-tight">
+                        Timestamps sincronizados para CapCut, Premiere, DaVinci e YouTube
+                      </span>
+                    </div>
+                    <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-primary mt-1">
+                      <Download className="h-3 w-3" />
+                      <span>Baixar .SRT</span>
+                    </span>
+                  </button>
+
+                  {/* Option 2: JSON */}
+                  <button
+                    type="button"
+                    onClick={handleDownloadTimelineJson}
+                    className="flex flex-col items-center justify-between p-3.5 rounded-xl border border-cyan-500/30 bg-cyan-500/10 hover:bg-cyan-500/20 transition-all text-center gap-2 group cursor-pointer shadow-xs"
+                    title="Baixar metadados estruturados em JSON para automações e criação de novos vídeos"
+                  >
+                    <div className="flex flex-col items-center gap-1.5">
+                      <div className="p-2 rounded-lg bg-cyan-500/20 text-cyan-400 group-hover:scale-105 transition-transform">
+                        <FileCode className="h-4 w-4" />
+                      </div>
+                      <span className="text-xs font-bold text-foreground">Timeline (.JSON)</span>
+                      <span className="text-[10px] text-muted-foreground leading-tight">
+                        Cenas, falas e quadros estruturados para Python, FFmpeg e IA
+                      </span>
+                    </div>
+                    <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-cyan-400 mt-1">
+                      <Download className="h-3 w-3" />
+                      <span>Baixar .JSON</span>
+                    </span>
+                  </button>
+
+                  {/* Option 3: TXT */}
+                  <button
+                    type="button"
+                    onClick={handleDownloadScript}
+                    className="flex flex-col items-center justify-between p-3.5 rounded-xl border border-border bg-card hover:bg-secondary/70 transition-all text-center gap-2 group cursor-pointer shadow-xs"
+                    title="Baixar roteiro em texto puro formatado para leitura"
+                  >
+                    <div className="flex flex-col items-center gap-1.5">
+                      <div className="p-2 rounded-lg bg-secondary text-foreground group-hover:scale-105 transition-transform">
+                        <FileText className="h-4 w-4" />
+                      </div>
+                      <span className="text-xs font-bold text-foreground">Roteiro (.TXT)</span>
+                      <span className="text-[10px] text-muted-foreground leading-tight">
+                        Texto corrido formatado por cena para leitura ou locução externa
+                      </span>
+                    </div>
+                    <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-muted-foreground group-hover:text-foreground mt-1">
+                      <Download className="h-3 w-3" />
+                      <span>Baixar .TXT</span>
+                    </span>
+                  </button>
+                </div>
               </div>
             </div>
           )}
