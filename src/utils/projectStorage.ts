@@ -20,6 +20,10 @@ const STORAGE_KEY_CHAPTER_MEDIA_PREFIX = 'recap_chapter_media_';
 // Set of chapter IDs whose media Blobs have already been saved to the isolated media store
 const persistedMediaChapters = new Set<string>();
 
+export function clearPersistedMediaChapters(): void {
+  persistedMediaChapters.clear();
+}
+
 export async function saveChapterMediaBlobs(chapterId: string, blobs: Blob[]): Promise<void> {
   if (!chapterId || blobs.length === 0) return;
   try {
@@ -144,6 +148,21 @@ export function registerCreatedUrl(url: string): string {
     activeCreatedUrls.add(url);
   }
   return url;
+}
+
+export function getActiveCreatedUrls(): Set<string> {
+  return new Set(activeCreatedUrls);
+}
+
+export function revokeSpecificUrls(urls: Set<string> | string[]): void {
+  urls.forEach((url) => {
+    if (url && url.startsWith('blob:')) {
+      try {
+        URL.revokeObjectURL(url);
+      } catch {}
+      activeCreatedUrls.delete(url);
+    }
+  });
 }
 
 export function revokeCreatedUrl(url?: string): void {
