@@ -5,7 +5,15 @@ import { RoteiroView } from './components/RoteiroView';
 import { NarracaoView } from './components/NarracaoView';
 import { MontagemView } from './components/MontagemView';
 import { ExportModal } from './components/ExportModal';
+import { ProjectBundleModal } from './components/ProjectBundleModal';
 import { ChaptersDrawer } from './components/ChaptersDrawer';
+import {
+  exportProjectBundle,
+  importProjectBundle,
+  triggerBundleDownload,
+  BundleMode,
+  BundleProgress,
+} from './utils/projectBundle';
 import {
   ChapterItem,
   FrameItem,
@@ -24,6 +32,9 @@ import {
   registerCreatedUrl,
   revokeCreatedUrl,
   revokeAllCreatedUrls,
+  getActiveCreatedUrls,
+  revokeSpecificUrls,
+  clearPersistedMediaChapters,
   deleteChapterMediaBlobs,
 } from './utils/projectStorage';
 import { deleteChapterThumbnails } from './utils/thumbnailCache';
@@ -260,6 +271,14 @@ export default function App() {
   const [isChapterMenuOpen, setIsChapterMenuOpen] = useState<boolean>(false);
   const folderInputRef = useRef<HTMLInputElement>(null);
 
+  // Portable Project Bundle (.recap) States
+  const [isBundleModalOpen, setIsBundleModalOpen] = useState<boolean>(false);
+  const [isBundleProcessing, setIsBundleProcessing] = useState<boolean>(false);
+  const [bundleProgress, setBundleProgress] = useState<BundleProgress | null>(null);
+  const [bundleError, setBundleError] = useState<string | null>(null);
+  const [bundleSuccessFilename, setBundleSuccessFilename] = useState<string | null>(null);
+  const recapFileInputRef = useRef<HTMLInputElement>(null);
+
   // Global Keyboard Shortcuts (Ctrl+S, Ctrl+O, Ctrl+E, Ctrl+N)
   useEffect(() => {
     const handleGlobalShortcuts = (e: KeyboardEvent) => {
@@ -425,6 +444,164 @@ export default function App() {
       showToast('Erro ao salvar no IndexedDB.', 'error');
     }
   };
+
+  // Open .recap file picker from disk
+  const handleOpenProjectFile = () => {
+    recapFileInputRef.current?.click();
+  };
+
+  // Open Save .recap modal
+  const handleSaveProjectFile = () => {
+    setBundleError(null);
+    setBundleSuccessFilename(null);
+    setBundleProgress(null);
+    setIsBundleProcessing(false);
+    setIsBundleModalOpen(true);
+  };
+
+  // Execute export bundle
+  const handleExecuteBundleExport = async (mode: BundleMode) => {
+    setIsBundleProcessing(true);
+    setBundleError(null);
+    try {
+      const result = await exportProjectBundle(
+        {
+          chapters,
+          frames,
+          scenes,
+          chapterPanels,
+          currentChapterId,
+          currentPageNumber,
+          currentTab,
+          title: projectMetadata?.workTitle || 'Projeto Manhwa Recap',
+          projectMetadata,
+          chapterMetadata,
+          pageScripts,
+        },
+        {
+          mode,
+          onProgress: (p) => setBundleProgress(p),
+        }
+      );
+      triggerBundleDownload(result.blob, result.filename);
+      setBundleSuccessFilename(result.filename);
+      showToast(`Projeto exportado como "${result.filename}"!`, 'success');
+    } catch (err: any) {
+      console.error('Erro ao empacotar projeto .recap:', err);
+      setBundleError(err?.message || 'Falha ao empacotar arquivo de projeto.');
+    } finally {
+      setIsBundleProcessing(false);
+    }
+  };
+
+  // Import .recap or .zip project file selected from disk or drag-and-drop
+  const handleRecapFileSelected = async (file: File) => {
+    const isSupported = file.name.toLowerCase().endsWith('.recap') || file.name.toLowerCase().endsWith('.zip');
+    if (!isSupported) {
+      showToast('Selecione um arquivo de projeto com extensão .recap ou .zip válido.', 'error');
+      return;
+    }
+
+    setIsBundleProcessing(true);
+    setBundleError(null);
+    setBundleSuccessFilename(null);
+    setBundleProgress({ percentage: 5, message: 'Lendo arquivo de projeto...' });
+    setIsBundleModalOpen(true);
+
+    // Capture previous project URLs before importing so we can revoke only them
+    const previousUrls = getActiveCreatedUrls();
+
+    try {
+      const { state: hydrated, manifest } = await importProjectBundle(file, (p) => {
+        setBundleProgress(p);
+      });
+
+      // 1. Revoke ONLY old Object URLs from previous project (preserves new ones!)
+      revokeSpecificUrls(previousUrls);
+
+      // 2. Clear persisted media registry so new chapter blobs are guaranteed to be saved
+      clearPersistedMediaChapters();
+
+      // 3. Set memory state
+      setChapters(hydrated.chapters);
+      setFrames(hydrated.frames);
+      setScenes(hydrated.scenes);
+      setChapterPanels(hydrated.chapterPanels || {});
+      setProjectMetadata(
+        hydrated.projectMetadata || {
+          workTitle: '',
+          universeLore: '',
+          glossary: {},
+          characters: [],
+          narrativeHistory: [],
+        }
+      );
+      setChapterMetadata(hydrated.chapterMetadata || {});
+      setPageScripts(hydrated.pageScripts || {});
+
+      const effectiveChapterId = hydrated.chapters.some((c) => c.id === hydrated.currentChapterId)
+        ? hydrated.currentChapterId
+        : hydrated.chapters[0]?.id || '';
+      setCurrentChapterId(effectiveChapterId);
+      setCurrentPageNumber(hydrated.currentPageNumber || 1);
+      setCurrentTab(hydrated.currentTab || 'recorte');
+
+      // 4. Immediately persist into IndexedDB on this machine
+      await saveProject({
+        chapters: hydrated.chapters,
+        frames: hydrated.frames,
+        scenes: hydrated.scenes,
+        chapterPanels: hydrated.chapterPanels,
+        currentChapterId: effectiveChapterId,
+        currentPageNumber: hydrated.currentPageNumber || 1,
+        currentTab: hydrated.currentTab || 'recorte',
+        title: hydrated.title,
+        projectMetadata: hydrated.projectMetadata,
+        chapterMetadata: hydrated.chapterMetadata,
+        pageScripts: hydrated.pageScripts,
+      });
+
+      setLastSavedAt(Date.now());
+      setSaveStatus('saved');
+      setIsBundleModalOpen(false);
+
+      showToast(
+        `Projeto "${manifest.workTitle || file.name}" carregado com sucesso (${manifest.stats.framesCount} quadros, ${manifest.stats.scenesCount} cenas)!`,
+        'success'
+      );
+    } catch (err: any) {
+      console.error('Erro ao importar arquivo de projeto:', err);
+      setBundleError(err?.message || 'Falha ao descompactar e carregar projeto.');
+    } finally {
+      setIsBundleProcessing(false);
+      if (recapFileInputRef.current) {
+        recapFileInputRef.current.value = '';
+      }
+    }
+  };
+
+  // Global Drag & Drop listener for .recap and .zip files
+  useEffect(() => {
+    const handleDragOver = (e: DragEvent) => {
+      e.preventDefault();
+    };
+    const handleDrop = (e: DragEvent) => {
+      e.preventDefault();
+      if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+        const file = e.dataTransfer.files[0];
+        const lowerName = file.name.toLowerCase();
+        if (lowerName.endsWith('.recap') || lowerName.endsWith('.zip')) {
+          handleRecapFileSelected(file);
+        }
+      }
+    };
+    window.addEventListener('dragover', handleDragOver);
+    window.addEventListener('drop', handleDrop);
+    return () => {
+      window.removeEventListener('dragover', handleDragOver);
+      window.removeEventListener('drop', handleDrop);
+    };
+  }, []);
 
   // Reset / Clear Project from IndexedDB and memory
   const handleClearProjectConfirm = async () => {
@@ -944,6 +1121,16 @@ export default function App() {
         onChange={(e) => e.target.files && handleUploadFolder(e.target.files)}
         className="hidden"
       />
+      <input
+        ref={recapFileInputRef}
+        type="file"
+        accept=".recap,.zip"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) handleRecapFileSelected(file);
+        }}
+        className="hidden"
+      />
       <StudioShell
         currentTab={currentTab}
         onTabChange={setCurrentTab}
@@ -1069,6 +1256,8 @@ export default function App() {
         onImportFolder={() => folderInputRef.current?.click()}
         onLoadDemo={handleLoadDemoProject}
         onSave={handleManualSave}
+        onOpenProjectFile={handleOpenProjectFile}
+        onSaveProjectFile={handleSaveProjectFile}
         saveStatus={saveStatus}
         lastSavedAt={lastSavedAt}
       >
@@ -1194,6 +1383,26 @@ export default function App() {
           if (data.frames) setFrames(data.frames);
           if (data.scenes) setScenes(data.scenes);
           showToast('Projeto importado com sucesso!');
+        }}
+      />
+
+      {/* Project Portable Bundle Modal (.recap) */}
+      <ProjectBundleModal
+        isOpen={isBundleModalOpen}
+        onClose={() => {
+          if (!isBundleProcessing) setIsBundleModalOpen(false);
+        }}
+        onExport={handleExecuteBundleExport}
+        isProcessing={isBundleProcessing}
+        progress={bundleProgress}
+        error={bundleError}
+        successFilename={bundleSuccessFilename}
+        stats={{
+          chaptersCount: chapters.length,
+          pagesCount: chapters.reduce((sum, ch) => sum + (ch.imageUrls?.length || ch.pages || 0), 0),
+          framesCount: frames.length,
+          scenesCount: scenes.length,
+          audioCount: scenes.filter((s) => Boolean(s.audioBlob || s.audioUrl)).length,
         }}
       />
 

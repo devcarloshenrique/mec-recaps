@@ -22,6 +22,9 @@ import {
   AlertCircle,
   Info,
   Check,
+  FolderOpen,
+  FileArchive,
+  HardDrive,
 } from 'lucide-react';
 import { StudioTab } from '../types';
 
@@ -37,6 +40,8 @@ export interface StudioShellProps {
   onImportFolder?: () => void;
   onLoadDemo?: () => void;
   onSave?: () => void;
+  onOpenProjectFile?: () => void;
+  onSaveProjectFile?: () => void;
   saveStatus?: 'idle' | 'saving' | 'saved' | 'error';
   lastSavedAt?: number | null;
   children: React.ReactNode;
@@ -61,6 +66,8 @@ export const StudioShell: React.FC<StudioShellProps> = ({
   onImportFolder,
   onLoadDemo,
   onSave,
+  onOpenProjectFile,
+  onSaveProjectFile,
   saveStatus = 'saved',
   lastSavedAt,
   children,
@@ -231,6 +238,53 @@ export const StudioShell: React.FC<StudioShellProps> = ({
                     type="button"
                     onClick={() => {
                       setOpenMenu(null);
+                      onOpenProjectFile?.();
+                    }}
+                    className="w-full flex items-center justify-between px-2.5 py-1.5 rounded hover:bg-primary/20 hover:text-white transition-colors cursor-pointer text-left"
+                  >
+                    <div className="flex items-center gap-2">
+                      <FolderOpen className="h-3.5 w-3.5 text-amber-400" />
+                      <span>Abrir Arquivo de Projeto (.recap)...</span>
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpenMenu(null);
+                      onSaveProjectFile?.();
+                    }}
+                    className="w-full flex items-center justify-between px-2.5 py-1.5 rounded hover:bg-primary/20 hover:text-white transition-colors cursor-pointer text-left font-medium text-emerald-300 hover:text-white"
+                  >
+                    <div className="flex items-center gap-2">
+                      <FileArchive className="h-3.5 w-3.5 text-emerald-400" />
+                      <span>Salvar Arquivo de Projeto (.recap)...</span>
+                    </div>
+                  </button>
+
+                  <div className="h-[1px] bg-white/10 my-1 mx-1.5" />
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpenMenu(null);
+                      onSave?.();
+                    }}
+                    className="w-full flex items-center justify-between px-2.5 py-1.5 rounded hover:bg-primary/20 hover:text-white transition-colors cursor-pointer text-left"
+                  >
+                    <div className="flex items-center gap-2">
+                      <HardDrive className="h-3.5 w-3.5 text-cyan-400" />
+                      <span>Salvar Projeto no Navegador</span>
+                    </div>
+                    <kbd className="text-[10px] font-mono text-muted-foreground">Ctrl+S</kbd>
+                  </button>
+
+                  <div className="h-[1px] bg-white/10 my-1 mx-1.5" />
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpenMenu(null);
                       onImportFolder?.();
                     }}
                     className="w-full flex items-center justify-between px-2.5 py-1.5 rounded hover:bg-primary/20 hover:text-white transition-colors cursor-pointer text-left"
@@ -254,23 +308,6 @@ export const StudioShell: React.FC<StudioShellProps> = ({
                       <RotateCcw className="h-3.5 w-3.5 text-muted-foreground" />
                       <span>Carregar Projeto Demo (Exemplo)</span>
                     </div>
-                  </button>
-
-                  <div className="h-[1px] bg-white/10 my-1 mx-1.5" />
-
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setOpenMenu(null);
-                      onSave?.();
-                    }}
-                    className="w-full flex items-center justify-between px-2.5 py-1.5 rounded hover:bg-primary/20 hover:text-white transition-colors cursor-pointer text-left"
-                  >
-                    <div className="flex items-center gap-2">
-                      <Save className="h-3.5 w-3.5 text-emerald-400" />
-                      <span>Salvar Projeto no IndexedDB</span>
-                    </div>
-                    <kbd className="text-[10px] font-mono text-muted-foreground">Ctrl+S</kbd>
                   </button>
 
                   <div className="h-[1px] bg-white/10 my-1 mx-1.5" />

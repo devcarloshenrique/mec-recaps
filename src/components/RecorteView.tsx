@@ -3640,39 +3640,64 @@ export const RecorteView: React.FC<RecorteViewProps> = ({
             }`}
           >
             {chapters.length === 0 || !currentImageUrl || currentChapter.pages === 0 ? (
-              <div className="text-center p-8 max-w-md bg-card/90 backdrop-blur rounded-xl border border-border shadow-2xl space-y-4 my-auto animate-fade-in">
-                <div className="mx-auto w-12 h-12 rounded-full bg-primary/10 text-primary flex items-center justify-center">
-                  <FolderUp className="h-6 w-6" />
-                </div>
-                <div>
-                  <h3 className="text-base font-bold text-foreground">
-                    {chapters.length === 0 ? 'Nenhum Capítulo Carregado' : 'Capítulo Sem Páginas'}
-                  </h3>
-                  <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
-                    {chapters.length === 0
-                      ? 'Importe uma pasta com as imagens dos seus capítulos de manhwa para começar os cortes e a detecção automática.'
-                      : `O capítulo "${currentChapter.label}" ainda não possui páginas. Importe imagens para começar.`}
-                  </p>
-                </div>
-                <div className="flex flex-col sm:flex-row items-center justify-center gap-2 pt-2">
-                  <button
-                    onClick={() => fileInputRef.current?.click()}
-                    className="w-full sm:w-auto px-4 py-2 rounded-md bg-primary text-primary-foreground text-xs font-semibold flex items-center justify-center gap-1.5 hover:opacity-90 transition-opacity shadow"
-                  >
-                    <FolderUp className="h-4 w-4" />
-                    <span>Importar Pasta de Capítulos</span>
-                  </button>
-                  {onAddChapter && (
+              frames.length > 0 && chapters.length > 0 ? (
+                <div className="text-center p-8 max-w-md bg-card/90 backdrop-blur rounded-2xl border border-white/10 shadow-2xl space-y-4 my-auto animate-fade-in ring-1 ring-white/5">
+                  <div className="mx-auto w-12 h-12 rounded-full bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 flex items-center justify-center">
+                    <Zap className="h-6 w-6" />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-bold text-foreground">
+                      Projeto em Modo Compacto
+                    </h3>
+                    <p className="text-xs text-muted-foreground mt-1.5 leading-relaxed">
+                      Este projeto foi empacotado sem as páginas brutas de capítulos. Todos os seus <strong className="text-emerald-400 font-semibold">{frames.length} quadros recortados</strong>, narrações e linha do tempo estão prontos para edição nas abas <strong className="text-foreground">Roteiro</strong>, <strong className="text-foreground">Narração</strong> e <strong className="text-foreground">Montagem</strong>.
+                    </p>
+                  </div>
+                  <div className="flex flex-col sm:flex-row items-center justify-center gap-2 pt-2">
                     <button
-                      onClick={() => onAddChapter()}
-                      className="w-full sm:w-auto px-3 py-2 rounded-md bg-secondary text-foreground text-xs font-medium hover:bg-secondary/80 transition-colors flex items-center justify-center gap-1.5"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="w-full sm:w-auto px-4 py-2 rounded-xl bg-white/10 hover:bg-white/15 text-foreground text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
                     >
-                      <Plus className="h-3.5 w-3.5" />
-                      <span>Novo Capítulo</span>
+                      <FolderUp className="h-4 w-4 text-cyan-400" />
+                      <span>Adicionar Páginas Originais</span>
                     </button>
-                  )}
+                  </div>
                 </div>
-              </div>
+              ) : (
+                <div className="text-center p-8 max-w-md bg-card/90 backdrop-blur rounded-xl border border-border shadow-2xl space-y-4 my-auto animate-fade-in">
+                  <div className="mx-auto w-12 h-12 rounded-full bg-primary/10 text-primary flex items-center justify-center">
+                    <FolderUp className="h-6 w-6" />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-bold text-foreground">
+                      {chapters.length === 0 ? 'Nenhum Capítulo Carregado' : 'Capítulo Sem Páginas'}
+                    </h3>
+                    <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
+                      {chapters.length === 0
+                        ? 'Importe uma pasta com as imagens dos seus capítulos de manhwa para começar os cortes e a detecção automática.'
+                        : `O capítulo "${currentChapter.label}" ainda não possui páginas. Importe imagens para começar.`}
+                    </p>
+                  </div>
+                  <div className="flex flex-col sm:flex-row items-center justify-center gap-2 pt-2">
+                    <button
+                      onClick={() => fileInputRef.current?.click()}
+                      className="w-full sm:w-auto px-4 py-2 rounded-md bg-primary text-primary-foreground text-xs font-semibold flex items-center justify-center gap-1.5 hover:opacity-90 transition-opacity shadow"
+                    >
+                      <FolderUp className="h-4 w-4" />
+                      <span>Importar Pasta de Capítulos</span>
+                    </button>
+                    {onAddChapter && (
+                      <button
+                        onClick={() => onAddChapter()}
+                        className="w-full sm:w-auto px-3 py-2 rounded-md bg-secondary text-foreground text-xs font-medium hover:bg-secondary/80 transition-colors flex items-center justify-center gap-1.5"
+                      >
+                        <Plus className="h-3.5 w-3.5" />
+                        <span>Novo Capítulo</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )
             ) : (
               <div
                 ref={imageContainerRef}
